@@ -182,7 +182,9 @@ msg9_send({ to: "dsh-alpha-a1b2@msg9.io", text: "schema 已更新", correlation_
 
 ## HTTP 桥
 
-面板调用的同源接口（响应里永不含 key）。只接受连接来源本身是本机 loopback（`remoteAddress`）的请求，浏览器另有 `Origin` 同源校验——本机其他进程伪造 `Host` 头不再放行：
+面板调用的同源接口（响应里永不含 key）。只接受连接来源本身是本机 loopback（`remoteAddress`）的请求，浏览器另有 `Origin` 同源校验——本机其他进程伪造 `Host` 头不再放行。
+
+威胁模型边界（审计澄清）：本机进程经 loopback 连接仍会被信任——这是有意的，因为这类进程本就可以直读 `~/.dsh/msg9-kit/state.json`，HTTP 层防不住也不必防「机器主人」。这层校验真正关掉的是：dsh web 绑定非 loopback 地址时远程伪造 `Host` 的客户端，以及跨源浏览器页面。
 
 | 路由 | 用途 |
 |---|---|

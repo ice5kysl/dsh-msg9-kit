@@ -303,6 +303,13 @@ function isLoopbackAddress(address: string): boolean {
  * key). The loopback Host check stays as a secondary guard; a missing
  * remoteAddress only happens with injected test doubles, which keep the old
  * Host-only behaviour.
+ *
+ * Threat-model note (per audit 补充 12): a local process connecting via
+ * loopback still passes — deliberately. Such a process could read
+ * ~/.dsh/msg9-kit/state.json directly; HTTP-layer defence has never been able
+ * to keep out "the machine's owner". What this check actually closes is (a) a
+ * REMOTE client forging Host when dsh web binds a non-loopback address, and
+ * (b) cross-origin browser pages. Those are the bridge's real boundaries.
  */
 export function isTrustedRequest(req: IncomingMessage): boolean {
   const host = hostnameOf(req.headers.host)

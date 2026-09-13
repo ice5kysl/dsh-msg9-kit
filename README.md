@@ -235,7 +235,13 @@ what it sent, and the address book it messages most.
 The panel talks to these same-origin routes (never a key in the response).
 Requests are accepted only when the connection itself comes from loopback
 (`remoteAddress`), plus a same-origin `Origin` check for browsers — a forged
-`Host` header from another local process does not pass:
+`Host` header from another local process does not pass.
+
+Threat-model boundary (per audit): a local process connecting via loopback is
+still trusted — deliberately, since it could read `~/.dsh/msg9-kit/state.json`
+directly anyway; HTTP-layer defence cannot and need not keep out the machine's
+owner. What this check actually closes is remote clients forging `Host` when
+dsh web binds a non-loopback address, and cross-origin browser pages:
 
 | Route | Purpose |
 |---|---|
