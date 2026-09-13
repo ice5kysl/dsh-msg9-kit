@@ -80,7 +80,7 @@ export function apply(ctx: Context): void {
   log.info('msg9-kit loaded')
 
   registerMsg9Tools(ctx)
-  log.info('msg9 tools registered (setup, inbox, outbox, send, read, done, notify, resolve, contacts, peers, rotate, status)')
+  log.info('msg9 tools registered (setup, inbox, outbox, send, read, done, message, notify, resolve, contacts, peers, rotate, status)')
 
   registerMsg9Commands(ctx.commands)
   log.info('msg9 command registered (/msg9)')
