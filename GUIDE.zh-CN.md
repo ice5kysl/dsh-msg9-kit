@@ -108,7 +108,7 @@ dsh plugin --profile web add dsh-msg9-kit
 | `msg9_rotate` | 轮换当前 workspace 的 key |
 | `msg9_resolve` | 解析任意地址的公开记录 |
 | `msg9_status` | 查看绑定与同步状态 |
-| `msg9_notify` | 主动唤醒另一个 workspace 的 Agent |
+| `msg9_notify` | 暂停/恢复新邮件唤醒（`on`/`off`/`status`）——和面板铃铛是同一个静音开关 |
 
 工作方式：会话开始时 Agent 会自己查一次信；运行期间有新信到达，watcher 会把信**唤醒送进当前会话**（多封积攒会一次性送达，不会一条条打断）。
 

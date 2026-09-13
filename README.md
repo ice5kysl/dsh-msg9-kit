@@ -73,6 +73,7 @@ themes alike.
 | `msg9_peers` | List the sibling workspaces' inboxes (address book for cross-workspace sync) |
 | `msg9_rotate` | Rotate the current workspace's key (recover from a lost/leaked key) |
 | `msg9_status` | Owner + current workspace + cursor + state file; `verify=true` checks the key |
+| `msg9_notify` | Pause/resume new-mail wake-ups for this instance (`on` / `off` / `status`) — the same mute switch as the panel bell |
 
 Plus `/msg9` to print the owner and the registered workspace inboxes.
 

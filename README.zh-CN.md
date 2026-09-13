@@ -61,6 +61,7 @@
 | `msg9_peers` | 列出**兄弟 workspace** 的收件箱（跨 workspace 同步的地址簿） |
 | `msg9_rotate` | 轮换当前 workspace 的 key（本地 key 丢失/泄漏时恢复） |
 | `msg9_status` | owner + 当前 workspace + 游标 + 状态文件；`verify=true` 校验 key |
+| `msg9_notify` | 暂停/恢复本实例的新邮件唤醒（`on` / `off` / `status`）——和面板铃铛是同一个静音开关 |
 
 另有 `/msg9` 命令，打印 owner 与已登记的 workspace 收件箱。
 
