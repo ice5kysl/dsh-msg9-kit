@@ -25,7 +25,7 @@ import { markedHighlight } from 'marked-highlight'
 import DOMPurify from 'dompurify'
 import { bodyText, truncate } from '../shared/message.ts'
 import type { AccountAgentView, ContactRow, DirectoryAgentRow, GroupRow, MessageRow, PeerRow } from '../shared/types.ts'
-import { ArrowRight, Bell, BellOff, Check, Copy, Globe, Inbox, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X } from './icons.tsx'
+import { ArrowRight, Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, Globe, Inbox, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X } from './icons.tsx'
 import { highlightCode, highlightReady } from './highlight.ts'
 import { L } from './locale.ts'
 import { selectedWorkspace, type Msg9State, type Msg9Store, type Tab } from './store.ts'
@@ -902,11 +902,15 @@ function GroupView({ state, store }: { state: Msg9State; store: Msg9Store }): JS
 const CLAMP_CHARS = 2000
 
 /** The group's archive as a chat channel: letters grouped into threads by
- *  correlation_id, each letter a bubble with its body rendered inline through
- *  the same markdown pipeline as the inbox detail. The toggle flips the thread
- *  order and defaults to chronological (正序) — a discussion reads like a chat log. */
+ *  correlation_id, each thread a timeline (gutter line + node dots), each
+ *  letter a collapsible card — collapsed by default (header + one-line preview),
+ *  expanded to the full markdown body through the same pipeline as the inbox
+ *  detail. The toggle flips the thread order and defaults to chronological
+ *  (正序) — a discussion reads like a chat log. */
 function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
-  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(new Set())
+  // openIds: 卡片级展开（默认全部折叠）；fullIds: 长正文的「展开全文」（2000 字符 clamp）。
+  const [openIds, setOpenIds] = useState<ReadonlySet<string>>(new Set())
+  const [fullIds, setFullIds] = useState<ReadonlySet<string>>(new Set())
   const [ascending, setAscending] = useState(true)
   const myAddress = selectedWorkspace(state)?.address ?? null
   const groupAddress = state.selectedGroup
@@ -946,11 +950,23 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
     return grouped
   }, [state.groupArchive, ascending])
 
-  const toggleExpand = (id: string): void => {
-    setExpandedIds((prev) => {
+  const toggleIn = (setIds: (fn: (prev: ReadonlySet<string>) => ReadonlySet<string>) => void, id: string): void => {
+    setIds((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
+      return next
+    })
+  }
+
+  /** 线程头的「全部展开/收起」：只动本线程的信，跨线程不联动。 */
+  const setThreadOpen = (letters: { message: MessageRow }[], open: boolean): void => {
+    setOpenIds((prev) => {
+      const next = new Set(prev)
+      for (const { message } of letters) {
+        if (open) next.add(message.message_id)
+        else next.delete(message.message_id)
+      }
       return next
     })
   }
@@ -972,27 +988,41 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
         <div style={styles.listEmpty}>{L('组里还没有消息。', 'No messages in this group yet.')}</div>
       ) : (
         <div style={styles.threadList}>
-          {threads.map((thread) => (
-            <div key={thread.id} style={styles.thread}>
-              {thread.letters.map(({ message, copies }, index) => (
-                <LetterCard
-                  key={message.message_id}
-                  message={message}
-                  copies={copies}
-                  reply={index > 0}
-                  mine={myAddress !== null && message.from_address === myAddress}
-                  expanded={expandedIds.has(message.message_id)}
-                  onToggleExpand={() => toggleExpand(message.message_id)}
-                  onReply={() => store.replyTo({
-                    ...message,
-                    // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
-                    // 链路——reply_to 闭环、correlation_id 原样随行，语义不变。
-                    list_address: message.list_address ?? groupAddress ?? undefined,
-                  })}
-                />
-              ))}
-            </div>
-          ))}
+          {threads.map((thread) => {
+            const allOpen = thread.letters.every(({ message }) => openIds.has(message.message_id))
+            return (
+              <div key={thread.id} style={styles.thread}>
+                <span className="m9-timeline" style={styles.threadGutter} />
+                {thread.letters.length > 1 && (
+                  <div style={styles.threadHead}>
+                    <button type="button" className="m9-chip" onClick={() => setThreadOpen(thread.letters, !allOpen)}>
+                      {allOpen ? L('全部收起', 'Collapse all') : L('全部展开', 'Expand all')}
+                    </button>
+                    <span style={styles.threadCount}>{L('{n} 封', '{n} letters', { n: thread.letters.length })}</span>
+                  </div>
+                )}
+                {thread.letters.map(({ message, copies }, index) => (
+                  <LetterCard
+                    key={message.message_id}
+                    message={message}
+                    copies={copies}
+                    reply={index > 0}
+                    mine={myAddress !== null && message.from_address === myAddress}
+                    open={openIds.has(message.message_id)}
+                    full={fullIds.has(message.message_id)}
+                    onToggleOpen={() => toggleIn(setOpenIds, message.message_id)}
+                    onToggleFull={() => toggleIn(setFullIds, message.message_id)}
+                    onReply={() => store.replyTo({
+                      ...message,
+                      // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
+                      // 链路——reply_to 闭环、correlation_id 原样随行，语义不变。
+                      list_address: message.list_address ?? groupAddress ?? undefined,
+                    })}
+                  />
+                ))}
+              </div>
+            )
+          })}
         </div>
       )}
       {hasMore && (
@@ -1004,33 +1034,43 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
   )
 }
 
-/** 频道里的一封信（消息气泡）：发送者 + 时间 + 正文 inline 渲染
- *  （marked + DOMPurify + Shiki，与收件箱详情同一条链路），长正文 clamp。 */
-function LetterCard({
+/** 频道里的一封信（可折叠卡片 + 时间线节点）。折叠态（默认）：头行 = 折叠箭头 +
+ *  发送者 + 时间 + 「×N 副本」徽标，下面一行纯文本预览（~120 字符）；点头行展开为
+ *  完整 markdown（marked + DOMPurify + Shiki，与收件箱详情同一条链路），长正文
+ *  保留 2000 字符 clamp + 「展开全文」。导出以便测试直接驱动两个层级。 */
+export function LetterCard({
   message,
   copies,
   reply,
   mine,
-  expanded,
-  onToggleExpand,
+  open,
+  full,
+  onToggleOpen,
+  onToggleFull,
   onReply,
 }: {
   message: MessageRow
   copies: number
-  /** 线程内的回复（非首信）：缩进 + 左边框，视觉上连成一串。 */
+  /** 线程内的回复（非首信）：缩进，节点挂在时间线上，视觉上连成一串。 */
   reply: boolean
-  /** 当前 workspace 自己发的信：靠右 + 底色，一眼看出"我在这个组说过什么"。 */
+  /** 当前 workspace 自己发的信：靠右 + 底色（折叠态也能看出）。 */
   mine: boolean
-  expanded: boolean
-  onToggleExpand: () => void
+  /** 卡片级展开（折叠态只有头行 + 预览）。 */
+  open: boolean
+  /** 长正文的「展开全文」（2000 字符 clamp 的旁路）。 */
+  full: boolean
+  onToggleOpen: () => void
+  onToggleFull: () => void
   onReply: () => void
 }): JSX.Element {
   const text = bodyText(message)
-  const clamped = text.length > CLAMP_CHARS && !expanded
+  const clamped = text.length > CLAMP_CHARS && !full
   const shown = clamped ? truncate(text, CLAMP_CHARS) : fullBody(message)
   return (
     <article style={{ ...styles.letter, ...(reply ? styles.letterReply : {}), ...(mine ? styles.letterMine : {}) }}>
-      <header style={styles.letterHead}>
+      <span className="m9-tl-node" style={{ ...styles.tlNode, left: reply ? -30 : -16, ...(mine ? styles.tlNodeMine : {}) }} />
+      <button type="button" className="m9-letterhead" onClick={onToggleOpen} title={open ? L('收起', 'Collapse') : L('展开', 'Expand')}>
+        {open ? <ChevronDown size={12} style={styles.tlArrow} /> : <ChevronRight size={12} style={styles.tlArrow} />}
         <span style={styles.letterSender}>{message.from_address}</span>
         {mine && (
           <span style={styles.mineTag} title={L('本 workspace 发的信', 'Sent by this workspace')}>{L('我', 'me')}</span>
@@ -1041,20 +1081,25 @@ function LetterCard({
           </span>
         )}
         <span style={styles.letterTime}>{formatTime(message.created_at)}</span>
-      </header>
+      </button>
       {message.subject ? <div style={styles.letterSubject}>{message.subject}</div> : null}
-      <div className="m9-md" dangerouslySetInnerHTML={{ __html: markdownHtml(shown) }} />
-      <div style={styles.letterActions}>
-        {text.length > CLAMP_CHARS && (
-          <button type="button" className="m9-btn" onClick={onToggleExpand}>
-            {expanded ? L('收起', 'Show less') : L('展开全文', 'Show full text')}
-          </button>
-        )}
-        <button type="button" className="m9-btn" onClick={onReply}>
-          <Reply size={12} />
-          {L('回复', 'Reply')}
-        </button>
-      </div>
+      {!open && <div style={styles.rowPreview}>{previewOf(message, 120)}</div>}
+      {open && (
+        <>
+          <div className="m9-md m9-letter-md" style={styles.letterBody} dangerouslySetInnerHTML={{ __html: markdownHtml(shown) }} />
+          <div style={styles.letterActions}>
+            {text.length > CLAMP_CHARS && (
+              <button type="button" className="m9-btn" onClick={onToggleFull}>
+                {full ? L('收起全文', 'Show less') : L('展开全文', 'Show full text')}
+              </button>
+            )}
+            <button type="button" className="m9-btn" onClick={onReply}>
+              <Reply size={12} />
+              {L('回复', 'Reply')}
+            </button>
+          </div>
+        </>
+      )}
     </article>
   )
 }
@@ -1444,8 +1489,12 @@ const styles: Record<string, CSSProperties> = {
   groupArchive: { display: 'flex', flexDirection: 'column', gap: 6, borderTop: `1px solid ${BORDER}`, paddingTop: 10 },
   archiveHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
   threadList: { display: 'flex', flexDirection: 'column', gap: 12 },
-  thread: { display: 'flex', flexDirection: 'column', gap: 4 },
+  thread: { position: 'relative', display: 'flex', flexDirection: 'column', gap: 4, paddingLeft: 16 },
+  threadGutter: { position: 'absolute', left: 5, top: 10, bottom: 10, width: 2, borderRadius: 1, background: BORDER },
+  threadHead: { display: 'flex', alignItems: 'center', gap: 6, paddingBottom: 2 },
+  threadCount: { fontSize: 10, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '0 7px' },
   letter: {
+    position: 'relative',
     maxWidth: '92%',
     alignSelf: 'flex-start',
     minWidth: 0,
@@ -1458,11 +1507,14 @@ const styles: Record<string, CSSProperties> = {
   },
   letterMine: { alignSelf: 'flex-end', background: ACTIVE_BG, borderColor: BORDER_STRONG },
   letterReply: { marginLeft: 14, borderLeft: `2px solid ${BORDER_STRONG}` },
-  letterHead: { display: 'flex', alignItems: 'center', gap: 6 },
+  tlNode: { position: 'absolute', top: 13, width: 8, height: 8, borderRadius: 4, background: BORDER_STRONG },
+  tlNodeMine: { background: ACCENT },
+  tlArrow: { flexShrink: 0, color: DIM },
   letterSender: { fontSize: 11, fontWeight: 600, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   mineTag: { flexShrink: 0, fontSize: 10, color: ACCENT, border: `1px solid ${BORDER_STRONG}`, borderRadius: 999, padding: '0 6px' },
   letterTime: { color: DIM, fontSize: 10, flexShrink: 0, marginLeft: 'auto' },
-  letterSubject: { fontSize: 12, fontWeight: 600 },
+  letterSubject: { fontSize: 12, fontWeight: 600, overflowWrap: 'anywhere' },
+  letterBody: { minWidth: 0, overflowWrap: 'anywhere', wordBreak: 'break-word' },
   letterActions: { display: 'flex', gap: 6, marginTop: 2 },
   rowSubject: { fontSize: 12, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   rowSubjectUnread: { fontSize: 12, marginTop: 2, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },

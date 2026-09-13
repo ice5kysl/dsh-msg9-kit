@@ -11,6 +11,8 @@ import {
   Bell,
   BellOff,
   Check,
+  ChevronDown,
+  ChevronRight,
   Copy,
   Globe,
   Inbox,
@@ -27,4 +29,4 @@ import {
   X,
 } from 'lucide-react'
 
-export { ArrowRight, Bell, BellOff, Check, Copy, Globe, Inbox, Mail, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X }
+export { ArrowRight, Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, Globe, Inbox, Mail, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X }

@@ -60,6 +60,11 @@ export const M9_CSS = `
 .m9-md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; background: ${HOVER_BG}; padding: 1px 5px; border-radius: 5px; }
 .m9-md pre { background: ${BG_SUNK}; border: 1px solid ${BORDER}; border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 0.6em 0; line-height: 1.6; tab-size: 2; }
 .m9-md pre code { background: transparent; padding: 0; display: block; white-space: pre; }
+/* 组存档频道里的 markdown：长串字符（路径/标识符）必须断行，代码块横向滚动
+   且不撑破卡片。作用域限定在频道内，收件箱详情的 .m9-md 表现不变。 */
+.m9-letter-md { overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
+.m9-letter-md pre { overflow-x: auto; max-width: 100%; }
+.m9-letterhead { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: transparent; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; text-align: left; min-width: 0; }
 /* Syntax highlighting (Shiki css-variables theme): the palette maps token
    variables onto shell colors, so one render serves both themes. */
 .m9-md pre code {

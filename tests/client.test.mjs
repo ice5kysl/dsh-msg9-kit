@@ -1230,23 +1230,41 @@ await check('groups archive: the channel view threads letters, folds copies and 
 
     const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
     const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
-    // 线程 thread-f：3 份投递副本折成一张卡片（×N 徽标保留），另一封信同组且按时间排在后面。
+    // 默认折叠：只有头行 + 纯文本预览，没有 markdown 正文，也没有「回复」。
+    // （断言匹配渲染出的 class 属性——M9_CSS 样式文本里本来就含 ".m9-md" 字样。）
+    assert.ok(!html.includes('class="m9-md'), 'collapsed channel renders previews, not markdown bodies')
+    assert.ok(!html.includes('Reply</button>'), 'the reply action lives in the expanded card')
+    // 线程 thread-f：3 份投递副本折成一张卡片（×N 徽标折叠态可见），另一封信同组且按时间排在后面。
     assert.equal(html.match(/same letter body/g).length, 1, 'three delivery copies of one letter render as ONE card')
-    assert.ok(html.includes('×3 copies'), 'the copy-count chip shows the folded size')
+    assert.ok(html.includes('×3 copies'), 'the copy-count chip is visible on the collapsed card')
     assert.ok(html.includes('another letter in thread'), 'a different letter sharing the thread id is NOT folded away')
     assert.ok(html.indexOf('same letter body') < html.indexOf('a different letter'), 'letters inside a thread run oldest-first')
     // 不同线程分开；线程之间按首信时间正序（thread-f → standalone → mine → long）。
     assert.ok(html.indexOf('a different letter') < html.indexOf('own thread'), 'threads sort by first-letter time')
     assert.ok(html.indexOf('own thread') < html.indexOf('from this workspace'), 'a letter without a thread id is its own thread')
-    // 频道形态：正文直接走 markdown 管线渲染，不再默认预览。
-    assert.ok(html.includes('m9-md'), 'bodies render inline through the markdown pipeline')
-    // 自己发的信有区分标记。
+    // 线程时间线：gutter + 每张卡一个节点圆点；线程头有信数徽标和「全部展开」。
+    assert.ok(html.includes('m9-timeline'), 'the thread gutter line is rendered')
+    assert.ok(html.includes('m9-tl-node'), 'every card hangs a node dot on the line')
+    assert.ok(html.includes('2 letters'), 'the thread head shows its letter count')
+    assert.ok(html.includes('Expand all'), 'per-thread expand-all is offered')
+    // 自己发的信折叠态也有区分标记。
     assert.ok(html.includes('Sent by this workspace'), 'own letters carry the me marker')
-    // 超长正文 clamp：尾巴不出现，给「展开全文」。
-    assert.ok(!html.includes('TAIL_END_MARKER'), 'long body is clamped')
-    assert.ok(html.includes('Show full text'), 'clamp offers an expander')
-    // 每封信都有「回复」（5 张卡片）。
-    assert.equal(html.match(/Reply<\/button>/g).length, 5, 'every letter has a reply action')
+    // 超长正文折叠后连预览都只有 ~120 字符，尾巴当然不出现。
+    assert.ok(!html.includes('TAIL_END_MARKER'), 'collapsed long letter shows only a short preview')
+
+    // 展开态：SSR 没有事件，直接渲染导出的 LetterCard 验证两个层级。
+    const longRow = store.getState().groupArchive.find((entry) => entry.message_id === 'f7')
+    const cardProps = { message: longRow, copies: 1, reply: false, mine: false, onToggleOpen: () => {}, onToggleFull: () => {}, onReply: () => {} }
+    const openCard = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, open: true, full: false }))
+    assert.ok(openCard.includes('m9-md'), 'expanded card renders the markdown body')
+    assert.ok(openCard.includes('m9-letter-md'), 'archive markdown carries the overflow-safe scoped class')
+    assert.ok(!openCard.includes('TAIL_END_MARKER'), 'long body stays clamped at 2000 chars')
+    assert.ok(openCard.includes('Show full text'), 'clamp offers an expander')
+    assert.ok(openCard.includes('Reply</button>'), 'expanded card has the reply action')
+    const fullCard = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, open: true, full: true }))
+    assert.ok(fullCard.includes('TAIL_END_MARKER'), 'show-full reveals the tail')
+    assert.ok(fullCard.includes('Show less'), 'and offers to collapse back')
+
     // 回复链路：reply_to 闭环、correlation_id 原样随行；存档行不带
     // list_address 时回退到组地址（与 handler 里 `message.list_address ?? groupAddress` 一致）。
     const row = store.getState().groupArchive.find((entry) => entry.message_id === 'f4')
