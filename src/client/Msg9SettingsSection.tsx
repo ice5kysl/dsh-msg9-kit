@@ -71,9 +71,9 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
             <div style={styles.fieldRow}>
               <dt style={styles.fieldName}>{L('租户域名', 'Domain')}</dt>
               <dd style={styles.fieldValue}>
-                {state.owner.slug
+                {state.owner.address_domain ?? (state.owner.slug
                   ? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`
-                  : L('未分配（扁平 @msg9.io）', 'none (flat @msg9.io)')}
+                  : L('未分配（扁平 @msg9.io）', 'none (flat @msg9.io)'))}
               </dd>
             </div>
             <div style={styles.fieldRow}>
@@ -156,7 +156,7 @@ function MigrationCard({ state, store }: { state: Msg9State; store: Msg9Store })
         {L(
           '以下收件箱还开在旧租户下（域名不是 {domain}）。迁移会在新租户下按地址规范重新开通，并给旧地址设置转发（新邮件自动进新信箱，旧地址不会被他人注册）。',
           'These inboxes still live under the previous tenant (not on {domain}). Migrating re-opens them under the new tenant with the naming spec and sets forwarding on the old address (new mail lands in the new mailbox; the old address stays reserved).',
-          { domain: `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}` },
+          { domain: state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}` },
         )}
       </div>
       <label style={styles.migrateKeyRow}>

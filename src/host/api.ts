@@ -470,6 +470,29 @@ export function ownerAccountAgents(
 }
 
 /**
+ * §28 (v1.27 proposal): the ORG-level agent union — every agent of every pod
+ * in this pod's org, same narrow projection. Falls back to
+ * {@link ownerAccountAgents} on 404 (server predates §28), so the plugin
+ * upgrades to org semantics the day the endpoint ships without a redeploy.
+ */
+export async function ownerOrgAgents(
+  apiUrl: string,
+  ownerKey: string,
+  offset = 0,
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<{ agents: AccountAgentRow[]; total: number; org_id?: string | null; org_label?: string | null }> {
+  try {
+    return await msg9Request(apiUrl, `/api/v1/owner/org/agents?offset=${offset}&limit=${limit}`, { apiKey: ownerKey, signal })
+  } catch (error) {
+    if (error instanceof Msg9ApiError && error.status === 404) {
+      return ownerAccountAgents(apiUrl, ownerKey, offset, limit, signal)
+    }
+    throw error
+  }
+}
+
+/**
  * v1.8: move an agent's RECEIVED mail to another agent of the SAME tenant
  * (folders preserved, move not copy, irreversible). Cross-tenant is a 403 by
  * design — callers should treat that as "history stays behind".

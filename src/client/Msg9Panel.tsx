@@ -237,7 +237,7 @@ function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JS
         </button>
         <span style={styles.navTenant}>
           {state.owner?.slug
-            ? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`
+            ? (state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`)
             : state.owner?.name ?? L('公开注册', 'public registration')}
         </span>
       </div>

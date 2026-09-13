@@ -34,6 +34,8 @@ export interface OwnerView {
   slug?: string | null
   /** Mail domain reported by the server. */
   mail_domain?: string | null
+  /** The pod's real address domain (v1.22+ ORG model), wins over slug-derived. */
+  address_domain?: string | null
 }
 
 /** `GET /dsh-msg9/overview` payload. */

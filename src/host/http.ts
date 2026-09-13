@@ -42,6 +42,7 @@ import {
   markRead,
   Msg9ApiError,
   ownerAccountAgents,
+  ownerOrgAgents,
   ownerListAgents,
   ownerMe,
   resolveAddress,
@@ -74,6 +75,7 @@ export interface BridgeApi {
   listDirectory: typeof listDirectory
   ownerListAgents: typeof ownerListAgents
   ownerAccountAgents: typeof ownerAccountAgents
+  ownerOrgAgents: typeof ownerOrgAgents
   listGroups: typeof listGroups
   getGroup: typeof getGroup
   groupMessages: typeof groupMessages
@@ -174,6 +176,7 @@ export function defaultBridgeDeps(ctx: Context, override: Partial<BridgeApi> = {
       listDirectory,
       ownerListAgents,
       ownerAccountAgents,
+      ownerOrgAgents,
       listGroups,
       getGroup,
       groupMessages,
@@ -325,7 +328,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     // (hash-less) address on the tenant's domain.
     const tenantMode = Boolean(owner?.api_key && owner.slug)
     const mailDomain = owner?.mail_domain || addressDomain(apiUrl)
-    const domain = tenantMode ? `${owner!.slug}.${mailDomain}` : mailDomain
+    // ORG model (v1.22): the pod's real address domain wins when probed.
+    const domain = tenantMode ? (owner?.address_domain ?? `${owner!.slug}.${mailDomain}`) : mailDomain
     const planned = (workspace: CurrentWorkspace): string =>
       `${tenantMode ? deriveAddress(workspace, { tenant: true }) : deriveAddress(workspace)}@${domain}`
     const rows = new Map<string, WorkspaceView>()
@@ -397,12 +401,13 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     if (current && !workspaces.some((row) => row.key === current.key)) {
       const tenantMode = Boolean(owner?.api_key && owner.slug)
       const mailDomain = owner?.mail_domain || addressDomain(apiUrl)
+      const currentDomain = tenantMode ? (owner?.address_domain ?? `${owner!.slug}.${mailDomain}`) : mailDomain
       workspaces.unshift({
         key: current.key,
         title: current.title,
         path: current.path,
         address: null,
-        planned_address: `${tenantMode ? deriveAddress(current, { tenant: true }) : deriveAddress(current)}@${tenantMode ? `${owner!.slug}.${mailDomain}` : mailDomain}`,
+        planned_address: `${tenantMode ? deriveAddress(current, { tenant: true }) : deriveAddress(current)}@${currentDomain}`,
         provisioned: false,
         cursor: null,
         current: true,
@@ -415,6 +420,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         masked: maskKey(owner.api_key),
         slug: owner.slug ?? null,
         mail_domain: owner.mail_domain ?? null,
+        address_domain: owner.address_domain ?? null,
       } : null,
       api_url: owner?.api_url || apiUrl,
       state_file: deps.stateFilePath(),
@@ -517,12 +523,13 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
 
     if (method === 'GET' && path === `${BRIDGE_PREFIX}/peers`) return ok(res, { peers: await peers(signal) })
 
-    // 「我的租户网络」(v1.10): every agent of every owner on this account,
-    // narrow fields only. Needs the bound tenant key.
+    // 「我的租户网络」: the ORG-level union when the server knows §28 (v1.27),
+    // falling back to the v1.10 account-level union otherwise — narrow fields
+    // only. Needs the bound tenant key.
     if (method === 'GET' && path === `${BRIDGE_PREFIX}/account/agents`) {
       const { owner } = await ownerContext()
       if (!owner?.api_key) throw new BridgeError(400, 'no-tenant', 'bind a tenant first (msg9_tk_…)')
-      const page = await deps.api.ownerAccountAgents(
+      const page = await deps.api.ownerOrgAgents(
         owner.api_url,
         owner.api_key,
         intParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER),
@@ -764,10 +771,10 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       }
       const id = typeof me.id === 'string' ? me.id : undefined
       const name = typeof me.name === 'string' ? me.name : undefined
-      // Tenant subdomain assigned by the server (null = flat `@msg9.io`).
       const slug = typeof me.slug === 'string' ? me.slug : null
       const mailDomain = typeof me.mail_domain === 'string' ? me.mail_domain : undefined
-      await setOwner({ api_key: ownerKey, api_url: apiUrl, id, name, slug, mail_domain: mailDomain })
+      const addressDomain = typeof me.address_domain === 'string' ? me.address_domain : null
+      await setOwner({ api_key: ownerKey, api_url: apiUrl, id, name, slug, mail_domain: mailDomain, address_domain: addressDomain })
       return ok(res, {
         owner: {
           name: name ?? null,
@@ -775,6 +782,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
           masked: maskKey(ownerKey),
           slug,
           mail_domain: mailDomain ?? null,
+          address_domain: addressDomain,
         },
         api_url: apiUrl,
       })

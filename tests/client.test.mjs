@@ -59,6 +59,11 @@ const groupsFixture = [
   { address: 'team-x@dsh.msg9.io', display_name: 'Team X', description: 'demo group for the panel', open: false, created_by: 'dsh-alpha-1a2b@msg9.io', created_at: '2026-09-12', member_count: 3, is_member: true },
   { address: 'platform-crew@dsh.msg9.io', display_name: 'Platform Crew', description: 'someone else created it', open: false, created_by: 'msg9-io@dsh.msg9.io', created_at: '2026-09-12', member_count: 4, is_member: true },
 ]
+// The §28 org endpoint starts "unshipped" and is flipped on mid-suite.
+let orgEndpointLive = false
+const orgAgents = [
+  { owner_id: 'own_ice_dsh', owner_name: 'DSH', owner_slug: 'dsh', address_domain: 'dsh.ice.msg9.io', agent_address: 'dsh@dsh.ice.msg9.io', status: 'active', profile: { display_name: 'dsh' } },
+]
 const groupArchive = [
   // The server returns newest-first; the panel's default view flips it.
   { message_id: 'g2', from_address: 'peer@msg9.io', subject: 'follow', body: { text: 'archive body two' }, created_at: '2026-09-12T09:00:00Z' },
@@ -187,6 +192,12 @@ const server = createServer(async (req, res) => {
   }
   if (req.method === 'GET' && path === '/api/v1/owner/account/agents') {
     return reply(res, 200, { code: 0, data: { agents: accountAgents, total: accountAgents.length } })
+  }
+  // §28 (v1.27): the org-level union. Gated so the suite exercises BOTH the
+  // 404 fallback (account view) and the org-priority path once it "ships".
+  if (req.method === 'GET' && path === '/api/v1/owner/org/agents') {
+    if (!orgEndpointLive) return reply(res, 404, { code: 40400, message: 'not found' })
+    return reply(res, 200, { code: 0, data: { agents: orgAgents, total: orgAgents.length, org_id: 'org_ice', org_label: 'ice' } })
   }
   if (req.method === 'GET' && path === '/api/v1/groups') {
     return reply(res, 200, { code: 0, data: { groups: groupsFixture, total: groupsFixture.length } })
@@ -851,6 +862,16 @@ await check('contacts tab shows the tenant network grouped by owner', async () =
   assert.ok(html.includes('nova@kimi.msg9.io'), 'agent of the other owner listed')
   assert.ok(html.includes('design-review'), 'capabilities ride along')
   assert.ok(html.includes('suspended'), 'non-active status is tagged')
+})
+
+await check('account agents: the §28 org endpoint wins once it ships; 404 falls back to the account view', async () => {
+  // The tenant-network test above already exercised the fallback
+  // (orgEndpointLive=false → /owner/org/agents 404s → the account fixture).
+  orgEndpointLive = true
+  const res = await call(`${BRIDGE_PREFIX}/account/agents`)
+  assert.equal(res.payload.data.total, 1, 'org projection, not the account fixture')
+  assert.equal(res.payload.data.agents[0].address, 'dsh@dsh.ice.msg9.io')
+  orgEndpointLive = false
 })
 
 await check('groups tab lists groups; selecting one shows the card and its archive', async () => {

@@ -35,6 +35,14 @@ export interface OwnerState {
   slug?: string | null
   /** Mail domain reported by the server (defaults to msg9.io). */
   mail_domain?: string
+  /**
+   * The pod's actual address domain (v1.22+ ORG model, e.g.
+   * `dsh.ice.msg9.io` — pod dsh under org ice). Present on owner/me since the
+   * ORG upgrade. When set it WINS over `${slug}.${mail_domain}` for previews,
+   * legacy detection and display. `undefined` = never probed; `null` = probed,
+   * the server has none (flat namespace).
+   */
+  address_domain?: string | null
 }
 
 export interface WorkspaceInbox {

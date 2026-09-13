@@ -46,13 +46,16 @@ export async function ownerContext(): Promise<{ owner: OwnerState | undefined; a
   // slugs has `slug === undefined` in the state file. Ask /owner/me once and
   // persist the answer (`null` = flat namespace; per the server spec, existing
   // owners never gain a slug later, so a persisted null stays correct).
-  if (owner?.api_key && owner.slug === undefined && !process.env.MSG9_OWNER_KEY) {
+  // The ORG upgrade (v1.22) added address_domain: re-probe when it is missing
+  // so previews/legacy-detection/display track the pod's real domain.
+  if (owner?.api_key && (owner.slug === undefined || owner.address_domain === undefined) && !process.env.MSG9_OWNER_KEY) {
     try {
       const me = await ownerMe(apiUrl, owner.api_key)
       const probed: OwnerState = {
         ...owner,
         slug: typeof me.slug === 'string' ? me.slug : null,
         ...(typeof me.mail_domain === 'string' ? { mail_domain: me.mail_domain } : {}),
+        address_domain: typeof me.address_domain === 'string' ? me.address_domain : null,
       }
       await setOwner(probed)
       return { owner: probed, apiUrl }
