@@ -1,0 +1,1166 @@
+/**
+ * Browser-face smoke test for dsh-msg9-kit (no browser needed).
+ *
+ * Three layers are exercised end to end against a fake msg9 server:
+ *
+ *   1. the host bridge — `createMsg9Bridge` over fake node req/res objects,
+ *      including the loopback/origin guard and key redaction;
+ *   2. the built browser bundle — loaded through the official
+ *      `window.__ModuleLoader__` envelope, then `apply()`ed against a fake
+ *      client ctx that records slot registrations;
+ *   3. the panel itself — the store drives the real client bridge (whose
+ *      transport is the host bridge above), and the components are rendered
+ *      with `react-dom/server` so the markup can be asserted.
+ *
+ * Run: node tests/client.test.mjs   (or: npm test)
+ */
+
+import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createRequire } from 'node:module'
+import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto'
+
+process.env.MSG9KIT_LOCALE = 'en'
+const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-client-'))
+process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
+delete process.env.MSG9_OWNER_KEY
+
+const require_ = createRequire(import.meta.url)
+const React = require_('react')
+const { renderToStaticMarkup } = require_('react-dom/server')
+
+// ---------------------------------------------------------------- fake msg9
+
+const seen = { send: [], read: [], readBy: [], processed: [], contactAdd: [], contactRemove: [], ownerAgents: 0, register: 0, inboxLimit: [], provisioned: [], provisionProfiles: [], directory: [], forwarding: [], moveMail: [], signingKeys: [] }
+const ownerAgents = [{ id: 'oa_a', agent_address: 'dsh-alpha-1a2b@msg9.io', profile: { display_name: 'alpha', description: 'alpha workspace inbox', capabilities: ['code-review'] } }]
+
+const inbox = [
+  { message_id: 'm1', from_address: 'peer@msg9.io', subject: 'hello', body: { text: '**first body line**' }, created_at: '2026-09-11T09:00:00Z' },
+  { message_id: 'm2', from_address: 'beta@msg9.io', subject: 'second', body: { text: 'second body' }, created_at: '2026-09-11T10:00:00Z', read_at: '2026-09-11T10:05:00Z' },
+  { message_id: 'm3', from_address: 'peer@msg9.io', subject: 'snippet', body: { text: '看这段：\n\n```ts\nconst answer: number = 42\n```' }, created_at: '2026-09-11T10:30:00Z', read_at: '2026-09-11T10:31:00Z', verified: true, key_id: 'kid_peer_1', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-9' },
+]
+const outbox = [
+  { message_id: 'o1', from_address: 'dsh-alpha-1a2b@msg9.io', to_address: 'peer@msg9.io', subject: 'answer', body: { text: 'sent body' }, created_at: '2026-09-11T11:00:00Z' },
+]
+const contacts = [{ id: 'c1', contact: 'peer@msg9.io', alias: 'Peer', notes: 'sibling workspace', status: 'accepted' }]
+const directoryAgents = [
+  { address: 'dsh-alpha-1a2b@msg9.io', profile: { display_name: 'alpha', description: 'alpha workspace inbox', capabilities: ['code-review'], visibility: 'public' }, created_at: '2026-09-11' },
+  { address: 'nova@vme.msg9.io', profile: { display_name: 'Nova', description: 'design reviewer of another tenant', capabilities: ['design-review'], links: { workspace: '/opt/nova' }, visibility: 'public' }, created_at: '2026-09-10' },
+]
+const accountAgents = [
+  { owner_id: 'own_ui', owner_name: 'dsh-ui', address_domain: 'msg9.io', agent_address: 'dsh-alpha-1a2b@msg9.io', status: 'active', profile: { display_name: 'alpha' } },
+  { owner_id: 'own_kimi', owner_name: 'KimiCode', owner_slug: 'kimi', address_domain: 'kimi.msg9.io', agent_address: 'nova@kimi.msg9.io', status: 'active', profile: { display_name: 'Nova', capabilities: ['design-review'] } },
+  { owner_id: 'own_kimi', owner_name: 'KimiCode', owner_slug: 'kimi', address_domain: 'kimi.msg9.io', agent_address: 'old@kimi.msg9.io', status: 'suspended', profile: { display_name: 'Old' } },
+]
+const groupsFixture = [
+  { address: 'team-x@dsh.msg9.io', display_name: 'Team X', description: 'demo group for the panel', open: false, created_by: 'dsh-alpha-1a2b@msg9.io', created_at: '2026-09-12', member_count: 3, is_member: true },
+  { address: 'platform-crew@dsh.msg9.io', display_name: 'Platform Crew', description: 'someone else created it', open: false, created_by: 'msg9-io@dsh.msg9.io', created_at: '2026-09-12', member_count: 4, is_member: true },
+]
+const groupArchive = [
+  // The server returns newest-first; the panel's default view flips it.
+  { message_id: 'g2', from_address: 'peer@msg9.io', subject: 'follow', body: { text: 'archive body two' }, created_at: '2026-09-12T09:00:00Z' },
+  { message_id: 'g1', from_address: 'boss@msg9.io', subject: 'kickoff', body: { text: '**archive body one**' }, created_at: '2026-09-12T08:00:00Z' },
+]
+
+function reply(res, status, payload) {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(payload))
+}
+function readBody(req) {
+  return new Promise((resolve) => {
+    let raw = ''
+    req.on('data', (chunk) => { raw += chunk })
+    req.on('end', () => resolve(raw ? JSON.parse(raw) : {}))
+  })
+}
+function readRaw(req) {
+  return new Promise((resolve) => {
+    let raw = ''
+    req.on('data', (chunk) => { raw += chunk })
+    req.on('end', () => resolve(raw))
+  })
+}
+
+/** Verify an msg9-sig-v1 signed send the way the real server would. */
+const SPKI_ED25519_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
+function verifySignedSend({ publicKeyB64, headers, rawBody, from, to }) {
+  const publicKey = createPublicKey({
+    key: Buffer.concat([SPKI_ED25519_PREFIX, Buffer.from(publicKeyB64, 'base64')]),
+    format: 'der',
+    type: 'spki',
+  })
+  const payload = [
+    'msg9-sig-v1',
+    `from=${from}`,
+    `to=${to}`,
+    `ts=${headers['x-msg9-timestamp']}`,
+    `nonce=${headers['x-msg9-nonce']}`,
+    `idem=${headers['idempotency-key']}`,
+    `body_sha256=${createHash('sha256').update(rawBody, 'utf8').digest('hex')}`,
+  ].join('\n')
+  return cryptoVerify(null, Buffer.from(payload, 'utf8'), publicKey, Buffer.from(headers['x-msg9-signature'], 'base64'))
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://fake')
+  const path = url.pathname
+
+  if (req.method === 'GET' && path === '/api/v1/inbox/messages') {
+    seen.inboxLimit.push(url.searchParams.get('limit'))
+    return reply(res, 200, { code: 0, data: { messages: inbox, total: inbox.length, unread_count: 3 } })
+  }
+  if (req.method === 'GET' && path === '/api/v1/outbox/messages') {
+    return reply(res, 200, { code: 0, data: { messages: outbox, total: outbox.length } })
+  }
+  if (req.method === 'POST' && path === '/api/v1/send') {
+    const rawBody = await readRaw(req)
+    seen.send.push({
+      auth: req.headers.authorization,
+      body: rawBody ? JSON.parse(rawBody) : {},
+      rawBody,
+      idempotencyKey: req.headers['idempotency-key'],
+      signatureHeaders: req.headers['x-msg9-signature']
+        ? {
+            'x-msg9-signature': req.headers['x-msg9-signature'],
+            'x-msg9-timestamp': req.headers['x-msg9-timestamp'],
+            'x-msg9-nonce': req.headers['x-msg9-nonce'],
+            'idempotency-key': req.headers['idempotency-key'],
+          }
+        : null,
+    })
+    return reply(res, 200, { code: 0, data: { message_id: 'm_sent_ui', status: 'accepted' } })
+  }
+  if (req.method === 'PUT' && path === '/api/v1/agent/signing-key') {
+    const body = await readBody(req)
+    seen.signingKeys.push({ auth: req.headers.authorization, publicKey: body.signing_public_key })
+    return reply(res, 200, { code: 0, data: { signing_public_key: body.signing_public_key, key_id: 'kid_fake', first_time: true } })
+  }
+  if (req.method === 'POST' && /^\/api\/v1\/inbox\/messages\/.+\/read$/.test(path)) {
+    const body = await readBody(req)
+    seen.read.push(decodeURIComponent(path.split('/')[5]))
+    seen.readBy.push(body.by ?? null)
+    return reply(res, 200, { code: 0, data: { status: 'ok' } })
+  }
+  if (req.method === 'POST' && /^\/api\/v1\/inbox\/messages\/.+\/processed$/.test(path)) {
+    const body = await readBody(req)
+    seen.processed.push({ id: decodeURIComponent(path.split('/')[5]), by: body.by ?? null })
+    return reply(res, 200, { code: 0, data: { status: 'ok' } })
+  }
+  if (req.method === 'GET' && path === '/api/v1/contacts') {
+    return reply(res, 200, { code: 0, data: { contacts, total: contacts.length } })
+  }
+  if (req.method === 'GET' && path === '/api/v1/directory') {
+    seen.directory.push({ q: url.searchParams.get('q'), capability: url.searchParams.get('capability'), limit: url.searchParams.get('limit') })
+    const q = (url.searchParams.get('q') ?? '').toLowerCase()
+    const capability = url.searchParams.get('capability')
+    const agents = directoryAgents.filter((agent) => {
+      if (capability && !(agent.profile.capabilities ?? []).includes(capability)) return false
+      if (q && !`${agent.profile.display_name} ${agent.address} ${agent.profile.description}`.toLowerCase().includes(q)) return false
+      return true
+    })
+    return reply(res, 200, { code: 0, data: { agents, total: agents.length } })
+  }
+  if (req.method === 'POST' && path === '/api/v1/contacts') {
+    const body = await readBody(req)
+    seen.contactAdd.push(body)
+    return reply(res, 200, { code: 0, data: { id: 'c9', contact: body.contact, alias: body.alias, status: 'accepted' } })
+  }
+  if (req.method === 'DELETE' && path.startsWith('/api/v1/contacts/')) {
+    seen.contactRemove.push(decodeURIComponent(path.slice('/api/v1/contacts/'.length)))
+    return reply(res, 200, { code: 0, data: { status: 'ok' } })
+  }
+  if (req.method === 'GET' && path === '/api/v1/owner/me') {
+    const auth = req.headers.authorization || ''
+    // A tenant with a subdomain slug (post-upgrade server shape).
+    if (auth === 'Bearer msg9_tk_slug_1234567890') {
+      return reply(res, 200, { code: 0, data: { id: 'own_sl', name: 'slugged', slug: 'vme', mail_domain: 'msg9.io', quota: { max_agents: 50 } } })
+    }
+    if (auth !== 'Bearer msg9_tk_ui_1234567890') return reply(res, 401, { code: 40100, message: 'invalid owner key' })
+    return reply(res, 200, { code: 0, data: { id: 'own_ui', name: 'dsh-ui', quota: { max_agents: 50 } } })
+  }
+  if (req.method === 'GET' && path === '/api/v1/owner/agents') {
+    seen.ownerAgents += 1
+    return reply(res, 200, { code: 0, data: { agents: ownerAgents, total: ownerAgents.length } })
+  }
+  if (req.method === 'GET' && path === '/api/v1/owner/account/agents') {
+    return reply(res, 200, { code: 0, data: { agents: accountAgents, total: accountAgents.length } })
+  }
+  if (req.method === 'GET' && path === '/api/v1/groups') {
+    return reply(res, 200, { code: 0, data: { groups: groupsFixture, total: groupsFixture.length } })
+  }
+  if (req.method === 'GET' && /^\/api\/v1\/groups\/.+\/messages$/.test(path)) {
+    return reply(res, 200, { code: 0, data: { messages: groupArchive, total: groupArchive.length } })
+  }
+  if (req.method === 'GET' && path.startsWith('/api/v1/groups/')) {
+    const address = decodeURIComponent(path.slice('/api/v1/groups/'.length))
+    const group = groupsFixture.find((row) => row.address === address)
+    if (!group) return reply(res, 404, { code: 40400, message: 'not found' })
+    return reply(res, 200, { code: 0, data: { ...group, members: ['a1@x.msg9.io', 'b2@x.msg9.io', 'c3@x.msg9.io'] } })
+  }
+  if (req.method === 'POST' && path === '/api/v1/owner/agents') {
+    const body = await readBody(req)
+    seen.provisioned.push(body.addresses[0])
+    seen.provisionProfiles.push(body.profile ?? null)
+    // This local part is already taken: the server reports a 40900 conflict
+    // inside the provision envelope.
+    if (body.addresses[0] === 'taken') {
+      return reply(res, 200, { code: 0, data: { created: [], errors: [{ address: 'taken@vme.msg9.io', code: 40900, message: 'address already taken' }] } })
+    }
+    // The slugged tenant mints addresses on its own domain.
+    const domain = req.headers.authorization === 'Bearer msg9_tk_slug_1234567890' ? 'vme.msg9.io' : 'msg9.io'
+    const address = `${body.addresses[0]}@${domain}`
+    seen.ownerAgents += 1
+    ownerAgents.push({ id: 'oa_new', agent_address: address, ...(body.profile ? { profile: body.profile } : {}) })
+    return reply(res, 200, { code: 0, data: { created: [{ address, api_key: `msg9_sk_prov_${body.addresses[0]}` }], errors: [] } })
+  }
+  if (req.method === 'POST' && /^\/api\/v1\/owner\/agents\/.+\/disable$/.test(path)) {
+    seen.disabled = seen.disabled ?? []
+    seen.disabled.push(decodeURIComponent(path.split('/')[5]))
+    return reply(res, 200, { code: 0, data: { status: 'suspended' } })
+  }
+  if (req.method === 'PUT' && path === '/api/v1/agent/forwarding') {
+    const body = await readBody(req)
+    seen.forwarding.push({ auth: req.headers.authorization, target: body.target })
+    return reply(res, 200, { code: 0, data: { address: 'dsh-alpha-1a2b@msg9.io', target: body.target, notify_sender: false } })
+  }
+  if (req.method === 'POST' && /^\/api\/v1\/owner\/agents\/.+\/move-mail$/.test(path)) {
+    const body = await readBody(req)
+    seen.moveMail.push({ address: decodeURIComponent(path.split('/')[5]), to: body.to })
+    return reply(res, 200, { code: 0, data: { moved: 2 } })
+  }
+  if (req.method === 'POST' && path === '/api/v1/register') {
+    const body = await readBody(req)
+    seen.register += 1
+    return reply(res, 201, { code: 0, data: { address: `${body.requested_address}@msg9.io`, api_key: 'msg9_sk_pub_new' } })
+  }
+  return reply(res, 404, { code: 40400, message: 'not found' })
+})
+
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+const apiUrl = `http://127.0.0.1:${server.address().port}`
+process.env.MSG9_API_URL = apiUrl
+
+// Pre-provisioned tenant: an owner plus two workspace inboxes. Workspace C has
+// no inbox yet, so the panel's "open inbox" path has something to do.
+await writeFile(process.env.MSG9_STATE_FILE, `${JSON.stringify({
+  owner: { api_key: 'msg9_tk_smoketest0123456789', api_url: apiUrl, id: 'own_1', name: 'dsh' },
+  workspaces: {
+    'ws-a': { address: 'dsh-alpha-1a2b@msg9.io', api_key: 'msg9_sk_a', api_url: apiUrl, title: 'alpha', path: '/work/a', cursor: 'C1' },
+    'ws-b': { address: 'dsh-beta-3c4d@msg9.io', api_key: 'msg9_sk_b', api_url: apiUrl, title: 'beta', path: '/work/b' },
+  },
+}, null, 2)}\n`)
+
+// ------------------------------------------------------------- fake dsh host
+
+const workspaces = [
+  { id: 'ws-a', title: 'alpha', path: '/work/a' },
+  { id: 'ws-b', title: 'beta', path: '/work/b' },
+  { id: 'ws-c', title: 'gamma', path: '/work/c' },
+]
+const sessionCwd = { 'sess-a': '/work/a', 'sess-c': '/work/c' }
+
+const host = {
+  logger: () => ({ info: () => {} }),
+  sessions: { get: (id) => (sessionCwd[id] ? { header: { cwd: sessionCwd[id] } } : undefined) },
+  workspaceRegistry: { list: () => workspaces },
+}
+
+const {
+  BRIDGE_PREFIX,
+  createMsg9Bridge,
+  defaultBridgeDeps,
+  isTrustedRequest,
+  createBridgeEventBus,
+} = await import('../lib/index.js')
+
+const bridge = createMsg9Bridge(defaultBridgeDeps(host))
+
+// ----------------------------------------------------- node req/res doubles
+
+function fakeReq({ method = 'GET', url = '/', body, headers = {} } = {}) {
+  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
+  return {
+    method,
+    url,
+    headers: { host: '127.0.0.1:3080', ...headers },
+    on() {},
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk
+    },
+  }
+}
+
+function fakeRes() {
+  const listeners = {}
+  const res = {
+    status: 0,
+    body: undefined,
+    headers: undefined,
+    written: [],
+    // The bridge subscribes to 'close' to abort outbound calls on disconnect.
+    on(event, fn) {
+      ;(listeners[event] ??= []).push(fn)
+    },
+    fire(event) {
+      for (const fn of listeners[event] ?? []) fn()
+    },
+    writableEnded: false,
+    writeHead(status, headers) {
+      res.status = status
+      res.headers = headers
+    },
+    write(text) {
+      res.written.push(text)
+    },
+    end(text) {
+      res.body = text
+      res.writableEnded = true
+    },
+    json() {
+      return res.body ? JSON.parse(res.body) : undefined
+    },
+  }
+  return res
+}
+
+/** Call one bridge route and return `{ status, payload }`. */
+async function call(path, { method = 'GET', body, headers } = {}) {
+  const res = fakeRes()
+  await bridge.handle(fakeReq({ method, url: path, body, headers }), res)
+  return { status: res.status, payload: res.json(), raw: res.body }
+}
+
+// -------------------------------------------------------------- bundle load
+
+let envelope
+globalThis.window = {
+  __ModuleLoader__: {
+    load: (captured) => {
+      envelope = captured
+    },
+  },
+}
+await import('../lib/client.js')
+assert.ok(envelope, 'client bundle must register itself with the module loader')
+const client = envelope.factory((specifier) => require_(specifier))
+
+/** A `fetch` that serves the client bridge from the host bridge. */
+function bridgeFetch() {
+  return async (url, init = {}) => {
+    const target = new URL(url, 'http://127.0.0.1:3080')
+    const res = fakeRes()
+    await bridge.handle(fakeReq({
+      method: init.method ?? 'GET',
+      url: `${target.pathname}${target.search}`,
+      body: init.body ? JSON.parse(init.body) : undefined,
+    }), res)
+    return {
+      ok: res.status >= 200 && res.status < 300,
+      status: res.status,
+      statusText: '',
+      text: async () => res.body ?? '',
+    }
+  }
+}
+
+let failed = 0
+async function check(name, fn) {
+  try {
+    await fn()
+    console.log(`  [ok] ${name}`)
+  } catch (error) {
+    failed += 1
+    console.log(`  [FAIL] ${name}: ${error.message}`)
+  }
+}
+
+console.log('dsh-msg9-kit browser-face smoke test:')
+
+// ------------------------------------------------------------- host bridge
+
+await check('bridge: overview resolves the current workspace from a session cwd', async () => {
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/overview?cwd=%2Fwork%2Fa`)
+  assert.equal(status, 200)
+  assert.equal(payload.ok, true)
+  assert.equal(payload.data.current.key, 'ws-a')
+  assert.equal(payload.data.current.address, 'dsh-alpha-1a2b@msg9.io')
+  assert.equal(payload.data.owner.name, 'dsh')
+  assert.deepEqual(payload.data.workspaces.map((row) => row.key), ['ws-a', 'ws-b', 'ws-c'])
+  assert.equal(payload.data.workspaces.find((row) => row.key === 'ws-c').provisioned, false)
+  // Unprovisioned rows carry the host-derived address preview.
+  assert.match(payload.data.workspaces.find((row) => row.key === 'ws-c').planned_address, /^dsh-gamma-[0-9a-f]{4}@/)
+  assert.equal(payload.data.workspaces.find((row) => row.key === 'ws-a').planned_address, null)
+})
+
+await check('bridge: overview without a cwd still lists the tenant', async () => {
+  const { payload } = await call(`${BRIDGE_PREFIX}/overview`)
+  assert.equal(payload.data.current, null)
+  assert.equal(payload.data.workspaces.length, 3)
+  assert.match(payload.data.owner.masked, /^msg9_tk_smo…/)
+})
+
+await check('bridge: no response ever carries a usable key', async () => {
+  const secrets = ['msg9_tk_smoketest0123456789', 'msg9_sk_a', 'msg9_sk_b']
+  for (const path of ['/overview?cwd=%2Fwork%2Fa', '/messages?key=ws-a', '/outbox?key=ws-a', '/contacts?key=ws-a', '/peers', '/unread']) {
+    const { raw } = await call(`${BRIDGE_PREFIX}${path}`)
+    for (const secret of secrets) {
+      assert.ok(!raw.includes(secret), `${path} leaked ${secret}`)
+    }
+  }
+  // The owner key reaches the page only in its masked form.
+  const { raw } = await call(`${BRIDGE_PREFIX}/overview`)
+  assert.ok(raw.includes('msg9_tk_smo…6789'), raw)
+})
+
+await check('bridge: messages/outbox/contacts return the workspace mailbox', async () => {
+  const messages = await call(`${BRIDGE_PREFIX}/messages?key=ws-a&folder=all&limit=10`)
+  assert.equal(messages.payload.data.messages.length, 3)
+  assert.equal(messages.payload.data.unread_count, 3)
+
+  // No limit given: the documented default (20) reaches the upstream — a
+  // regression here once clamped the absent parameter to a single message.
+  seen.inboxLimit.length = 0
+  const dflt = await call(`${BRIDGE_PREFIX}/messages?key=ws-a`)
+  assert.equal(dflt.payload.data.messages.length, 3)
+  assert.deepEqual(seen.inboxLimit, ['20'])
+
+  const outboxPage = await call(`${BRIDGE_PREFIX}/outbox?key=ws-a`)
+  assert.equal(outboxPage.payload.data.messages[0].message_id, 'o1')
+  assert.equal(outboxPage.payload.data.messages[0].to_address, 'peer@msg9.io')
+
+  const addressBook = await call(`${BRIDGE_PREFIX}/contacts?key=ws-a`)
+  assert.equal(addressBook.payload.data.contacts[0].alias, 'Peer')
+})
+
+await check('bridge: send / read / contacts write through to msg9', async () => {
+  const sent = await call(`${BRIDGE_PREFIX}/send`, {
+    method: 'POST',
+    body: { key: 'ws-a', to: 'peer@msg9.io', subject: 'hi', text: 'from the panel' },
+  })
+  assert.equal(sent.payload.data.message_id, 'm_sent_ui')
+  assert.equal(seen.send[0].auth, 'Bearer msg9_sk_a')
+  assert.deepEqual(seen.send[0].body, { to: 'peer@msg9.io', subject: 'hi', body: { text: 'from the panel' } })
+
+  await call(`${BRIDGE_PREFIX}/read`, { method: 'POST', body: { key: 'ws-a', message_id: 'm1' } })
+  assert.deepEqual(seen.read, ['m1'])
+
+  await call(`${BRIDGE_PREFIX}/contacts`, { method: 'POST', body: { key: 'ws-a', contact: 'gamma@msg9.io', alias: 'Gamma' } })
+  assert.deepEqual(seen.contactAdd, [{ contact: 'gamma@msg9.io', alias: 'Gamma' }])
+
+  await call(`${BRIDGE_PREFIX}/contacts?key=ws-a&address=gamma%40msg9.io`, { method: 'DELETE' })
+  assert.deepEqual(seen.contactRemove, ['gamma@msg9.io'])
+})
+
+await check('bridge: peers and unread serve the sidebar badge', async () => {
+  const peers = await call(`${BRIDGE_PREFIX}/peers`)
+  assert.equal(peers.payload.data.peers.length, 1)
+  assert.equal(peers.payload.data.peers[0].title, 'alpha')
+  // Yellow-pages profile rides the roster (v1.5).
+  assert.equal(peers.payload.data.peers[0].description, 'alpha workspace inbox')
+  assert.deepEqual(peers.payload.data.peers[0].capabilities, ['code-review'])
+
+  const unread = await call(`${BRIDGE_PREFIX}/unread`)
+  const keys = Object.keys(unread.payload.data.byKey).sort()
+  assert.deepEqual(keys, ['ws-a', 'ws-b']) // ws-c has no inbox yet
+  assert.equal(unread.payload.data.total, 3 * keys.length) // every inbox reports 3 unread
+  assert.equal(unread.payload.data.byKey['ws-a'], 3)
+})
+
+await check('bridge: provision opens the inbox of a workspace that has none', async () => {
+  const before = seen.ownerAgents
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: '/work/c', title: 'gamma' } })
+  assert.equal(payload.data.key, 'ws-c')
+  assert.ok(payload.data.address.startsWith('dsh-gamma-'), payload.data.address)
+  assert.equal(payload.data.provisioned, true)
+  assert.equal(seen.ownerAgents, before + 1)
+  // Provisioning writes the yellow-pages profile for the new inbox.
+  const profile = seen.provisionProfiles[seen.provisionProfiles.length - 1]
+  assert.equal(profile.display_name, 'gamma')
+  assert.equal(profile.links.workspace, '/work/c')
+
+  const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=%2Fwork%2Fc`)
+  assert.equal(overview.payload.data.current.key, 'ws-c')
+  assert.equal(overview.payload.data.current.provisioned, true)
+})
+
+await check('bridge: rejects untrusted hosts, unknown routes and missing params', async () => {
+  assert.equal(isTrustedRequest(fakeReq({ headers: { host: 'evil.example:80' } })), false)
+  assert.equal(isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080' } })), true)
+  // A browser origin is authoritative: cross-site pages cannot drive the bridge.
+  assert.equal(isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'http://evil.example' } })), false)
+  assert.equal(isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' } })), true)
+  assert.equal(isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:9999' } })), false)
+
+  const forbidden = await call(`${BRIDGE_PREFIX}/overview`, { headers: { host: 'evil.example' } })
+  assert.equal(forbidden.status, 403)
+  assert.equal(forbidden.payload.error.code, 'forbidden')
+
+  const notFound = await call(`${BRIDGE_PREFIX}/nope`)
+  assert.equal(notFound.status, 404)
+
+  const missingKey = await call(`${BRIDGE_PREFIX}/messages`)
+  assert.equal(missingKey.status, 400)
+  assert.equal(missingKey.payload.error.code, 'missing-key')
+
+  const unknownWorkspace = await call(`${BRIDGE_PREFIX}/messages?key=ghost`)
+  assert.equal(unknownWorkspace.status, 404)
+  assert.equal(unknownWorkspace.payload.error.code, 'unknown-workspace')
+})
+
+await check('bridge: the notify mute survives a write/read roundtrip (the lost-on-refresh bug)', async () => {
+  const on = await call(`${BRIDGE_PREFIX}/notify`, { method: 'POST', body: { paused: true } })
+  assert.equal(on.payload.data.paused, true)
+  // The state file round trip is the actual regression: loadState once dropped
+  // every top-level field except owner/workspaces, so the mute never came back.
+  const saved = JSON.parse(await readFile(process.env.MSG9_STATE_FILE, 'utf8'))
+  assert.equal(saved.notify_paused, true, 'persisted to the state file')
+  const back = await call(`${BRIDGE_PREFIX}/notify`)
+  assert.equal(back.payload.data.paused, true, 'and it reads back')
+  // Leave the fixture unmuted for the rest of the suite.
+  await call(`${BRIDGE_PREFIX}/notify`, { method: 'POST', body: { paused: false } })
+})
+
+// --------------------------------------------------------- browser bundle
+
+await check('bundle: the module-loader envelope names the package', () => {
+  assert.equal(envelope.id, 'dsh-msg9-kit')
+  assert.equal(client.name, 'msg9-kit')
+  assert.deepEqual([...client.inject], ['slots'])
+  assert.equal(client.MSG9_VIEW_ID, 'msg9')
+})
+
+await check('apply(): the conversation view tab and the settings section are registered', async () => {
+  const registrations = []
+  const injections = []
+  const disposers = []
+  const ctx = {
+    logger: () => ({ info: () => {} }),
+    effect: (fn) => {
+      const dispose = fn()
+      const disposer = () => {
+        if (typeof dispose === 'function') dispose()
+      }
+      disposers.push(disposer)
+      return disposer
+    },
+    slots: {
+      inject: (slot, callback) => {
+        injections.push(slot)
+        callback()
+      },
+      register: (options, component) => {
+        registrations.push({ options, component })
+        return () => {}
+      },
+    },
+  }
+  client.apply(ctx)
+
+  assert.deepEqual([...new Set(injections)].sort(), ['conversation.view', 'settings.section'])
+
+  // The「消息」view tab sits after 对话 | 轨迹 | 文件 (order 30).
+  const view = registrations.find((row) => row.options.name === 'conversation.view')
+  assert.equal(view.options.id, 'msg9')
+  assert.equal(view.options.order, 30)
+  assert.equal(view.options.label(), 'Messages')
+  assert.equal(typeof view.component, 'function')
+  const viewStore = view.options.inject().store
+  assert.equal(typeof viewStore.getState, 'function')
+  // The mute state shows on the tab itself (no need to open it to know).
+  // The registered store is the singleton (default bridge): point the global
+  // fetch at the test bridge so toggleNotify can reach it.
+  const realFetch = globalThis.fetch
+  globalThis.fetch = bridgeFetch()
+  await viewStore.toggleNotify()
+  globalThis.fetch = realFetch
+  assert.equal(viewStore.getState().notifyPaused, true)
+  assert.ok(view.options.label().includes('‖'), 'muted tab is marked')
+  globalThis.fetch = bridgeFetch()
+  await viewStore.toggleNotify()
+  globalThis.fetch = realFetch
+
+  // Settings → 消息信箱 section.
+  const section = registrations.find((row) => row.options.name === 'settings.section')
+  assert.equal(section.options.id, 'msg9-mailboxes')
+  assert.equal(section.options.label(), 'Messages')
+  assert.equal(typeof section.options.inject().store.getState, 'function')
+
+  // Effects: just the unread poller.
+  assert.equal(disposers.length, 1)
+  for (const dispose of disposers) dispose()
+})
+
+// -------------------------------------------------------------- panel + store
+
+await check('store: loads overview, inbox, outbox and contacts through the bridge', async () => {
+  const store = client.createMsg9Store({
+    bridge: client.createBridge({ fetch: bridgeFetch() }),
+    pollMs: 10 ** 9,
+  })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const state = store.getState()
+  assert.equal(state.status, 'ready')
+  assert.equal(state.currentKey, 'ws-a')
+  assert.equal(state.owner.name, 'dsh')
+  assert.equal(state.messages.length, 3)
+  assert.equal(state.unreadCount, 3)
+  assert.equal(state.outbox.length, 1)
+  assert.equal(state.contacts.length, 1)
+  assert.equal(state.unreadTotal, 3 * Object.keys(state.unreadByKey).length)
+  assert.equal(store.getState() === state, true)
+})
+
+await check('store: send, mark-read, contacts and provision move the real data', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+
+  store.setCompose({ to: 'peer@msg9.io', subject: 'ping', text: 'hello from the panel' })
+  await store.send()
+  assert.ok(store.getState().notice.text.includes('m_sent_ui'), store.getState().notice.text)
+  assert.equal(store.getState().compose.text, '')
+  assert.equal(seen.send[seen.send.length - 1].body.body.text, 'hello from the panel')
+
+  const before = store.getState().unreadCount
+  await store.markRead('m1')
+  assert.equal(store.getState().unreadCount, before - 1)
+  assert.ok(store.getState().messages.find((message) => message.message_id === 'm1').read_at)
+  assert.equal(seen.read[seen.read.length - 1], 'm1')
+
+  await store.addContact({ contact: 'delta@msg9.io', alias: 'Delta' })
+  assert.equal(seen.contactAdd[seen.contactAdd.length - 1].contact, 'delta@msg9.io')
+
+  await store.removeContact('delta@msg9.io')
+  assert.equal(seen.contactRemove[seen.contactRemove.length - 1], 'delta@msg9.io')
+
+  store.selectWorkspace('ws-c')
+  await store.provision()
+  assert.ok(store.getState().notice.text.includes('dsh-gamma-'), store.getState().notice.text)
+  assert.equal(store.getState().workspaces.find((row) => row.key === 'ws-c').provisioned, true)
+})
+await check('store: failed sends surface a notice and keep the draft', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  store.setCompose({ to: '', text: '' })
+  await store.send()
+  assert.equal(store.getState().notice.kind, 'error')
+  assert.ok(store.getState().notice.text.includes('recipient'), store.getState().notice.text)
+})
+
+await check('store: a retried send reuses one idempotency key', async () => {
+  const base = bridgeFetch()
+  const sendKeys = []
+  let failFirstSend = true
+  const flaky = async (url, init) => {
+    if (String(url).includes('/send')) {
+      sendKeys.push(JSON.parse(init.body).idempotency_key)
+      if (failFirstSend) {
+        failFirstSend = false
+        return { ok: false, status: 500, statusText: '', text: async () => JSON.stringify({ ok: false, error: { code: 'boom', message: 'send failed' } }) }
+      }
+    }
+    return base(url, init)
+  }
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: flaky }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+
+  store.setCompose({ to: 'peer@msg9.io', text: 'retry me' })
+  await store.send()
+  assert.equal(store.getState().notice.kind, 'error')
+  await store.send()
+  assert.equal(store.getState().notice.kind, 'ok')
+
+  // Both attempts carried the SAME key, and that key reached msg9 as the
+  // Idempotency-Key header — the server can dedup instead of double-sending.
+  assert.equal(sendKeys.length, 2)
+  assert.ok(sendKeys[0], 'client generates a key')
+  assert.equal(sendKeys[0], sendKeys[1])
+  assert.equal(seen.send[seen.send.length - 1].idempotencyKey, sendKeys[0])
+
+  // Editing the draft is a new intent: the next send gets a fresh key.
+  store.setCompose({ to: 'peer@msg9.io', text: 'retry me (edited)' })
+  await store.send()
+  assert.equal(sendKeys.length, 3)
+  assert.notEqual(sendKeys[2], sendKeys[0])
+})
+
+await check('store: a failed mark-read restores the list AND the unread count', async () => {
+  const base = bridgeFetch()
+  let failFirstRead = true
+  const flaky = async (url, init) => {
+    if (failFirstRead && String(url).includes('/read')) {
+      failFirstRead = false
+      return { ok: false, status: 500, statusText: '', text: async () => JSON.stringify({ ok: false, error: { code: 'boom', message: 'read failed' } }) }
+    }
+    return base(url, init)
+  }
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: flaky }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const before = store.getState().unreadCount
+  await store.markRead('m1')
+  assert.equal(store.getState().notice.kind, 'error')
+  assert.equal(store.getState().unreadCount, before, 'badge count restored')
+  assert.equal(store.getState().messages.find((message) => message.message_id === 'm1').read_at, undefined, 'message still unread')
+})
+
+await check('store: a stale list response never overwrites the workspace being viewed', async () => {
+  // Fully fake bridge: inbox fetches hang until the test releases them.
+  const release = new Map()
+  const fake = {
+    overview: async () => ({
+      owner: null,
+      api_url: 'http://fake',
+      state_file: '',
+      current: null,
+      workspaces: [
+        { key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false },
+        { key: 'ws-b', title: 'beta', path: '/work/b', address: 'b@msg9.io', provisioned: true, cursor: null, current: false },
+      ],
+    }),
+    messages: (key) => new Promise((resolve) => release.set(key, resolve)),
+    outbox: async () => ({ messages: [], total: 0 }),
+    contacts: async () => ({ contacts: [], total: 0 }),
+    unread: async () => ({ total: 0, byKey: {} }),
+    peers: async () => ({ peers: [] }),
+  }
+  const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshOverview()
+  assert.ok(release.has('ws-a'), 'inbox of the auto-selected workspace is loading')
+
+  // Switch workspaces while ws-a's fetch is still in flight.
+  store.selectWorkspace('ws-b')
+  assert.ok(release.has('ws-b'))
+
+  // The NEWER request answers first, then the stale one: last write must win.
+  release.get('ws-b')({ messages: [{ message_id: 'b1', from_address: 'x@msg9.io' }], total: 1, unread_count: 0 })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  release.get('ws-a')({ messages: [{ message_id: 'a1', from_address: 'x@msg9.io' }], total: 1, unread_count: 0 })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  assert.equal(store.getState().currentKey, 'ws-b')
+  assert.deepEqual(store.getState().messages.map((message) => message.message_id), ['b1'])
+})
+
+await check('panel renders the current workspace mailbox (server-side markup)', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+
+  // Three columns: nav (boxes + compose), list, detail placeholder.
+  assert.ok(html.includes('Inbox'), 'nav: inbox')
+  assert.ok(html.includes('Outbox'), 'nav: outbox')
+  assert.ok(html.includes('Contacts'), 'nav: contacts')
+  assert.ok(html.includes('Compose'), 'nav: compose button')
+  assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'address shown')
+  assert.ok(html.includes('peer@msg9.io'), 'sender shown')
+  assert.ok(html.includes('hello'), 'subject shown')
+  assert.ok(html.includes('first body line'), 'preview shown')
+  assert.ok(html.includes('Select a message to read it.'), 'detail placeholder')
+  // The body renders as markdown in the detail column.
+  store.selectMessage('m1')
+  const reading = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(reading.includes('m9-md'), 'markdown container')
+  assert.ok(reading.includes('<strong>first body line</strong>'), 'markdown rendered, not raw')
+  assert.ok(reading.includes('Unsigned'), 'unsigned mail is labelled as such')
+  // Fenced code blocks get syntax highlighting (Shiki css-variables theme).
+  await client.highlightReady
+  store.selectMessage('m3')
+  const coded = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(coded.includes('language-ts'), 'language tag on the fence')
+  assert.ok(coded.includes('var(--shiki-'), 'code is highlighted with Shiki token variables')
+  assert.ok(coded.includes('Signature verified'), 'verified mail carries the badge')
+  assert.ok(coded.includes('team-x@dsh.msg9.io'), 'group address shown on a group copy')
+  assert.ok(coded.includes('Reply to group'), 'group copies reply to the group, not the sender')
+  // The composer opens in the detail column on demand.
+  store.composeTo('peer@msg9.io')
+  const composing = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(composing.includes('peer@msg9.io'), 'reply pre-fills the recipient')
+  assert.ok(composing.includes('Send'), 'composer offered')
+})
+
+await check('square tab lists public agents and shows the agent card', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  store.setTab('square')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  assert.equal(store.getState().directoryTotal, 2)
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(html.includes('Square'), 'nav: square')
+  assert.ok(html.includes('nova@vme.msg9.io'), 'agent of another tenant listed')
+  assert.ok(html.includes('design-review'), 'capability chip listed')
+  assert.ok(html.includes('known'), 'the local inbox is tagged as known')
+
+  // Selecting an agent shows its yellow-pages card with the follow-up actions.
+  store.selectAgent('nova@vme.msg9.io')
+  const card = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(card.includes('Nova'), 'display name on the card')
+  assert.ok(card.includes('design reviewer of another tenant'), 'description on the card')
+  assert.ok(card.includes('/opt/nova'), 'profile link on the card')
+  assert.ok(card.includes('Add contact'), 'add-contact action offered')
+
+  // Adding it lands in the workspace's address book (alias = display name).
+  const added = await store.addContact({ contact: 'nova@vme.msg9.io', alias: 'Nova' })
+  assert.ok(added, 'addContact resolves true')
+  assert.equal(seen.contactAdd.at(-1).contact, 'nova@vme.msg9.io')
+  assert.equal(seen.contactAdd.at(-1).alias, 'Nova')
+
+  // The square queries the SERVER: q / capability ride the request, and the
+  // page size stays within the v1.10 cap of 100.
+  assert.equal(seen.directory.at(-1).limit, '100')
+  store.setDirectoryQuery('nova')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(seen.directory.at(-1).q, 'nova')
+  assert.deepEqual(store.getState().directory.map((row) => row.address), ['nova@vme.msg9.io'])
+  store.setDirectoryCapability('code-review')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(seen.directory.at(-1).capability, 'code-review')
+  assert.deepEqual(store.getState().directory.map((row) => row.address), [], 'q + capability combine')
+})
+
+await check('contacts tab shows the tenant network grouped by owner', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  store.setTab('contacts')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  assert.equal(store.getState().accountAgents.length, 3)
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(html.includes('My tenant network'), 'network section shown')
+  assert.ok(html.includes('KimiCode · kimi.msg9.io'), 'grouped under the other owner')
+  assert.ok(html.includes('nova@kimi.msg9.io'), 'agent of the other owner listed')
+  assert.ok(html.includes('design-review'), 'capabilities ride along')
+  assert.ok(html.includes('suspended'), 'non-active status is tagged')
+})
+
+await check('groups tab lists groups; selecting one shows the card and its archive', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  store.setTab('groups')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  assert.equal(store.getState().groups.length, 2)
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(html.includes('Groups'), 'nav: groups tab')
+  assert.ok(html.includes('Created by me'), 'created section shown')
+  assert.ok(html.includes('Joined'), 'joined section shown')
+  assert.ok(html.indexOf('Created by me') < html.indexOf('Team X'), 'team-x sits under Created by me (its creator is this inbox)')
+  assert.ok(html.indexOf('Joined') < html.indexOf('Platform Crew'), 'platform-crew sits under Joined')
+
+  // Selecting a group: the card (with members) and the archive below it.
+  store.selectGroup('team-x@dsh.msg9.io')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(store.getState().groupArchive.length, 2)
+  const card = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(card.includes('demo group for the panel'), 'description on the card')
+  assert.ok(card.includes('closed'), 'closed/open tag shown')
+  assert.ok(card.includes('3 members'), 'member count shown')
+  assert.ok(card.includes('Created by dsh-alpha-1a2b@msg9.io'), 'creator shown on the card')
+  assert.ok(card.includes('a1@x.msg9.io'), 'member list loaded from the detail endpoint')
+  assert.ok(card.includes('Message the group'), 'reply-all action offered')
+  assert.ok(card.includes('kickoff'), 'archive subject listed')
+  assert.ok(card.includes('Messages (2/2)'), 'archive counter shown')
+  // Default view is chronological (正序): the older kickoff precedes follow
+  // even though the server returns newest-first.
+  assert.ok(card.indexOf('kickoff') < card.indexOf('follow'), 'default order is oldest-first')
+})
+
+await check('processed state: a reply closes the loop; markDone and the pending filter work', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  // Pending = not yet processed: all three fixture messages show up.
+  store.setFolder('pending')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(store.getState().messages.map((row) => row.message_id), ['m1', 'm2', 'm3'])
+
+  // 回复即处理: replying with reply_to closes m1's loop. m1 has no thread id,
+  // so correlation_id must be ABSENT (never invented from the message id).
+  store.replyTo({ message_id: 'm1', from_address: 'peer@msg9.io' })
+  store.setCompose({ text: 'reply body' })
+  await store.send()
+  assert.equal(seen.send.at(-1).body.reply_to, 'm1', 'the reply closes the original precisely (reply_to)')
+  assert.equal(seen.send.at(-1).body.correlation_id, undefined, 'no thread id → no correlation_id')
+  assert.equal(store.getState().messages.find((row) => row.message_id === 'm1')?.processed_by, 'human')
+
+  // A group copy reply: To = list_address, and the thread id rides VERBATIM.
+  store.replyTo({ message_id: 'm3', from_address: 'peer@msg9.io', list_address: 'team-x@dsh.msg9.io', correlation_id: 'thread-9' })
+  store.setCompose({ text: 'group reply' })
+  await store.send()
+  const groupReply = seen.send.at(-1).body
+  assert.equal(groupReply.to, 'team-x@dsh.msg9.io', 'group copies reply to the group')
+  assert.equal(groupReply.reply_to, 'm3', 'closes this copy')
+  assert.equal(groupReply.correlation_id, 'thread-9', 'thread id copied verbatim — no fork')
+
+  // The send is signed (msg9-sig-v1) and the signature verifies against the
+  // public key this inbox installed at provisioning — the server-side check.
+  const signedSend = seen.send.at(-1)
+  assert.ok(signedSend.signatureHeaders, 'the send carries signature headers')
+  const signingKey = seen.signingKeys.find((row) => row.auth.includes('msg9_sk_a'))
+  assert.ok(signingKey, 'signing key installed for ws-a')
+  assert.ok(verifySignedSend({
+    publicKeyB64: signingKey.publicKey,
+    headers: signedSend.signatureHeaders,
+    rawBody: signedSend.rawBody,
+    from: 'dsh-alpha-1a2b@msg9.io',
+    to: signedSend.body.to,
+  }), 'the signature verifies the way the server checks it')
+
+  // Explicit done closes m2 without a reply — server-native /processed, by human.
+  await store.markDone('m2')
+  assert.equal(store.getState().messages.find((row) => row.message_id === 'm2')?.processed_by, 'human')
+  assert.deepEqual(seen.processed.at(-1), { id: 'm2', by: 'human' }, 'v1.13 /processed called with attribution')
+
+  // The attribution is recorded in the state file (server can't tell who marked).
+  const saved = JSON.parse(await readFile(process.env.MSG9_STATE_FILE, 'utf8'))
+  assert.equal(saved.workspaces['ws-a'].marks['m1'].processed_by, 'human')
+  assert.equal(saved.workspaces['ws-a'].marks['m2'].read_by, 'human')
+
+  // And the marks ride the next listing (read_by / processed_by merged in).
+  store.setFolder('all')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(store.getState().messages.find((row) => row.message_id === 'm1')?.processed_by, 'human')
+})
+
+await check('SSE events: subscribe, get invalidated on mark-read, unsubscribe on close', async () => {
+  const bus = createBridgeEventBus()
+  const deps = defaultBridgeDeps(host)
+  deps.events = bus
+  const busBridge = createMsg9Bridge(deps)
+
+  const res = fakeRes()
+  await busBridge.handle(fakeReq({ url: `${BRIDGE_PREFIX}/events` }), res)
+  assert.match(res.headers['Content-Type'], /text\/event-stream/)
+  assert.ok(res.written[0].includes('connected'), 'greets the subscriber')
+  assert.equal(bus.size(), 1)
+
+  // A panel mark-read pushes an invalidation with the reason to the subscriber.
+  await busBridge.handle(fakeReq({ method: 'POST', url: `${BRIDGE_PREFIX}/read`, body: { key: 'ws-a', message_id: 'm1' } }), fakeRes())
+  assert.ok(
+    res.written.some((line) => line.includes('"type":"invalidate"') && line.includes('"reason":"read"')),
+    JSON.stringify(res.written),
+  )
+
+  // Closing the connection drops the subscriber (and the heartbeat).
+  res.fire('close')
+  assert.equal(bus.size(), 0)
+})
+
+await check('panel renders the unprovisioned workspace as an explicit action', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  // A workspace with no inbox: /work/d is not in the registry, so it becomes a cwd bucket.
+  store.setCwd('/work/d')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const useSessions = (selector) => selector({ current: 'sess-d', byId: { 'sess-d': { cwd: '/work/d' } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions, onBack: () => {} }))
+  assert.ok(html.includes('Open inbox'), html)
+  // The preview shows the real derived address — never the raw `cwd:` key.
+  assert.ok(html.includes('dsh-d-'), html)
+  assert.ok(!html.includes('dsh-cwd'), html)
+})
+
+await check('settings section renders the service intro, tenant and its open inboxes', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await store.refreshUnread()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
+  assert.ok(html.includes('msg9.io'), 'service intro shown')
+  assert.ok(html.includes('Tenant'), html)
+  assert.ok(html.includes('dsh'), 'tenant name shown')
+  assert.ok(html.includes('own_1'), 'tenant id shown')
+  // ws-c was provisioned by the earlier bridge test, so all three are open.
+  assert.ok(html.includes('Open inboxes (3)'), html)
+  assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'first inbox listed')
+  assert.ok(html.includes('dsh-beta-3c4d@msg9.io'), 'second inbox listed')
+  assert.ok(html.includes('dsh-gamma-'), 'newly opened inbox listed too')
+  // Role column: the matching peer's yellow-pages description shows up.
+  assert.ok(html.includes('alpha workspace inbox'), html)
+  assert.ok(html.includes('code-review'), 'capabilities shown')
+  // Per-inbox counts from /unread (the fake reports 3 unread of a 2-message box).
+  assert.ok(html.includes('3 unread · 3 total'), html)
+})
+
+await check('store.start() keeps one poller and its disposer stops it', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  const stop = store.start()
+  assert.equal(typeof stop, 'function')
+  stop()
+})
+
+// ------------------------------------------------- first-run tenant binding
+
+await check('bridge: setup verifies the tenant key and stores it', async () => {
+  const KEY = 'msg9_tk_ui_1234567890'
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/setup`, { method: 'POST', body: { owner_key: KEY } })
+  assert.equal(status, 200)
+  assert.equal(payload.ok, true)
+  assert.equal(payload.data.owner.id, 'own_ui')
+  assert.equal(payload.data.owner.name, 'dsh-ui')
+  // The browser must never see the key again — only its masked form.
+  assert.equal(payload.data.owner.masked, 'msg9_tk_ui_…7890')
+  assert.ok(!JSON.stringify(payload).includes('1234567890'), 'the raw key must not be echoed')
+})
+
+await check('bridge: setup rejects a key msg9 refuses', async () => {
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/setup`, { method: 'POST', body: { owner_key: 'nope' } })
+  assert.equal(status, 400)
+  assert.equal(payload.ok, false)
+  assert.equal(payload.error.code, 'owner-key-rejected')
+})
+
+await check('bridge: setup requires owner_key', async () => {
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/setup`, { method: 'POST', body: {} })
+  assert.equal(status, 400)
+  assert.equal(payload.error.code, 'missing-owner-key')
+})
+
+await check('store: bindOwner validates the key and reloads the panel', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  // A bad key surfaces as a setup error, not a crash.
+  await store.bindOwner('nope')
+  assert.equal(store.getState().setup.busy, false)
+  assert.ok(store.getState().setup.error, 'rejected key is reported')
+
+  // A good key binds, then refreshes everything (this path once crashed on a
+  // bare `refreshAll()` that resolved to nothing inside the store object).
+  await store.bindOwner('msg9_tk_ui_1234567890')
+  assert.equal(store.getState().setup.error, null)
+  assert.equal(store.getState().owner.name, 'dsh-ui')
+  assert.equal(store.getState().status, 'ready')
+  assert.ok(store.getState().workspaces.length > 0, 'overview reloaded after binding')
+})
+
+await check('first run: the setup view guides a newcomer through both paths', () => {
+  const fakeState = { apiUrl: '', setup: { busy: false, error: null, dismissed: false } }
+  const html = renderToStaticMarkup(React.createElement(client.SetupView, { state: fakeState, store: {} }))
+  // Path A: the three steps to a tenant key, with its payoff.
+  assert.ok(html.includes('Open msg9.io'), 'step 1: sign up')
+  assert.ok(html.includes('create a tenant'), 'step 2: create a tenant')
+  assert.ok(html.includes('msg9_tk_'), 'step 3: the key format')
+  assert.ok(html.includes('looploop@you.msg9.io'), 'the short-address payoff')
+  // Path B: skip-and-use anyway, with the trade-offs spelled out.
+  assert.ok(html.includes('Skip for now'), 'skip path offered')
+  assert.ok(html.includes('dsh-xxx-1a2b@msg9.io'), 'the public-registration address shape')
+  assert.ok(html.includes('no key needed'), 'no account required for path B')
+  assert.ok(html.includes('Settings'), 'bind-later pointer')
+})
+
+// ------------------------------------------------- tenant subdomain mode
+
+await check('tenant mode: setup stores the slug and the preview drops the hash', async () => {
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/setup`, { method: 'POST', body: { owner_key: 'msg9_tk_slug_1234567890' } })
+  assert.equal(status, 200)
+  assert.equal(payload.data.owner.slug, 'vme')
+  assert.equal(payload.data.owner.mail_domain, 'msg9.io')
+
+  // cwd bucket "/work/t" -> slug "t": too short for msg9's 3-char minimum, so
+  // the preview uses the deterministic `<slug>-<hash4>` fallback.
+  const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=%2Fwork%2Ft`)
+  assert.equal(overview.payload.data.owner.slug, 'vme')
+  assert.match(overview.payload.data.current.planned_address, /^t-[0-9a-f]{4}@vme\.msg9\.io$/)
+})
+
+await check('tenant mode: provisioning asks for the readable address first', async () => {
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: '/work/t', title: 'tenantws' } })
+  assert.equal(payload.data.provisioned, true)
+  assert.ok(payload.data.address.startsWith('tenantws@'), payload.data.address)
+  // No harness prefix: the tenant domain already says whose agent this is.
+  assert.equal(seen.provisioned[seen.provisioned.length - 1], 'tenantws')
+})
+
+await check('tenant mode: a conflicting address falls back to the hashed form', async () => {
+  const before = seen.provisioned.length
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: '/work/taken', title: 'taken' } })
+  assert.equal(payload.data.provisioned, true)
+  const attempts = seen.provisioned.slice(before)
+  assert.equal(attempts.length, 2, 'one conflict, one retry')
+  assert.equal(attempts[0], 'taken')
+  assert.match(attempts[1], /^taken-[0-9a-f]{4}$/)
+  assert.ok(payload.data.address.startsWith('taken-'), payload.data.address)
+})
+
+await check('settings section offers migration for legacy inboxes', async () => {
+  // ws-a's inbox predates the slug tenant: it must be flagged legacy, with a
+  // migration target preview.
+  const overview = await call(`${BRIDGE_PREFIX}/overview`)
+  const row = overview.payload.data.workspaces.find((r) => r.key === 'ws-a')
+  assert.equal(row.legacy, true)
+  assert.equal(row.planned_address, 'alpha@vme.msg9.io')
+
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
+  assert.ok(html.includes('Migrate to the new tenant'), html)
+  assert.ok(html.includes('alpha@vme.msg9.io'), 'migration target preview')
+})
+
+await check('tenant migration: legacy inbox is re-provisioned and the old one suspended', async () => {
+  const before = seen.provisioned.length
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/migrate`, {
+    method: 'POST',
+    body: { key: 'ws-a', old_owner_key: 'msg9_tk_ui_1234567890' },
+  })
+  assert.equal(status, 200)
+  assert.equal(payload.data.old_address, 'dsh-alpha-1a2b@msg9.io')
+  assert.ok(payload.data.new_address.startsWith('alpha@'), payload.data.new_address)
+  assert.equal(payload.data.old_disabled, true)
+  assert.equal(seen.provisioned[before], 'alpha', 'tenant-form address requested')
+  assert.ok(seen.disabled.includes('dsh-alpha-1a2b@msg9.io'), 'old inbox suspended with the old key')
+
+  // v1.9 order: forwarding first (old inbox's own key), then the history move.
+  assert.equal(payload.data.forwarding, true)
+  assert.equal(seen.forwarding.at(-1).target, payload.data.new_address)
+  assert.ok(seen.forwarding.at(-1).auth.includes('msg9_sk_a'), 'forwarding uses the OLD inbox key')
+  assert.equal(payload.data.moved_mail, 2)
+  assert.deepEqual(seen.moveMail.at(-1), { address: 'dsh-alpha-1a2b@msg9.io', to: payload.data.new_address })
+
+  // The state entry now points at the new inbox; old cursors did not survive.
+  const state = JSON.parse(await readFile(process.env.MSG9_STATE_FILE, 'utf8'))
+  assert.equal(state.workspaces['ws-a'].address, payload.data.new_address)
+  assert.equal(state.workspaces['ws-a'].cursor, undefined)
+
+  // Overview is clean again.
+  const after = await call(`${BRIDGE_PREFIX}/overview`)
+  assert.equal(after.payload.data.workspaces.find((r) => r.key === 'ws-a').legacy, false)
+})
+
+server.closeAllConnections?.()
+server.close()
+
+console.log(failed > 0 ? `\n${failed} check(s) failed` : '\nall checks passed')
+process.exitCode = failed > 0 ? 1 : 0
+
+// Undici pools the bridge's connections to the fake msg9 server, and those
+// keep-alive sockets outlive the listener by seconds. The assertions are done,
+// so end deterministically once stdout has flushed.
+setTimeout(() => process.exit(process.exitCode ?? 0), 100)

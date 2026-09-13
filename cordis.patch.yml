@@ -1,0 +1,16 @@
+# dsh-msg9-kit — bundle layer
+#
+# One Loader entry per package (the dsh client module system rejects multiple
+# active sources resolving to one package name), so the single `msg9-kit` entry
+# carries both faces:
+#
+#   • host — the msg9 model tools (msg9_setup / msg9_inbox / msg9_outbox /
+#     msg9_send / msg9_read / msg9_resolve / msg9_contacts / msg9_peers /
+#     msg9_rotate / msg9_status), the `/msg9` slash command, and the
+#     `/dsh-msg9/*` bridge the browser calls (keys stay on the host).
+#   • web  — the same entry's `dsh.client` metadata makes the browser load the
+#     ./client face: a ✉ sidebar icon with an unread badge that opens the
+#     current workspace's inbox / outbox / contacts in the centre column.
+- insert:
+    - id: msg9-kit
+      name: dsh-msg9-kit
