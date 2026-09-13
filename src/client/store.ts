@@ -639,11 +639,19 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     },
     selectMessage(id) {
       set({ selectedId: id, composeOpen: false })
-      // Reading is believing for the human too: opening an unread inbox
-      // message marks it read — no separate click required.
+      // Reading is believing for the human too: opening a message opens its
+      // whole conversation (Gmail 式) — every UNREAD inbox letter in it gets
+      // marked read, no separate click required. 仍走单封的 markReadOp 链路
+      // （乐观更新 + 失败回滚），只对未读的触发。
       if (!id) return
-      const message = state.messages.find((row) => row.message_id === id)
-      if (message && !message.read_at) void markReadOp(id)
+      const seed = state.messages.find((row) => row.message_id === id)
+      if (!seed) return
+      const thread = seed.correlation_id
+        ? state.messages.filter((row) => row.correlation_id === seed.correlation_id)
+        : [seed]
+      for (const row of thread) {
+        if (!row.read_at) void markReadOp(row.message_id)
+      }
     },
     selectContact(address) {
       set({ selectedContact: address, composeOpen: false })

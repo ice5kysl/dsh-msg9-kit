@@ -103,6 +103,19 @@ const treeLetters = [
   { message_id: 't5', from_address: 'frank@msg9.io', subject: 're: topic', body: { text: 'loose letter' }, created_at: '2026-09-12T08:50:00Z', correlation_id: 'thread-t' },
   { message_id: 't6', from_address: 'gina@msg9.io', subject: 'solo', body: { text: 'solo letter' }, created_at: '2026-09-12T09:30:00Z' },
 ]
+// Gmail 式会话夹具：同 correlation_id 的 3 封信（c1/c2 收 + c1s 发——发的那封
+// 只在 outbox）+ 一封别的会话（无 correlation_id，自成会话）+ 组副本 2 份。
+let threadInbox = false
+const threadInboxRows = [
+  { message_id: 'c1', from_address: 'peer@msg9.io', subject: 'roadmap sync', body: { text: '**question one**' }, created_at: '2026-09-12T08:00:00Z', correlation_id: 'thread-c' },
+  { message_id: 'c2', from_address: 'peer@msg9.io', subject: 're: roadmap sync', body: { text: 'answer two' }, created_at: '2026-09-12T09:00:00Z', correlation_id: 'thread-c', read_at: '2026-09-12T09:05:00Z', verified: true, key_id: 'kid_peer_1' },
+  { message_id: 'c3', from_address: 'boss@msg9.io', subject: 'other topic', body: { text: 'other body' }, created_at: '2026-09-12T10:00:00Z' },
+  { message_id: 'c4a', from_address: 'team@msg9.io', subject: 'group note', body: { text: 'group body' }, created_at: '2026-09-12T11:00:00Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-g', read_at: '2026-09-12T11:05:00Z' },
+  { message_id: 'c4b', from_address: 'team@msg9.io', subject: 'group note', body: { text: 'group body' }, created_at: '2026-09-12T11:00:01Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-g', read_at: '2026-09-12T11:05:00Z' },
+]
+const threadOutboxRows = [
+  { message_id: 'c1s', from_address: 'dsh-alpha-1a2b@msg9.io', to_address: 'peer@msg9.io', subject: 're: roadmap sync', body: { text: 'my question' }, created_at: '2026-09-12T08:30:00Z', correlation_id: 'thread-c' },
+]
 
 function reply(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json' })
@@ -149,10 +162,12 @@ const server = createServer(async (req, res) => {
 
   if (req.method === 'GET' && path === '/api/v1/inbox/messages') {
     seen.inboxLimit.push(url.searchParams.get('limit'))
-    return reply(res, 200, { code: 0, data: { messages: inbox, total: inbox.length, unread_count: 3 } })
+    const rows = threadInbox ? threadInboxRows : inbox
+    return reply(res, 200, { code: 0, data: { messages: rows, total: rows.length, unread_count: 3 } })
   }
   if (req.method === 'GET' && path === '/api/v1/outbox/messages') {
-    return reply(res, 200, { code: 0, data: { messages: outbox, total: outbox.length } })
+    const rows = threadInbox ? threadOutboxRows : outbox
+    return reply(res, 200, { code: 0, data: { messages: rows, total: rows.length } })
   }
   if (req.method === 'POST' && path === '/api/v1/send') {
     const rawBody = await readRaw(req)
@@ -1390,6 +1405,61 @@ await check('groups archive: reply_to builds a nested reply tree (copies resolve
     assert.ok(nestedCard.includes('m9-tl-node'), 'and hangs its node dot on the connector line')
   } finally {
     treeArchive = false
+  }
+})
+
+await check('inbox detail: opening a letter opens its whole conversation (Gmail thread)', async () => {
+  threadInbox = true
+  try {
+    const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+    store.setCwd('/work/a')
+    await store.refreshAll()
+    for (let i = 0; i < 50 && store.getState().messages.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+
+    // 点开 c1 → 会话 = 同 correlation_id 的 2 收 1 发（发的那封只在 outbox），时间正序。
+    const readBefore = seen.read.length
+    store.selectMessage('c1')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    assert.ok(html.includes('roadmap sync'), 'conversation subject shown')
+    assert.ok(html.includes('3 in thread'), 'letter count in the header')
+    // 顺序断言锚在会话详情区（中栏列表也带同样的主题/预览，会先命中）。
+    const detail = html.slice(html.indexOf('3 in thread'))
+    assert.ok(detail.indexOf('question one') < detail.indexOf('my question'), 'inbox letter before the outbox reply')
+    assert.ok(detail.indexOf('my question') < detail.indexOf('answer two'), 'outbox reply before the final answer')
+    // 我发的信带 mine 标记。
+    assert.equal(html.match(/Sent by this workspace/g).length, 1, 'the outbox letter carries the me marker')
+    // 默认展开最新 + 当前点开的（2 张 markdown 卡），中间那封折叠成头行预览。
+    assert.equal(html.match(/class="m9-md /g).length, 2, 'seed + latest expanded, the middle letter collapsed to its header')
+    assert.ok(html.includes('<strong>question one</strong>'), 'expanded seed renders markdown')
+    assert.ok(html.includes('my question'), 'collapsed letter still shows its one-line preview')
+    // 签名徽标与动作保留（最新一封已读且已验证签名）。
+    assert.ok(html.includes('Signature verified'), 'signature badge on the expanded letter')
+    assert.ok(html.includes('Mark handled'), 'mark-handled action on the expanded inbox letter')
+    assert.ok(html.includes('Copy id'), 'copy-id action on the expanded letter')
+    // 点开 = 会话里未读的都标已读：c2 本来就已读，只有 c1 触发 markRead。
+    assert.deepEqual(seen.read.slice(readBefore), ['c1'], 'only the unread letters in the conversation get marked read')
+
+    // 组副本 2 份：折成一张卡 ×2，回复走「回复组」。
+    store.selectMessage('c4a')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const group = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    assert.ok(group.includes('1 in thread'), 'copies fold into one letter')
+    assert.ok(group.includes('×2 copies'), 'copy-count chip preserved')
+    assert.ok(group.includes('Reply to group'), 'group copies reply to the group')
+    assert.ok(group.includes('group · team-x@dsh.msg9.io'), 'group tag on the card')
+
+    // 无 correlation_id 的信：单封会话。
+    store.selectMessage('c3')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const solo = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    assert.ok(solo.includes('1 in thread'), 'no correlation_id → a conversation of one')
+    assert.ok(solo.includes('other body'), 'and it renders expanded (seed = latest)')
+  } finally {
+    threadInbox = false
   }
 })
 

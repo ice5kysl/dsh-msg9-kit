@@ -96,3 +96,27 @@ export function processedLabel(message: MessageRow): string {
   if (!message.processed_by) return ''
   return message.processed_by === 'human' ? L('人已处理', 'Handled by you') : L('Agent 已处理', 'Handled by agent')
 }
+
+/** 「信」的身份（发件人+主题+正文）：fan-out 副本的折叠键。不能用
+ *  correlation_id——同一线程/会话的回复共享它，按它折会把不同的信藏进一行。 */
+export function letterIdentity(row: MessageRow): string {
+  const text = bodyText(row)
+  if (!text && !row.subject) return row.message_id
+  return `${row.from_address}\n${row.subject ?? ''}\n${text}`
+}
+
+/** Gmail 式会话：与 seed 同 correlation_id 的收件箱+发件箱信（无则自成
+ *  会话），按时间正序平铺。只用本地已有数据，不新发请求。 */
+export function conversationOf(inbox: MessageRow[], outbox: MessageRow[], seed: MessageRow): MessageRow[] {
+  if (!seed.correlation_id) return [seed]
+  const seen = new Set<string>()
+  const rows: MessageRow[] = []
+  for (const row of [...inbox, ...outbox]) {
+    if (row.correlation_id !== seed.correlation_id || seen.has(row.message_id)) continue
+    seen.add(row.message_id)
+    rows.push(row)
+  }
+  if (!seen.has(seed.message_id)) rows.push(seed)
+  rows.sort((a, b) => (Date.parse(a.created_at ?? '') || 0) - (Date.parse(b.created_at ?? '') || 0))
+  return rows
+}

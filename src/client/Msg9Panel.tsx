@@ -19,13 +19,13 @@
  * @module dsh-msg9-kit/client-panel
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
 import { marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import DOMPurify from 'dompurify'
 import { bodyText, truncate } from '../shared/message.ts'
 import type { AccountAgentView, ContactRow, DirectoryAgentRow, GroupRow, MessageRow, PeerRow } from '../shared/types.ts'
-import { ArrowRight, Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, Globe, Inbox, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X } from './icons.tsx'
+import { Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, Globe, Inbox, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X } from './icons.tsx'
 import { highlightCode, highlightReady } from './highlight.ts'
 import { L } from './locale.ts'
 import { selectedWorkspace, type Msg9State, type Msg9Store, type Tab } from './store.ts'
@@ -35,11 +35,13 @@ import {
   agentLabel,
   badgeText,
   contactLabel,
+  conversationOf,
   filterContacts,
   folderLabel,
   formatTime,
   fullBody,
   isUnread,
+  letterIdentity,
   previewOf,
   processedLabel,
 } from './view.ts'
@@ -355,11 +357,15 @@ function DetailColumn({ state, store }: { state: Msg9State; store: Msg9Store }):
   if (state.tab === 'square') return <SquareDetail state={state} store={store} />
   const messages = state.tab === 'outbox' ? state.outbox : state.messages
   const selected = messages.find((message) => message.message_id === state.selectedId)
-  return (
-    <section style={styles.detailCol}>
-      <MessageDetail message={selected} store={store} />
-    </section>
-  )
+  if (!selected) {
+    return (
+      <section style={styles.detailCol}>
+        <div style={styles.detailEmpty}>{L('选择一条消息查看内容。', 'Select a message to read it.')}</div>
+      </section>
+    )
+  }
+  // key by seed：换会话时重挂 ConversationView，默认展开状态随之重置。
+  return <ConversationView key={selected.message_id} state={state} store={store} seed={selected} />
 }
 
 /** First run: paste the tenant (owner) key before anything else can happen.
@@ -554,90 +560,97 @@ function markdownHtml(text: string): string {
   return DOMPurify.isSupported ? DOMPurify.sanitize(raw) : raw
 }
 
-function MessageDetail({
-  message,
-  store,
-}: {
-  message: MessageRow | undefined
-  store: Msg9Store
-}): JSX.Element {
-  if (!message) return <div style={styles.detailEmpty}>{L('选择一条消息查看内容。', 'Select a message to read it.')}</div>
+/** 签名徽标（v1.3）：已验证 / 无效 / 未签名。 */
+function SignatureBadge({ message }: { message: MessageRow }): JSX.Element {
+  if (message.verified === true) {
+    return (
+      <span style={styles.sigOk} title={message.key_id ? `key ${message.key_id}` : undefined}>
+        {L('签名已验证', 'Signature verified')}
+      </span>
+    )
+  }
+  if (message.verified === false) {
+    return (
+      <span style={styles.sigBad} title={message.key_id ? `key ${message.key_id}` : undefined}>
+        {L('签名无效', 'Invalid signature')}
+      </span>
+    )
+  }
+  return <span style={styles.sigNone}>{L('未签名', 'Unsigned')}</span>
+}
+
+/** Gmail 式会话视图：点开一封信 = 打开整个会话（同 correlation_id 的
+ *  收件箱+发件箱信，无 correlation_id 的单封成会话），按时间正序平铺
+ *  （平铺不嵌套——回复树是组频道的形态，这里照 Gmail 惯例）。
+ *  较早的信默认折叠成头行（发送者+时间+一行预览），最新一封和当前点开的
+ *  默认展开；我发的信右侧高亮，"我问了什么、对方回了什么"一目了然。
+ *  调用方按 seed 加 key：换会话时重挂，默认展开状态随之重置。 */
+function ConversationView({ state, store, seed }: { state: Msg9State; store: Msg9Store; seed: MessageRow }): JSX.Element {
+  const myAddress = selectedWorkspace(state)?.address ?? null
+  const letters = useMemo(() => foldLetterCopies(conversationOf(state.messages, state.outbox, seed)), [state.messages, state.outbox, seed])
+  const inboxIds = useMemo(() => new Set(state.messages.map((row) => row.message_id)), [state.messages])
+  const latestId = letters[letters.length - 1]?.message.message_id ?? seed.message_id
+  const [openIds, setOpenIds] = useState<ReadonlySet<string>>(() => new Set([seed.message_id, latestId]))
+  const [fullIds, setFullIds] = useState<ReadonlySet<string>>(new Set())
+  const subject = seed.subject || letters[0]?.message.subject || L('（无主题）', '(no subject)')
   return (
-    <article style={styles.detail}>
-      <header style={styles.detailHeader}>
-        <div style={styles.detailSubject}>{message.subject || L('（无主题）', '(no subject)')}</div>
-        <div style={styles.detailMeta}>
-          <span style={styles.detailAddresses}>
-            {message.from_address}
-            <ArrowRight size={11} style={styles.metaArrow} />
-            {message.to_address ?? '—'}
-          </span>
-          {message.list_address && (
-            <span style={styles.groupTag} title={L('组邮件：回复将发到组', 'Group mail: replies go to the group')}>
-              {L('组', 'group')} · {message.list_address}
-            </span>
-          )}
-          <span style={styles.metaTime}>{formatTime(message.created_at)}</span>
-          {message.verified === true && (
-            <span style={styles.sigOk} title={message.key_id ? `key ${message.key_id}` : undefined}>
-              {L('签名已验证', 'Signature verified')}
-            </span>
-          )}
-          {message.verified === false && (
-            <span style={styles.sigBad} title={message.key_id ? `key ${message.key_id}` : undefined}>
-              {L('签名无效', 'Invalid signature')}
-            </span>
-          )}
-          {message.verified === undefined && (
-            <span style={styles.sigNone}>{L('未签名', 'Unsigned')}</span>
-          )}
-        </div>
-        {(message.processed_by || message.read_by) && (
-          <div style={styles.detailMeta}>
-            {message.processed_by ? (
-              <span style={styles.processedTag}>
-                <Check size={11} />
-                {processedLabel(message)}
-                {message.processed_at ? ` · ${formatTime(message.processed_at)}` : ''}
-              </span>
-            ) : message.read_by ? (
-              <span style={styles.metaTime}>
-                {message.read_by === 'human' ? L('人已读', 'Read by you') : L('Agent 已读', 'Read by agent')}
-              </span>
-            ) : null}
-          </div>
-        )}
-        <div style={styles.detailActions}>
-          {isUnread(message) && (
-            <button type="button" className="m9-btn" onClick={() => void store.markRead(message.message_id)}>
-              <Check size={12} />
-              {L('标记已读', 'Mark read')}
-            </button>
-          )}
-          {!message.processed_by && (
-            <button type="button" className="m9-btn" onClick={() => void store.markDone(message.message_id)}>
-              <Check size={12} />
-              {L('标为已处理', 'Mark handled')}
-            </button>
-          )}
-          <button type="button" className="m9-btn" onClick={() => store.replyTo(message)}>
-            <Reply size={12} />
-            {message.list_address ? L('回复组', 'Reply to group') : L('回复', 'Reply')}
-          </button>
-          <button
-            type="button"
-            className="m9-btn"
-            onClick={() => void navigator.clipboard?.writeText(message.message_id)}
-            title={message.message_id}
-          >
-            <Copy size={12} />
-            {L('复制 ID', 'Copy id')}
-          </button>
-        </div>
-      </header>
-      <div className="m9-md" dangerouslySetInnerHTML={{ __html: markdownHtml(fullBody(message)) }} />
-      <div style={styles.detailId}>{message.message_id}</div>
-    </article>
+    <section style={styles.detailCol}>
+      <div style={styles.conversationHead}>
+        <span style={styles.detailSubject}>{subject}</span>
+        <span style={styles.threadCount}>{L('{n} 封信', '{n} in thread', { n: letters.length })}</span>
+      </div>
+      <div style={styles.threadList}>
+        {letters.map(({ message, copies }) => {
+          const id = message.message_id
+          return (
+            <LetterCard
+              key={id}
+              message={message}
+              copies={copies}
+              mine={myAddress !== null && message.from_address === myAddress}
+              open={openIds.has(id)}
+              full={fullIds.has(id)}
+              onToggleOpen={() => toggleId(setOpenIds, id)}
+              onToggleFull={() => toggleId(setFullIds, id)}
+              onReply={() => store.replyTo(message)}
+              replyLabel={message.list_address ? L('回复组', 'Reply to group') : undefined}
+              headMeta={<>
+                {message.list_address && (
+                  <span style={styles.groupTag} title={L('组邮件：回复将发到组', 'Group mail: replies go to the group')}>
+                    {L('组', 'group')} · {message.list_address}
+                  </span>
+                )}
+                <SignatureBadge message={message} />
+                {message.processed_by && (
+                  <span style={styles.processedTag}>
+                    <Check size={11} />
+                    {processedLabel(message)}
+                    {message.processed_at ? ` · ${formatTime(message.processed_at)}` : ''}
+                  </span>
+                )}
+              </>}
+              actionsExtra={<>
+                {inboxIds.has(id) && !message.processed_by && (
+                  <button type="button" className="m9-btn" onClick={() => void store.markDone(id)}>
+                    <Check size={12} />
+                    {L('标为已处理', 'Mark handled')}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="m9-btn"
+                  onClick={() => void navigator.clipboard?.writeText(id)}
+                  title={id}
+                >
+                  <Copy size={12} />
+                  {L('复制 ID', 'Copy id')}
+                </button>
+              </>}
+            />
+          )
+        })}
+      </div>
+    </section>
   )
 }
 
@@ -958,6 +971,33 @@ interface LetterFold {
   ids: string[]
 }
 
+/** 按「信身份」折叠 fan-out 副本（组频道与会话视图共用）：保持首见顺序，
+ *  副本计数 +1、副本 id 收进 ids。 */
+function foldLetterCopies(rows: MessageRow[]): LetterFold[] {
+  const letters: LetterFold[] = []
+  for (const row of rows) {
+    const key = letterIdentity(row)
+    const existing = letters.find((letter) => letterIdentity(letter.message) === key)
+    if (existing) {
+      existing.copies += 1
+      existing.ids.push(row.message_id)
+    } else {
+      letters.push({ message: row, copies: 1, ids: [row.message_id] })
+    }
+  }
+  return letters
+}
+
+/** 在 ReadonlySet state 里切换一个 id（返回新 Set，不原地修改）。 */
+function toggleId(setIds: (fn: (prev: ReadonlySet<string>) => ReadonlySet<string>) => void, id: string): void {
+  setIds((prev) => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+}
+
 /** 回复树节点：一封信 + 它的回复子树。 */
 export interface LetterNode {
   letter: LetterFold
@@ -1033,34 +1073,23 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
   const groupAddress = state.selectedGroup
   const hasMore = state.groupArchive.length < state.groupArchiveTotal
   const threads = useMemo(() => {
-    // 线程 = correlation_id（无则自己成线程）。线程内按时间正序，同时把同一封信
-    // 的 fan-out 副本（发件人+主题+正文相同，仅 message_id/to 不同）折成一张
-    // 卡片——折叠键用「信」的身份，不能用 correlation_id：同一线程的回复共享它。
-    const letterKey = (row: MessageRow): string => {
-      const text = bodyText(row)
-      if (!text && !row.subject) return row.message_id
-      return `${row.from_address}\n${row.subject ?? ''}\n${text}`
-    }
-    const byThread = new Map<string, { id: string; letters: LetterFold[] }>()
+    // 线程 = correlation_id（无则自己成线程）。线程内先按「信身份」折叠
+    // fan-out 副本（发件人+主题+正文相同，仅 message_id/to 不同），再按时间
+    // 正序、建成回复树。
+    const byThread = new Map<string, { id: string; rows: MessageRow[] }>()
     for (const row of state.groupArchive) {
       const id = row.correlation_id ?? row.message_id
       let thread = byThread.get(id)
       if (!thread) {
-        thread = { id, letters: [] }
+        thread = { id, rows: [] }
         byThread.set(id, thread)
       }
-      const key = letterKey(row)
-      const existing = thread.letters.find((letter) => letterKey(letter.message) === key)
-      if (existing) {
-        existing.copies += 1
-        existing.ids.push(row.message_id)
-      } else {
-        thread.letters.push({ message: row, copies: 1, ids: [row.message_id] })
-      }
+      thread.rows.push(row)
     }
     const grouped = [...byThread.values()].map((thread) => {
-      thread.letters.sort((a, b) => (Date.parse(a.message.created_at ?? '') || 0) - (Date.parse(b.message.created_at ?? '') || 0))
-      return { ...thread, root: buildLetterTree(thread.letters) }
+      const letters = foldLetterCopies(thread.rows)
+      letters.sort((a, b) => (Date.parse(a.message.created_at ?? '') || 0) - (Date.parse(b.message.created_at ?? '') || 0))
+      return { id: thread.id, letters, root: buildLetterTree(letters) }
     })
     // 线程之间：正序按根信时间，倒序按线程内最新信时间。
     const keyOf = (thread: { letters: LetterFold[]; root: LetterNode }): number => {
@@ -1070,15 +1099,6 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
     grouped.sort((a, b) => (ascending ? keyOf(a) - keyOf(b) : keyOf(b) - keyOf(a)))
     return grouped
   }, [state.groupArchive, ascending])
-
-  const toggleIn = (setIds: (fn: (prev: ReadonlySet<string>) => ReadonlySet<string>) => void, id: string): void => {
-    setIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
 
   /** 线程头的「全部展开/收起」：只动本线程的信，跨线程不联动。 */
   const setThreadOpen = (letters: { message: MessageRow }[], open: boolean): void => {
@@ -1133,9 +1153,9 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
                     openIds={openIds}
                     fullIds={fullIds}
                     closedIds={closedIds}
-                    onToggleOpen={(id) => toggleIn(setOpenIds, id)}
-                    onToggleFull={(id) => toggleIn(setFullIds, id)}
-                    onToggleChildren={(id) => toggleIn(setClosedIds, id)}
+                    onToggleOpen={(id) => toggleId(setOpenIds, id)}
+                    onToggleFull={(id) => toggleId(setFullIds, id)}
+                    onToggleChildren={(id) => toggleId(setClosedIds, id)}
                     onReply={(message) => store.replyTo({
                       ...message,
                       // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
@@ -1237,38 +1257,47 @@ function LetterNodeView({
 export function LetterCard({
   message,
   copies,
-  depth,
+  depth = 0,
   mine,
   open,
   full,
-  childrenCount,
-  descendants,
-  childrenOpen,
+  childrenCount = 0,
+  descendants = 0,
+  childrenOpen = true,
   onToggleChildren,
   onToggleOpen,
   onToggleFull,
   onReply,
+  headMeta,
+  actionsExtra,
+  replyLabel,
 }: {
   message: MessageRow
   copies: number
-  /** 回复树深度（0 = 线程根）；≥1 的节点在时间线竖线上挂一个节点圆点。 */
-  depth: number
+  /** 回复树深度（0 = 线程根/非树场景）；≥1 的节点在时间线竖线上挂一个节点圆点。 */
+  depth?: number
   /** 当前 workspace 自己发的信：靠右 + 底色（折叠态也能看出）。 */
   mine: boolean
   /** 卡片级展开（折叠态只有头行 + 预览）。 */
   open: boolean
   /** 长正文的「展开全文」（2000 字符 clamp 的旁路）。 */
   full: boolean
-  /** 直接回复数（>0 时头行显示子树折叠开关）。 */
-  childrenCount: number
+  /** 直接回复数（>0 时头行显示子树折叠开关；组频道回复树专用）。 */
+  childrenCount?: number
   /** 全部后代数（子树收起时显示「N 条回复」）。 */
-  descendants: number
+  descendants?: number
   /** 子树展开状态（默认展开）。 */
-  childrenOpen: boolean
-  onToggleChildren: () => void
+  childrenOpen?: boolean
+  onToggleChildren?: () => void
   onToggleOpen: () => void
   onToggleFull: () => void
   onReply: () => void
+  /** 头行附加徽标（会话视图注入：组标记 / 签名徽标 / 已处理标记）。 */
+  headMeta?: ReactNode
+  /** 动作区附加按钮（会话视图注入：标为已处理 / 复制 ID）。 */
+  actionsExtra?: ReactNode
+  /** 回复按钮文案（组邮件副本用「回复组」）。 */
+  replyLabel?: string
 }): JSX.Element {
   const text = bodyText(message)
   const clamped = text.length > CLAMP_CHARS && !full
@@ -1310,6 +1339,7 @@ export function LetterCard({
           {!childrenOpen && descendants > 0 && (
             <span style={styles.threadCount}>{L('{n} 条回复', '{n} replies', { n: descendants })}</span>
           )}
+          {headMeta}
           <span style={styles.letterTime}>{formatTime(message.created_at)}</span>
         </button>
       </div>
@@ -1326,8 +1356,9 @@ export function LetterCard({
             )}
             <button type="button" className="m9-btn" onClick={onReply}>
               <Reply size={12} />
-              {L('回复', 'Reply')}
+              {replyLabel ?? L('回复', 'Reply')}
             </button>
+            {actionsExtra}
           </div>
         </>
       )}
@@ -1785,9 +1816,9 @@ const styles: Record<string, CSSProperties> = {
   detailSubject: { fontSize: 14, fontWeight: 600 },
   detailMeta: { display: 'flex', justifyContent: 'space-between', gap: 8, color: DIM, fontSize: 11, flexWrap: 'wrap' },
   detailAddresses: { display: 'inline-flex', alignItems: 'center', gap: 4, minWidth: 0, flexWrap: 'wrap', wordBreak: 'break-all' },
-  metaArrow: { flexShrink: 0 },
   metaTime: { flexShrink: 0 },
   detailActions: { display: 'flex', gap: 6, marginTop: 2, flexWrap: 'wrap' },
+  conversationHead: { display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, borderBottom: `1px solid ${BORDER}`, paddingBottom: 10 },
   detailBody: {
     margin: 0,
     whiteSpace: 'pre-wrap',
@@ -1796,7 +1827,6 @@ const styles: Record<string, CSSProperties> = {
     fontSize: 13,
     lineHeight: 1.65,
   },
-  detailId: { color: DIM, fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
   composerHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   composerActions: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   composerHint: { color: DIM, fontSize: 10 },
