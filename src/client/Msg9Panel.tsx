@@ -863,8 +863,10 @@ function GroupView({ state, store }: { state: Msg9State; store: Msg9Store }): JS
   }
   const memberCount = group.member_count ?? group.members?.length ?? 0
   return (
-    <section style={styles.detailCol}>
-      <article style={styles.detail}>
+    // 右栏为 flex 列、自身不滚（overflow: hidden）：组信息卡 + 计数/正倒序行
+    // 固定，只有存档列表区独立滚动（见 GroupArchive 的 m9-archive-scroll）。
+    <section style={styles.groupCol}>
+      <article style={{ ...styles.detail, flexShrink: 0 }}>
         <header style={styles.detailHeader}>
           <div style={styles.detailSubject}>{group.display_name ?? group.address}</div>
           <div style={styles.detailMeta}>
@@ -985,50 +987,56 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
         </span>
       </div>
       {threads.length === 0 ? (
-        <div style={styles.listEmpty}>{L('组里还没有消息。', 'No messages in this group yet.')}</div>
-      ) : (
-        <div style={styles.threadList}>
-          {threads.map((thread) => {
-            const allOpen = thread.letters.every(({ message }) => openIds.has(message.message_id))
-            return (
-              <div key={thread.id} style={styles.thread}>
-                <span className="m9-timeline" style={styles.threadGutter} />
-                {thread.letters.length > 1 && (
-                  <div style={styles.threadHead}>
-                    <button type="button" className="m9-chip" onClick={() => setThreadOpen(thread.letters, !allOpen)}>
-                      {allOpen ? L('全部收起', 'Collapse all') : L('全部展开', 'Expand all')}
-                    </button>
-                    <span style={styles.threadCount}>{L('{n} 封', '{n} letters', { n: thread.letters.length })}</span>
-                  </div>
-                )}
-                {thread.letters.map(({ message, copies }, index) => (
-                  <LetterCard
-                    key={message.message_id}
-                    message={message}
-                    copies={copies}
-                    reply={index > 0}
-                    mine={myAddress !== null && message.from_address === myAddress}
-                    open={openIds.has(message.message_id)}
-                    full={fullIds.has(message.message_id)}
-                    onToggleOpen={() => toggleIn(setOpenIds, message.message_id)}
-                    onToggleFull={() => toggleIn(setFullIds, message.message_id)}
-                    onReply={() => store.replyTo({
-                      ...message,
-                      // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
-                      // 链路——reply_to 闭环、correlation_id 原样随行，语义不变。
-                      list_address: message.list_address ?? groupAddress ?? undefined,
-                    })}
-                  />
-                ))}
-              </div>
-            )
-          })}
+        <div style={styles.archiveScroll}>
+          <div style={styles.listEmpty}>{L('组里还没有消息。', 'No messages in this group yet.')}</div>
         </div>
-      )}
-      {hasMore && (
-        <button type="button" className="m9-btn" disabled={state.busy.archive} onClick={() => void store.refreshGroupArchive(true)}>
-          {state.busy.archive ? L('加载中…', 'Loading…') : L('加载更多', 'Load more')}
-        </button>
+      ) : (
+        // 唯一滚动区：gutter/时间线、卡片和「加载更多」都在里面；上面的计数行不滚。
+        // overflowX hidden 是兜底——卡片内容（表格/代码块）一律内部横滚，不探出右缘。
+        <div className="m9-archive-scroll" style={styles.archiveScroll}>
+          <div style={styles.threadList}>
+            {threads.map((thread) => {
+              const allOpen = thread.letters.every(({ message }) => openIds.has(message.message_id))
+              return (
+                <div key={thread.id} style={styles.thread}>
+                  <span className="m9-timeline" style={styles.threadGutter} />
+                  {thread.letters.length > 1 && (
+                    <div style={styles.threadHead}>
+                      <button type="button" className="m9-chip" onClick={() => setThreadOpen(thread.letters, !allOpen)}>
+                        {allOpen ? L('全部收起', 'Collapse all') : L('全部展开', 'Expand all')}
+                      </button>
+                      <span style={styles.threadCount}>{L('{n} 封', '{n} letters', { n: thread.letters.length })}</span>
+                    </div>
+                  )}
+                  {thread.letters.map(({ message, copies }, index) => (
+                    <LetterCard
+                      key={message.message_id}
+                      message={message}
+                      copies={copies}
+                      reply={index > 0}
+                      mine={myAddress !== null && message.from_address === myAddress}
+                      open={openIds.has(message.message_id)}
+                      full={fullIds.has(message.message_id)}
+                      onToggleOpen={() => toggleIn(setOpenIds, message.message_id)}
+                      onToggleFull={() => toggleIn(setFullIds, message.message_id)}
+                      onReply={() => store.replyTo({
+                        ...message,
+                        // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
+                        // 链路——reply_to 闭环、correlation_id 原样随行，语义不变。
+                        list_address: message.list_address ?? groupAddress ?? undefined,
+                      })}
+                    />
+                  ))}
+                </div>
+              )
+            })}
+          </div>
+          {hasMore && (
+            <button type="button" className="m9-btn" style={styles.loadMore} disabled={state.busy.archive} onClick={() => void store.refreshGroupArchive(true)}>
+              {state.busy.archive ? L('加载中…', 'Loading…') : L('加载更多', 'Load more')}
+            </button>
+          )}
+        </div>
       )}
     </div>
   )
@@ -1420,6 +1428,18 @@ const styles: Record<string, CSSProperties> = {
     flexDirection: 'column',
     gap: 10,
   },
+  // 组详情右栏：与 detailCol 同布局但自身不滚——组头 + 计数行固定，
+  // 滚动只发生在存档区（m9-archive-scroll），避免双层滚动条。
+  groupCol: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 0,
+    overflow: 'hidden',
+    padding: 16,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 10,
+  },
   setup: { display: 'flex', flexDirection: 'column', gap: 10, padding: 24, maxWidth: 520 },
   setupTitle: { fontSize: 15, fontWeight: 600 },
   setupHint: { fontSize: 12, color: DIM, lineHeight: 1.6 },
@@ -1486,16 +1506,21 @@ const styles: Record<string, CSSProperties> = {
     padding: '0 7px',
     whiteSpace: 'nowrap',
   },
-  groupArchive: { display: 'flex', flexDirection: 'column', gap: 6, borderTop: `1px solid ${BORDER}`, paddingTop: 10 },
-  archiveHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  groupArchive: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6, borderTop: `1px solid ${BORDER}`, paddingTop: 10 },
+  archiveHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexShrink: 0 },
+  archiveScroll: { flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column', gap: 8 },
+  loadMore: { flexShrink: 0, alignSelf: 'flex-start' },
   threadList: { display: 'flex', flexDirection: 'column', gap: 12 },
-  thread: { position: 'relative', display: 'flex', flexDirection: 'column', gap: 4, paddingLeft: 16 },
+  thread: { position: 'relative', display: 'flex', flexDirection: 'column', gap: 4, paddingLeft: 16, minWidth: 0 },
   threadGutter: { position: 'absolute', left: 5, top: 10, bottom: 10, width: 2, borderRadius: 1, background: BORDER },
   threadHead: { display: 'flex', alignItems: 'center', gap: 6, paddingBottom: 2 },
   threadCount: { fontSize: 10, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '0 7px' },
   letter: {
     position: 'relative',
+    // 卡片永不超出右栏可视宽度：maxWidth 封顶 + minWidth 0 允许 flex 收缩；
+    // 超宽内容（表格/代码块/长串）由信体内部断行或横滚消化（.m9-letter-md）。
     maxWidth: '92%',
+    width: 'fit-content',
     alignSelf: 'flex-start',
     minWidth: 0,
     border: `1px solid ${BORDER}`,

@@ -64,6 +64,10 @@ export const M9_CSS = `
    且不撑破卡片。作用域限定在频道内，收件箱详情的 .m9-md 表现不变。 */
 .m9-letter-md { overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
 .m9-letter-md pre { overflow-x: auto; max-width: 100%; }
+/* 宽表格不撑破卡片：表格块级化后在自身内部横向滚动；单元格允许断行。 */
+.m9-letter-md table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+.m9-letter-md td, .m9-letter-md th { overflow-wrap: anywhere; }
+.m9-letter-md img { max-width: 100%; }
 .m9-letterhead { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: transparent; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; text-align: left; min-width: 0; }
 /* Syntax highlighting (Shiki css-variables theme): the palette maps token
    variables onto shell colors, so one render serves both themes. */

@@ -84,6 +84,8 @@ const fanoutCopies = [
   { message_id: 'f6', from_address: 'dsh-alpha-1a2b@msg9.io', subject: 'my two cents', body: { text: 'from this workspace' }, created_at: '2026-09-12T09:30:00Z', correlation_id: 'thread-mine' },
   // 超长正文：超过 clamp 阈值（2000 字符），尾巴带标记验证截断。
   { message_id: 'f7', from_address: 'boss@msg9.io', subject: 'long read', body: { text: `${'long body line\n'.repeat(160)}TAIL_END_MARKER` }, created_at: '2026-09-12T10:00:00Z' },
+  // 带 markdown 表格的信：宽表格必须表格内部横滚，不能撑破卡片。
+  { message_id: 'f8', from_address: 'peer@msg9.io', subject: 'proposal', body: { text: '| option | latency | cost |\n| --- | --- | --- |\n| a-very-long-option-name-that-keeps-going | 120ms | $$$ |' }, created_at: '2026-09-12T10:30:00Z' },
 ]
 
 function reply(res, status, payload) {
@@ -1226,10 +1228,20 @@ await check('groups archive: the channel view threads letters, folds copies and 
     for (let i = 0; i < 50 && store.getState().groupArchive.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 20))
     }
-    assert.equal(store.getState().groupArchive.length, 7, 'store keeps every archived copy (dedup is by message_id only)')
+    assert.equal(store.getState().groupArchive.length, 8, 'store keeps every archived copy (dedup is by message_id only)')
 
     const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
     const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    // 布局：组头（信息卡 + 发信按钮）和计数/正倒序行在滚动容器外且位于其前；
+    // 滚动容器 m9-archive-scroll 里只有存档内容（含底部的加载更多）。
+    assert.ok(html.includes('m9-archive-scroll'), 'the archive has its own scroll region')
+    assert.ok(html.indexOf('Message the group') < html.indexOf('m9-archive-scroll'), 'group header stays above (outside) the scroll region')
+    assert.ok(html.indexOf('Oldest first') < html.indexOf('m9-archive-scroll'), 'counter + order toggle stays above the scroll region')
+    assert.ok(!html.slice(html.indexOf('m9-archive-scroll')).includes('Message the group'), 'scroll region holds only archive content')
+    // 卡片宽度约束锚点：maxWidth 封顶，任何卡片不超出右栏可视宽度。
+    assert.ok(html.includes('max-width:92%'), 'letter cards carry the max-width clamp')
+    // 宽表格处理规则随 M9_CSS 注入（表格内部横滚，不撑破卡片）。
+    assert.ok(html.includes('.m9-letter-md table'), 'archive tables scroll internally')
     // 默认折叠：只有头行 + 纯文本预览，没有 markdown 正文，也没有「回复」。
     // （断言匹配渲染出的 class 属性——M9_CSS 样式文本里本来就含 ".m9-md" 字样。）
     assert.ok(!html.includes('class="m9-md'), 'collapsed channel renders previews, not markdown bodies')
@@ -1264,6 +1276,11 @@ await check('groups archive: the channel view threads letters, folds copies and 
     const fullCard = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, open: true, full: true }))
     assert.ok(fullCard.includes('TAIL_END_MARKER'), 'show-full reveals the tail')
     assert.ok(fullCard.includes('Show less'), 'and offers to collapse back')
+    // 宽表格信：markdown 表格照常渲染，滚动由 .m9-letter-md table 规则兜住（上面已断言注入）。
+    const tableRow = store.getState().groupArchive.find((entry) => entry.message_id === 'f8')
+    const tableCard = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, message: tableRow, open: true, full: false }))
+    assert.ok(tableCard.includes('<table>'), 'markdown table renders')
+    assert.ok(tableCard.includes('m9-letter-md'), 'and sits inside the overflow-safe container')
 
     // 回复链路：reply_to 闭环、correlation_id 原样随行；存档行不带
     // list_address 时回退到组地址（与 handler 里 `message.list_address ?? groupAddress` 一致）。
