@@ -871,6 +871,8 @@ await check('account agents: the §28 org endpoint wins once it ships; 404 falls
   const res = await call(`${BRIDGE_PREFIX}/account/agents`)
   assert.equal(res.payload.data.total, 1, 'org projection, not the account fixture')
   assert.equal(res.payload.data.agents[0].address, 'dsh@dsh.ice.msg9.io')
+  assert.equal(res.payload.data.org_id, 'org_ice', 'org id rides along to the panel')
+  assert.equal(res.payload.data.org_label, 'ice', 'org label rides along to the panel')
   orgEndpointLive = false
 })
 

@@ -74,6 +74,8 @@ export interface Msg9State {
   peers: PeerRow[]
   /** 「我的租户网络」: agents of every owner on this account (v1.10). */
   accountAgents: AccountAgentView[]
+  /** §28 (v1.27): the org the tenant network was projected from, when the server knows it. */
+  accountOrg: { id: string | null; label: string | null } | null
   /** 「组」(v1.19): groups the selected workspace inbox belongs to. */
   groups: GroupRow[]
   /** Group selected in the middle column (its card shows on the right). */
@@ -201,6 +203,7 @@ const INITIAL: Msg9State = {
   contactsTotal: 0,
   peers: [],
   accountAgents: [],
+  accountOrg: null,
   groups: [],
   selectedGroup: null,
   groupDetail: null,
@@ -429,7 +432,10 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     if (!state.owner) return
     try {
       const view = await bridge.accountAgents()
-      set({ accountAgents: view.agents ?? [] })
+      set({
+        accountAgents: view.agents ?? [],
+        accountOrg: view.org_id || view.org_label ? { id: view.org_id ?? null, label: view.org_label ?? null } : null,
+      })
     } catch {
       /* the tenant network is advisory: an old server leaves the section hidden */
     }

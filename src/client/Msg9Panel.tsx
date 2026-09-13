@@ -697,7 +697,11 @@ function ContactList({ state, store }: { state: Msg9State; store: Msg9Store }): 
       )}
       {networkGroups.length > 0 && (
         <>
-          <div style={styles.listHeader}>{L('我的租户网络', 'My tenant network')}</div>
+          <div style={styles.listHeader}>
+            {state.accountOrg?.label
+              ? L('我的租户网络 · {org}', 'My tenant network · {org}', { org: state.accountOrg.label })
+              : L('我的租户网络', 'My tenant network')}
+          </div>
           {networkGroups.map((group) => (
             <div key={group.owner_id}>
               <div style={styles.networkOwner}>{group.owner_name} · {group.address_domain}</div>

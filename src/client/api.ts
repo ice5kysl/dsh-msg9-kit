@@ -79,8 +79,8 @@ export interface BridgeClient {
   /** The notification mute state (panel bell). */
   notifyStatus(signal?: AbortSignal): Promise<{ paused: boolean }>
   setNotifyPaused(paused: boolean, signal?: AbortSignal): Promise<{ paused: boolean }>
-  /** 「我的租户网络」: every agent of every owner on this account (v1.10). */
-  accountAgents(signal?: AbortSignal): Promise<{ agents: AccountAgentView[]; total: number }>
+  /** 「我的租户网络」: org-level union when the server knows §28, else the account union (v1.10). */
+  accountAgents(signal?: AbortSignal): Promise<{ agents: AccountAgentView[]; total: number; org_id?: string | null; org_label?: string | null }>
   /** The public yellow pages (all tenants), for the「广场」tab. q / capability filter server-side. */
   directory(
     query: { limit?: number; offset?: number; q?: string; capability?: string },
@@ -206,7 +206,7 @@ export function createBridge(options: BridgeOptions = {}): BridgeClient {
     peers: (signal) => request<{ peers: PeerRow[] }>('/peers', { signal }),
     notifyStatus: (signal) => request<{ paused: boolean }>('/notify', { signal }),
     setNotifyPaused: (paused, signal) => request<{ paused: boolean }>('/notify', { method: 'POST', body: { paused }, signal }),
-    accountAgents: (signal) => request<{ agents: AccountAgentView[]; total: number }>('/account/agents', { signal }),
+    accountAgents: (signal) => request<{ agents: AccountAgentView[]; total: number; org_id?: string | null; org_label?: string | null }>('/account/agents', { signal }),
     directory: (q, signal) => request<DirectoryView>(
       `/directory${query({ limit: q.limit, offset: q.offset, q: q.q, capability: q.capability })}`,
       { signal },

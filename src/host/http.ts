@@ -547,7 +547,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         description: row.profile?.description ?? null,
         capabilities: row.profile?.capabilities ?? [],
       }))
-      return ok(res, { agents, total: page.total ?? agents.length })
+      return ok(res, { agents, total: page.total ?? agents.length, org_id: page.org_id ?? null, org_label: page.org_label ?? null })
     }
 
     // The public yellow pages behind the「广场」tab: no key needed, so the
