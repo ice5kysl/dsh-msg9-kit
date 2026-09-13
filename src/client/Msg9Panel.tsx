@@ -950,16 +950,84 @@ function GroupView({ state, store }: { state: Msg9State; store: Msg9Store }): JS
 /** 长正文阈值（字符数）：超过就 clamp，点「展开全文」看完整版。 */
 const CLAMP_CHARS = 2000
 
+/** 一封（已折叠 fan-out 副本的）信：ids 收齐所有副本的 message_id——
+ *  reply_to 可能指向任意一个副本，建树靠它解析到「信」。 */
+interface LetterFold {
+  message: MessageRow
+  copies: number
+  ids: string[]
+}
+
+/** 回复树节点：一封信 + 它的回复子树。 */
+export interface LetterNode {
+  letter: LetterFold
+  children: LetterNode[]
+  /** 全部后代数（子树收起时显示「N 条回复」）。 */
+  descendants: number
+}
+
+/** 线程内的信建成回复树（导出以便测试直接驱动）：
+ *  - reply_to 解析到本线程内的信（经副本 id 映射）即为父；指向存档外、自指、
+ *    成环、或没有 reply_to——一律兜底挂到线程根（深度 1）；
+ *  - 根 = 线程内最早的无 reply_to 信（letters 已按时间正序）；多封无 reply_to
+ *    时最早的为根，其余当根的孩子；
+ *  - 每层孩子按时间正序；返回唯一根节点。 */
+export function buildLetterTree(letters: LetterFold[]): LetterNode {
+  const first = letters[0]
+  if (!first) throw new Error('buildLetterTree: an empty thread has no root')
+  const byId = new Map<string, LetterFold>()
+  for (const letter of letters) for (const id of letter.ids) byId.set(id, letter)
+  const parentOf = new Map<LetterFold, LetterFold | null>()
+  for (const letter of letters) {
+    const target = letter.message.reply_to ? byId.get(letter.message.reply_to) : undefined
+    parentOf.set(letter, target && target !== letter ? target : null)
+  }
+  // 断环：沿父链走撞见已见过的信，就当无父（兜底挂根）。
+  for (const letter of letters) {
+    const seen = new Set<LetterFold>([letter])
+    let cursor = parentOf.get(letter) ?? null
+    while (cursor) {
+      if (seen.has(cursor)) {
+        parentOf.set(letter, null)
+        break
+      }
+      seen.add(cursor)
+      cursor = parentOf.get(cursor) ?? null
+    }
+  }
+  const root = letters.find((letter) => !parentOf.get(letter)) ?? first
+  const nodes = new Map<LetterFold, LetterNode>()
+  for (const letter of letters) nodes.set(letter, { letter, children: [], descendants: 0 })
+  for (const letter of letters) {
+    if (letter === root) continue
+    const parent = parentOf.get(letter) ?? root
+    nodes.get(parent)?.children.push(nodes.get(letter) as LetterNode)
+  }
+  const timeOf = (node: LetterNode): number => Date.parse(node.letter.message.created_at ?? '') || 0
+  const finish = (node: LetterNode): number => {
+    node.children.sort((a, b) => timeOf(a) - timeOf(b))
+    let count = 0
+    for (const child of node.children) count += 1 + finish(child)
+    node.descendants = count
+    return count
+  }
+  const rootNode = nodes.get(root) as LetterNode
+  finish(rootNode)
+  return rootNode
+}
+
 /** The group's archive as a chat channel: letters grouped into threads by
- *  correlation_id, each thread a timeline (gutter line + node dots), each
- *  letter a collapsible card — collapsed by default (header + one-line preview),
- *  expanded to the full markdown body through the same pipeline as the inbox
- *  detail. The toggle flips the thread order and defaults to chronological
- *  (正序) — a discussion reads like a chat log. */
+ *  correlation_id, each thread a REPLY TREE (nested children under each
+ *  letter, per-level connector lines), each letter a collapsible card —
+ *  collapsed by default (header + one-line preview), expanded to the full
+ *  markdown body through the same pipeline as the inbox detail. The toggle
+ *  flips the thread order and defaults to chronological (正序). */
 function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
-  // openIds: 卡片级展开（默认全部折叠）；fullIds: 长正文的「展开全文」（2000 字符 clamp）。
+  // openIds: 卡片级展开（默认全部折叠）；fullIds: 长正文的「展开全文」（2000 字符 clamp）；
+  // closedIds: 子树折叠（默认全部展开，层级清晰可见）。
   const [openIds, setOpenIds] = useState<ReadonlySet<string>>(new Set())
   const [fullIds, setFullIds] = useState<ReadonlySet<string>>(new Set())
+  const [closedIds, setClosedIds] = useState<ReadonlySet<string>>(new Set())
   const [ascending, setAscending] = useState(true)
   const myAddress = selectedWorkspace(state)?.address ?? null
   const groupAddress = state.selectedGroup
@@ -973,7 +1041,7 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
       if (!text && !row.subject) return row.message_id
       return `${row.from_address}\n${row.subject ?? ''}\n${text}`
     }
-    const byThread = new Map<string, { id: string; letters: { message: MessageRow; copies: number }[] }>()
+    const byThread = new Map<string, { id: string; letters: LetterFold[] }>()
     for (const row of state.groupArchive) {
       const id = row.correlation_id ?? row.message_id
       let thread = byThread.get(id)
@@ -983,17 +1051,21 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
       }
       const key = letterKey(row)
       const existing = thread.letters.find((letter) => letterKey(letter.message) === key)
-      if (existing) existing.copies += 1
-      else thread.letters.push({ message: row, copies: 1 })
+      if (existing) {
+        existing.copies += 1
+        existing.ids.push(row.message_id)
+      } else {
+        thread.letters.push({ message: row, copies: 1, ids: [row.message_id] })
+      }
     }
-    const grouped = [...byThread.values()]
-    for (const thread of grouped) {
+    const grouped = [...byThread.values()].map((thread) => {
       thread.letters.sort((a, b) => (Date.parse(a.message.created_at ?? '') || 0) - (Date.parse(b.message.created_at ?? '') || 0))
-    }
-    // 线程之间：正序按线程首信时间，倒序按末信时间。
-    const keyOf = (thread: { letters: { message: MessageRow }[] }): number => {
-      const letter = ascending ? thread.letters[0] : thread.letters[thread.letters.length - 1]
-      return Date.parse(letter?.message.created_at ?? '') || 0
+      return { ...thread, root: buildLetterTree(thread.letters) }
+    })
+    // 线程之间：正序按根信时间，倒序按线程内最新信时间。
+    const keyOf = (thread: { letters: LetterFold[]; root: LetterNode }): number => {
+      if (ascending) return Date.parse(thread.root.letter.message.created_at ?? '') || 0
+      return Math.max(...thread.letters.map((letter) => Date.parse(letter.message.created_at ?? '') || 0))
     }
     grouped.sort((a, b) => (ascending ? keyOf(a) - keyOf(b) : keyOf(b) - keyOf(a)))
     return grouped
@@ -1038,7 +1110,7 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
           <div style={styles.listEmpty}>{L('组里还没有消息。', 'No messages in this group yet.')}</div>
         </div>
       ) : (
-        // 唯一滚动区：gutter/时间线、卡片和「加载更多」都在里面；上面的计数行不滚。
+        // 唯一滚动区：回复树、卡片和「加载更多」都在里面；上面的计数行不滚。
         // overflowX hidden 是兜底——卡片内容（表格/代码块）一律内部横滚，不探出右缘。
         <div className="m9-archive-scroll" style={styles.archiveScroll}>
           <div style={styles.threadList}>
@@ -1046,7 +1118,6 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
               const allOpen = thread.letters.every(({ message }) => openIds.has(message.message_id))
               return (
                 <div key={thread.id} style={styles.thread}>
-                  <span className="m9-timeline" style={styles.threadGutter} />
                   {thread.letters.length > 1 && (
                     <div style={styles.threadHead}>
                       <button type="button" className="m9-chip" onClick={() => setThreadOpen(thread.letters, !allOpen)}>
@@ -1055,25 +1126,24 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
                       <span style={styles.threadCount}>{L('{n} 封', '{n} letters', { n: thread.letters.length })}</span>
                     </div>
                   )}
-                  {thread.letters.map(({ message, copies }, index) => (
-                    <LetterCard
-                      key={message.message_id}
-                      message={message}
-                      copies={copies}
-                      reply={index > 0}
-                      mine={myAddress !== null && message.from_address === myAddress}
-                      open={openIds.has(message.message_id)}
-                      full={fullIds.has(message.message_id)}
-                      onToggleOpen={() => toggleIn(setOpenIds, message.message_id)}
-                      onToggleFull={() => toggleIn(setFullIds, message.message_id)}
-                      onReply={() => store.replyTo({
-                        ...message,
-                        // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
-                        // 链路——reply_to 闭环、correlation_id 原样随行，语义不变。
-                        list_address: message.list_address ?? groupAddress ?? undefined,
-                      })}
-                    />
-                  ))}
+                  <LetterNodeView
+                    node={thread.root}
+                    depth={0}
+                    mine={(message) => myAddress !== null && message.from_address === myAddress}
+                    openIds={openIds}
+                    fullIds={fullIds}
+                    closedIds={closedIds}
+                    onToggleOpen={(id) => toggleIn(setOpenIds, id)}
+                    onToggleFull={(id) => toggleIn(setFullIds, id)}
+                    onToggleChildren={(id) => toggleIn(setClosedIds, id)}
+                    onReply={(message) => store.replyTo({
+                      ...message,
+                      // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
+                      // 链路——reply_to 闭环、correlation_id 原样随行，语义不变；
+                      // reply_to 正好给这棵回复树供给真数据。
+                      list_address: message.list_address ?? groupAddress ?? undefined,
+                    })}
+                  />
                 </div>
               )
             })}
@@ -1089,31 +1159,113 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
   )
 }
 
-/** 频道里的一封信（可折叠卡片 + 时间线节点）。折叠态（默认）：头行 = 折叠箭头 +
+/** 回复树的一个节点：信卡片 + 递归子树。子树容器的左侧竖线就是该层的时间线
+ *  （每层一条，嵌套自然形成层级线）；子树折叠开关在卡片头行（与"展开正文"是两个
+ *  动作：箭头管孩子显隐、头行点击管自己正文）。 */
+function LetterNodeView({
+  node,
+  depth,
+  mine,
+  openIds,
+  fullIds,
+  closedIds,
+  onToggleOpen,
+  onToggleFull,
+  onToggleChildren,
+  onReply,
+}: {
+  node: LetterNode
+  depth: number
+  mine: (message: MessageRow) => boolean
+  openIds: ReadonlySet<string>
+  fullIds: ReadonlySet<string>
+  closedIds: ReadonlySet<string>
+  onToggleOpen: (id: string) => void
+  onToggleFull: (id: string) => void
+  onToggleChildren: (id: string) => void
+  onReply: (message: MessageRow) => void
+}): JSX.Element {
+  const { message, copies } = node.letter
+  const id = message.message_id
+  const childrenOpen = !closedIds.has(id)
+  return (
+    <div style={styles.treeNode}>
+      <LetterCard
+        message={message}
+        copies={copies}
+        depth={depth}
+        mine={mine(message)}
+        open={openIds.has(id)}
+        full={fullIds.has(id)}
+        childrenCount={node.children.length}
+        descendants={node.descendants}
+        childrenOpen={childrenOpen}
+        onToggleChildren={() => onToggleChildren(id)}
+        onToggleOpen={() => onToggleOpen(id)}
+        onToggleFull={() => onToggleFull(id)}
+        onReply={() => onReply(message)}
+      />
+      {node.children.length > 0 && childrenOpen && (
+        <div className="m9-tree-children" style={styles.treeChildren}>
+          {node.children.map((child) => (
+            <LetterNodeView
+              key={child.letter.message.message_id}
+              node={child}
+              depth={depth + 1}
+              mine={mine}
+              openIds={openIds}
+              fullIds={fullIds}
+              closedIds={closedIds}
+              onToggleOpen={onToggleOpen}
+              onToggleFull={onToggleFull}
+              onToggleChildren={onToggleChildren}
+              onReply={onReply}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 频道里的一封信（可折叠卡片，回复树的一个节点）。折叠态（默认）：头行 = 折叠箭头 +
  *  发送者 + 时间 + 「×N 副本」徽标，下面一行纯文本预览（~120 字符）；点头行展开为
  *  完整 markdown（marked + DOMPurify + Shiki，与收件箱详情同一条链路），长正文
- *  保留 2000 字符 clamp + 「展开全文」。导出以便测试直接驱动两个层级。 */
+ *  保留 2000 字符 clamp + 「展开全文」。有孩子的节点头行最左另有子树折叠开关
+ *  （管孩子显隐，与头行点击管自己正文是两个动作），子树收起时显示「N 条回复」。
+ *  导出以便测试直接驱动各个层级。 */
 export function LetterCard({
   message,
   copies,
-  reply,
+  depth,
   mine,
   open,
   full,
+  childrenCount,
+  descendants,
+  childrenOpen,
+  onToggleChildren,
   onToggleOpen,
   onToggleFull,
   onReply,
 }: {
   message: MessageRow
   copies: number
-  /** 线程内的回复（非首信）：缩进，节点挂在时间线上，视觉上连成一串。 */
-  reply: boolean
+  /** 回复树深度（0 = 线程根）；≥1 的节点在时间线竖线上挂一个节点圆点。 */
+  depth: number
   /** 当前 workspace 自己发的信：靠右 + 底色（折叠态也能看出）。 */
   mine: boolean
   /** 卡片级展开（折叠态只有头行 + 预览）。 */
   open: boolean
   /** 长正文的「展开全文」（2000 字符 clamp 的旁路）。 */
   full: boolean
+  /** 直接回复数（>0 时头行显示子树折叠开关）。 */
+  childrenCount: number
+  /** 全部后代数（子树收起时显示「N 条回复」）。 */
+  descendants: number
+  /** 子树展开状态（默认展开）。 */
+  childrenOpen: boolean
+  onToggleChildren: () => void
   onToggleOpen: () => void
   onToggleFull: () => void
   onReply: () => void
@@ -1130,21 +1282,37 @@ export function LetterCard({
     shown = `${lastBreak > CLAMP_CHARS / 2 ? cut.slice(0, lastBreak) : cut}\n…`
   }
   return (
-    <article style={{ ...styles.letter, ...(reply ? styles.letterReply : {}), ...(mine ? styles.letterMine : {}) }}>
-      <span className="m9-tl-node" style={{ ...styles.tlNode, left: reply ? -30 : -16, ...(mine ? styles.tlNodeMine : {}) }} />
-      <button type="button" className="m9-letterhead" onClick={onToggleOpen} title={open ? L('收起', 'Collapse') : L('展开', 'Expand')}>
-        {open ? <ChevronDown size={12} style={styles.tlArrow} /> : <ChevronRight size={12} style={styles.tlArrow} />}
-        <span style={styles.letterSender}>{message.from_address}</span>
-        {mine && (
-          <span style={styles.mineTag} title={L('本 workspace 发的信', 'Sent by this workspace')}>{L('我', 'me')}</span>
+    <article style={{ ...styles.letter, ...(mine ? styles.letterMine : {}) }}>
+      {depth > 0 && <span className="m9-tl-node" style={{ ...styles.tlNode, ...(mine ? styles.tlNodeMine : {}) }} />}
+      <div style={styles.letterHeadRow}>
+        {childrenCount > 0 && (
+          <button
+            type="button"
+            className="m9-iconbtn"
+            style={styles.treeToggle}
+            onClick={onToggleChildren}
+            title={childrenOpen ? L('收起回复', 'Collapse replies') : L('展开回复', 'Expand replies')}
+          >
+            {childrenOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          </button>
         )}
-        {copies > 1 && (
-          <span style={styles.groupTag} title={L('同一封邮件的 {n} 份 fan-out 副本', '{n} fan-out copies of the same mail', { n: copies })}>
-            {L('×{n} 副本', '×{n} copies', { n: copies })}
-          </span>
-        )}
-        <span style={styles.letterTime}>{formatTime(message.created_at)}</span>
-      </button>
+        <button type="button" className="m9-letterhead" onClick={onToggleOpen} title={open ? L('收起', 'Collapse') : L('展开', 'Expand')}>
+          {open ? <ChevronDown size={12} style={styles.tlArrow} /> : <ChevronRight size={12} style={styles.tlArrow} />}
+          <span style={styles.letterSender}>{message.from_address}</span>
+          {mine && (
+            <span style={styles.mineTag} title={L('本 workspace 发的信', 'Sent by this workspace')}>{L('我', 'me')}</span>
+          )}
+          {copies > 1 && (
+            <span style={styles.groupTag} title={L('同一封邮件的 {n} 份 fan-out 副本', '{n} fan-out copies of the same mail', { n: copies })}>
+              {L('×{n} 副本', '×{n} copies', { n: copies })}
+            </span>
+          )}
+          {!childrenOpen && descendants > 0 && (
+            <span style={styles.threadCount}>{L('{n} 条回复', '{n} replies', { n: descendants })}</span>
+          )}
+          <span style={styles.letterTime}>{formatTime(message.created_at)}</span>
+        </button>
+      </div>
       {message.subject ? <div style={styles.letterSubject}>{message.subject}</div> : null}
       {!open && <div style={styles.rowPreview}>{previewOf(message, 120)}</div>}
       {open && (
@@ -1566,8 +1734,10 @@ const styles: Record<string, CSSProperties> = {
   archiveScroll: { flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column', gap: 8 },
   loadMore: { flexShrink: 0, alignSelf: 'flex-start' },
   threadList: { display: 'flex', flexDirection: 'column', gap: 12 },
-  thread: { position: 'relative', display: 'flex', flexDirection: 'column', gap: 4, paddingLeft: 16, minWidth: 0 },
-  threadGutter: { position: 'absolute', left: 5, top: 10, bottom: 10, width: 2, borderRadius: 1, background: BORDER },
+  thread: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+  treeNode: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+  // 子树容器：左侧竖线即该层的时间线（嵌套自然形成多级层级线）。
+  treeChildren: { marginLeft: 4, paddingLeft: 18, borderLeft: `1px solid ${BORDER}`, display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
   threadHead: { display: 'flex', alignItems: 'center', gap: 6, paddingBottom: 2 },
   threadCount: { fontSize: 10, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '0 7px' },
   letter: {
@@ -1586,10 +1756,12 @@ const styles: Record<string, CSSProperties> = {
     gap: 4,
   },
   letterMine: { alignSelf: 'flex-end', background: ACTIVE_BG, borderColor: BORDER_STRONG },
-  letterReply: { marginLeft: 14, borderLeft: `2px solid ${BORDER_STRONG}` },
-  tlNode: { position: 'absolute', top: 13, width: 8, height: 8, borderRadius: 4, background: BORDER_STRONG },
+  // 节点圆点：挂在 treeChildren 的竖线上（border 1px + paddingLeft 18px → 线心约在 -19）。
+  tlNode: { position: 'absolute', left: -23, top: 13, width: 8, height: 8, borderRadius: 4, background: BORDER_STRONG },
   tlNodeMine: { background: ACCENT },
   tlArrow: { flexShrink: 0, color: DIM },
+  letterHeadRow: { display: 'flex', alignItems: 'center', gap: 2, minWidth: 0 },
+  treeToggle: { flexShrink: 0 },
   letterSender: { fontSize: 11, fontWeight: 600, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   mineTag: { flexShrink: 0, fontSize: 10, color: ACCENT, border: `1px solid ${BORDER_STRONG}`, borderRadius: 999, padding: '0 6px' },
   letterTime: { color: DIM, fontSize: 10, flexShrink: 0, marginLeft: 'auto' },

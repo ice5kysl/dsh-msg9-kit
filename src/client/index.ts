@@ -41,7 +41,7 @@ export const MSG9_SETTINGS_ID = 'msg9-mailboxes'
 // by another client plugin): the store, the components, and the bridge.
 export { Msg9Panel } from './Msg9Panel.tsx'
 export { Msg9SettingsSection } from './Msg9SettingsSection.tsx'
-export { SetupView, externalizeLinks, LetterCard, findScrollParent } from './Msg9Panel.tsx'
+export { SetupView, externalizeLinks, LetterCard, findScrollParent, buildLetterTree } from './Msg9Panel.tsx'
 export { createBridge } from './api.ts'
 export { highlightReady, highlightCode } from './highlight.ts'
 export { createMsg9Store, getMsg9Store, selectedWorkspace } from './store.ts'

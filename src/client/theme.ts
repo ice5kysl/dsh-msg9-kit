@@ -68,7 +68,7 @@ export const M9_CSS = `
 .m9-letter-md table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .m9-letter-md td, .m9-letter-md th { overflow-wrap: anywhere; }
 .m9-letter-md img { max-width: 100%; }
-.m9-letterhead { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: transparent; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; text-align: left; min-width: 0; }
+.m9-letterhead { display: flex; flex: 1; align-items: center; gap: 6px; width: 100%; border: none; background: transparent; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; text-align: left; min-width: 0; }
 /* Syntax highlighting (Shiki css-variables theme): the palette maps token
    variables onto shell colors, so one render serves both themes. */
 .m9-md pre code {

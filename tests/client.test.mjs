@@ -88,6 +88,21 @@ const fanoutCopies = [
   // 带 markdown 表格的信：宽表格必须表格内部横滚，不能撑破卡片。
   { message_id: 'f8', from_address: 'peer@msg9.io', subject: 'proposal', body: { text: '| option | latency | cost |\n| --- | --- | --- |\n| a-very-long-option-name-that-keeps-going | 120ms | $$$ |' }, created_at: '2026-09-12T10:30:00Z' },
 ]
+// 回复树夹具（3 层）：根信 3 份 fan-out 副本；reply_to 分别指向第 1、第 2 个副本
+// （都要解析到根信）；t31 是 t3 的回复（第三层）；t4 的 reply_to 指向存档外
+// （兜底挂根）；t5 同线程但无 reply_to（兜底当根的孩子）；t6 是另一个线程。
+let treeArchive = false
+const treeLetters = [
+  { message_id: 't1a', from_address: 'alice@msg9.io', subject: 'topic', body: { text: 'root body' }, created_at: '2026-09-12T08:00:00Z', correlation_id: 'thread-t' },
+  { message_id: 't1b', from_address: 'alice@msg9.io', subject: 'topic', body: { text: 'root body' }, created_at: '2026-09-12T08:00:01Z', correlation_id: 'thread-t' },
+  { message_id: 't1c', from_address: 'alice@msg9.io', subject: 'topic', body: { text: 'root body' }, created_at: '2026-09-12T08:00:02Z', correlation_id: 'thread-t' },
+  { message_id: 't2', from_address: 'bob@msg9.io', subject: 're: topic', body: { text: 'reply one' }, created_at: '2026-09-12T08:10:00Z', correlation_id: 'thread-t', reply_to: 't1a' },
+  { message_id: 't3', from_address: 'carol@msg9.io', subject: 're: topic', body: { text: 'reply two' }, created_at: '2026-09-12T08:20:00Z', correlation_id: 'thread-t', reply_to: 't1b' },
+  { message_id: 't31', from_address: 'dave@msg9.io', subject: 're: topic', body: { text: 'reply two dot one' }, created_at: '2026-09-12T08:30:00Z', correlation_id: 'thread-t', reply_to: 't3' },
+  { message_id: 't4', from_address: 'erin@msg9.io', subject: 're: topic', body: { text: 'reply three' }, created_at: '2026-09-12T08:40:00Z', correlation_id: 'thread-t', reply_to: 'ghost-not-in-archive' },
+  { message_id: 't5', from_address: 'frank@msg9.io', subject: 're: topic', body: { text: 'loose letter' }, created_at: '2026-09-12T08:50:00Z', correlation_id: 'thread-t' },
+  { message_id: 't6', from_address: 'gina@msg9.io', subject: 'solo', body: { text: 'solo letter' }, created_at: '2026-09-12T09:30:00Z' },
+]
 
 function reply(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json' })
@@ -222,7 +237,7 @@ const server = createServer(async (req, res) => {
     return reply(res, 200, { code: 0, data: { groups: groupsFixture, total: groupsFixture.length } })
   }
   if (req.method === 'GET' && /^\/api\/v1\/groups\/.+\/messages$/.test(path)) {
-    const rows = fanoutArchive ? fanoutCopies : groupArchive
+    const rows = treeArchive ? treeLetters : fanoutArchive ? fanoutCopies : groupArchive
     return reply(res, 200, { code: 0, data: { messages: rows, total: rows.length } })
   }
   if (req.method === 'GET' && path.startsWith('/api/v1/groups/')) {
@@ -1255,9 +1270,9 @@ await check('groups archive: the channel view threads letters, folds copies and 
     // 不同线程分开；线程之间按首信时间正序（thread-f → standalone → mine → long）。
     assert.ok(html.indexOf('a different letter') < html.indexOf('own thread'), 'threads sort by first-letter time')
     assert.ok(html.indexOf('own thread') < html.indexOf('from this workspace'), 'a letter without a thread id is its own thread')
-    // 线程时间线：gutter + 每张卡一个节点圆点；线程头有信数徽标和「全部展开」。
-    assert.ok(html.includes('m9-timeline'), 'the thread gutter line is rendered')
-    assert.ok(html.includes('m9-tl-node'), 'every card hangs a node dot on the line')
+    // 回复树：无 reply_to 的信兜底挂到线程根下（嵌套子树容器），非根卡挂节点圆点。
+    assert.ok(html.includes('m9-tree-children'), 'letters without reply_to nest under the thread root')
+    assert.ok(html.includes('m9-tl-node'), 'nested cards hang a node dot on the connector line')
     assert.ok(html.includes('2 letters'), 'the thread head shows its letter count')
     assert.ok(html.includes('Expand all'), 'per-thread expand-all is offered')
     // 自己发的信折叠态也有区分标记。
@@ -1267,7 +1282,11 @@ await check('groups archive: the channel view threads letters, folds copies and 
 
     // 展开态：SSR 没有事件，直接渲染导出的 LetterCard 验证两个层级。
     const longRow = store.getState().groupArchive.find((entry) => entry.message_id === 'f7')
-    const cardProps = { message: longRow, copies: 1, reply: false, mine: false, onToggleOpen: () => {}, onToggleFull: () => {}, onReply: () => {} }
+    const cardProps = {
+      message: longRow, copies: 1, depth: 0, mine: false,
+      childrenCount: 0, descendants: 0, childrenOpen: true,
+      onToggleChildren: () => {}, onToggleOpen: () => {}, onToggleFull: () => {}, onReply: () => {},
+    }
     const openCard = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, open: true, full: false }))
     assert.ok(openCard.includes('m9-md'), 'expanded card renders the markdown body')
     assert.ok(openCard.includes('m9-letter-md'), 'archive markdown carries the overflow-safe scoped class')
@@ -1298,6 +1317,79 @@ await check('groups archive: the channel view threads letters, folds copies and 
     assert.equal(store.getState().compose.to, 'team-x@dsh.msg9.io', 'rows without list_address fall back to the group address')
   } finally {
     fanoutArchive = false
+  }
+})
+
+await check('groups archive: reply_to builds a nested reply tree (copies resolve to their letter)', async () => {
+  treeArchive = true
+  try {
+    // 纯函数层：建树规则——根=最早无 reply_to 信；副本 id 映射到信；兜底挂根。
+    // （按真实折叠喂数据：t1a/t1b/t1c 是同一封信的 3 份副本，合并为一封。）
+    const rows = treeLetters.filter((row) => row.correlation_id === 'thread-t')
+    const letters = [
+      { message: rows[0], copies: 3, ids: ['t1a', 't1b', 't1c'] },
+      ...rows.slice(3).map((row) => ({ message: row, copies: 1, ids: [row.message_id] })),
+    ]
+    const indexNodes = (node) => {
+      const map = new Map()
+      const walk = (n) => { map.set(n.letter.message.message_id, n); for (const c of n.children) walk(c) }
+      walk(node)
+      return map
+    }
+    const direct = client.buildLetterTree(letters)
+    assert.equal(direct.letter.message.message_id, 't1a', 'earliest reply_to-less letter is the root')
+    assert.deepEqual(direct.children.map((node) => node.letter.message.message_id), ['t2', 't3', 't4', 't5'], 'children by time: direct reply, copy-targeted reply, orphan fallback, no-reply_to fallback')
+    const nodes = indexNodes(direct)
+    assert.equal(nodes.get('t3').children[0].letter.message.message_id, 't31', 'a reply to a reply nests one level deeper')
+    assert.equal(direct.descendants, 5, 'the root counts every descendant')
+
+    // 面板渲染：默认全部展开，嵌套层级与顺序可见。
+    const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+    store.setCwd('/work/a')
+    await store.refreshAll()
+    store.setTab('groups')
+    store.selectGroup('team-x@dsh.msg9.io')
+    for (let i = 0; i < 50 && store.getState().groupArchive.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(store.getState().groupArchive.length, 9, 'store keeps every archived copy')
+
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+    const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    // 根信 3 份副本折成一张卡（×3），reply_to 指向第 2 个副本的 t3 仍挂在根下。
+    assert.equal(html.match(/root body/g).length, 1, 'three copies of the root fold into ONE card')
+    assert.ok(html.includes('×3 copies'), 'root copy-count chip')
+    const order = ['root body', 'reply one', 'reply two', 'reply two dot one', 'reply three', 'loose letter']
+    for (let i = 1; i < order.length; i++) {
+      assert.ok(html.indexOf(order[i - 1]) < html.indexOf(order[i]), `tree order: ${order[i - 1]} before ${order[i]}`)
+    }
+    // 层级锚点：根的子树容器 + t3 的子树容器（两级嵌套），t31 在第二个容器内。
+    assert.equal(html.match(/m9-tree-children/g).length, 2, 'two nesting levels (root → replies → reply-of-reply)')
+    const secondNest = html.indexOf('m9-tree-children', html.indexOf('reply two'))
+    assert.ok(secondNest > html.indexOf('reply two') && secondNest < html.indexOf('reply two dot one'), 'reply-of-reply nests under its parent')
+    // 另一个线程（无 correlation_id）独立成树。
+    assert.ok(html.indexOf('loose letter') < html.indexOf('solo letter'), 'threads stay separate, sorted by root time')
+
+    // 子树收起（SSR 无事件，直接渲染 LetterCard）：显示「N 条回复」，正文/子树动作分离。
+    const rootRow = store.getState().groupArchive.find((entry) => entry.message_id === 't1a')
+    const cardProps = {
+      message: rootRow, copies: 3, depth: 0, mine: false,
+      onToggleChildren: () => {}, onToggleOpen: () => {}, onToggleFull: () => {}, onReply: () => {},
+    }
+    const collapsed = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, open: false, full: false, childrenCount: 4, descendants: 5, childrenOpen: false }))
+    assert.ok(collapsed.includes('5 replies'), 'collapsed subtree shows the descendant count')
+    assert.ok(collapsed.includes('Expand replies'), 'and the toggle offers to expand')
+    const expanded = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, open: false, full: false, childrenCount: 4, descendants: 5, childrenOpen: true }))
+    assert.ok(!expanded.includes('5 replies'), 'expanded subtree hides the count badge')
+    assert.ok(expanded.includes('Collapse replies'), 'the subtree toggle is separate from the body toggle')
+
+    // 嵌套节点的正文照常走 markdown 管线。
+    const nestedRow = store.getState().groupArchive.find((entry) => entry.message_id === 't31')
+    const nestedCard = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, message: nestedRow, copies: 1, depth: 2, childrenCount: 0, descendants: 0, childrenOpen: true, open: true }))
+    assert.ok(nestedCard.includes('class="m9-md'), 'a deeply nested letter still renders markdown')
+    assert.ok(nestedCard.includes('m9-tl-node'), 'and hangs its node dot on the connector line')
+  } finally {
+    treeArchive = false
   }
 })
 

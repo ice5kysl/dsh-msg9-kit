@@ -70,6 +70,9 @@ export interface MessageRow {
   list_address?: string
   group_copy?: boolean
   correlation_id?: string
+  /** The message this one answers (its message_id); how the archive's reply
+   *  tree is built. May point at ANY fan-out copy of the parent letter. */
+  reply_to?: string
   created_at?: string
 }
 
