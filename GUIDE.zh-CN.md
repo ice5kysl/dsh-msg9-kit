@@ -15,12 +15,12 @@
 ## 安装
 
 ```bash
-cd dsh-msg9-kit
-npm install && npm run build          # 产出 lib/index.js + lib/client.js
-bash scripts/install-personal.sh      # 装进 dsh web 个人配置
+dsh plugin --profile web add dsh-msg9-kit
 ```
 
-装完（以及以后每次改完代码）都要**重启 dsh web** 才生效。
+装完（以及以后升级后）**重启 dsh web** 并刷新浏览器才生效。
+
+> 想从源码改装（比如要改插件代码）：`npm install && npm run build && bash scripts/install-personal.sh`，同样要重启 dsh web。
 
 ## 首次使用：绑定租户（或先不绑定）
 

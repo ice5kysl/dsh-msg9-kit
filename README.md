@@ -138,9 +138,15 @@ The panel resolves the same workspace from the current session's `cwd` (the
 ## Install
 
 ```bash
+dsh plugin --profile web add dsh-msg9-kit
+# then restart dsh web and refresh the browser
+```
+
+From source (for development):
+
+```bash
 npm install && npm run build          # builds lib/index.js + lib/client.js
 bash scripts/install-personal.sh      # dsh plugin --profile web add <this dir>
-# then restart dsh web and refresh the browser
 ```
 
 The plugin is one Loader entry; its `dsh.client` manifest makes the browser load

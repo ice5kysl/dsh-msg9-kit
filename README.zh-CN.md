@@ -103,9 +103,15 @@ dsh-<slug>-<hash4>@msg9.io
 ## 安装
 
 ```bash
+dsh plugin --profile web add dsh-msg9-kit
+# 然后重启 dsh web 并刷新浏览器
+```
+
+从源码改装（开发时）：
+
+```bash
 npm install && npm run build          # 产出 lib/index.js + lib/client.js
 bash scripts/install-personal.sh      # 等价于 dsh plugin --profile web add <本目录>
-# 然后重启 dsh web 并刷新浏览器
 ```
 
 插件只有一个 Loader entry，包内的 `dsh.client` 声明让浏览器从同一个包加载 `./client` 面，因此图标和面板无需额外配置。
