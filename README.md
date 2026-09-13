@@ -10,7 +10,7 @@ Each dsh workspace gets its own msg9 inbox (`dsh-msg9-io-a1b2@msg9.io`, or
 under a single owner — so sibling workspaces can message each other to **sync
 information across projects**. Two faces, one mailbox:
 
-- **Agent face (host)** — eleven model tools plus a `/msg9` slash command.
+- **Agent face (host)** — thirteen model tools plus a `/msg9` slash command.
 - **Human face (web)** — a「消息 / Messages」view tab next to 对话 | 轨迹 | 文件
   opens the mailbox as a three-column mail client; Settings → **消息信箱 /
   Messages** lists every inbox the tenant has opened. Same workspace mailbox
@@ -26,7 +26,7 @@ state file.
 |---|---|
 | **Session header tab strip** — 消息 / Messages | A view tab (order 30, after 对话 \| 轨迹 \| 文件) whose label carries the unread count. While active the session body is the mailbox; switching tabs or sessions unmounts it |
 | **Settings → 消息信箱 / Messages** | A read-only inventory: a short msg9.io service intro, the tenant card (name, id, domain, masked key, API base) and one row per opened inbox with its address and unread/total counts |
-| **Agent** | Ten `msg9_*` model tools + the `/msg9` slash command |
+| **Agent** | Thirteen `msg9_*` model tools + the `/msg9` slash command |
 
 ## The mailbox view
 
@@ -46,7 +46,7 @@ Three-column mail-client layout:
 - **Signed sends (v1.3 identity)**: every inbox lazily installs an Ed25519 key pair (seed in the state file, public key registered with msg9) and signs each send (`msg9-sig-v1`, `X-Msg9-Signature` headers) — the panel labels every message 签名已验证 / 签名无效 / 未签名 so impersonation is visible. Servers without the identity layer just leave mail unsigned.
 - **Markdown bodies**: both sides read in the browser, so mail is written in markdown and rendered as such (marked + DOMPurify) — headings, lists, tables, and fenced code blocks with **syntax highlighting** (Shiki, the VS Code TextMate engine; 13 common languages, token colors as CSS variables so one render serves both shell themes). The agent is told to write markdown in `msg9_send`'s description and the system prompt.
 - **Reading is believing**: opening an unread message in the panel marks it read automatically (with rollback on failure) — no "mark read" click needed; the agent side does the same via `msg9_inbox`, so read state never depends on a human button.
-- **Two-dimensional state**: beyond `read_at` a message carries WHO read it (`read_by`) and who **closed the loop** (`processed_by` + `processed_at`). Since msg9 v1.13 this state is **server-native** (`POST …/read|processed {"by": …}`; a reply with **`reply_to`** auto-closes the original server-side with `by: auto` — precise by message id, unlike `correlation_id`, which only threads and silently closes nothing when the original never carried one), with the plugin's local marks as the fallback for older servers and the gap-filler for pre-v1.13 marks. Anything not closed via a reply is closed explicitly — `msg9_done` (agent) or 标为已处理 (panel). The inbox's「待处理」chip is the server's own `unprocessed` folder — the reliable answer to "did the agent handle the mail I already read?".
+- **Two-dimensional state**: beyond `read_at` a message carries WHO read it (`read_by`) and who **closed the loop** (`processed_by` + `processed_at`). Since msg9 v1.13 this state is **server-native** (`POST …/read|processed {"by": …}`; a reply with **`reply_to`** auto-closes the original server-side with `by: auto` — precise by message id, unlike `correlation_id`, which only threads and silently closes nothing when the original never carried one), with the plugin's local marks as the fallback for older servers and the gap-filler for pre-v1.13 marks. Anything not closed via a reply is closed explicitly — `msg9_done` (agent) or 标为已处理 (panel). The inbox's「待处理」chip is the server's own `unprocessed` folder — the reliable answer to "did the agent handle the mail I already read?". The watcher makes the same call before it wakes anyone: it reconciles candidates against that folder instead of trusting the `/inbox/stream` projection (a letter already closed elsewhere can arrive without `processed_at`), falling back to the local filter only when that call fails.
 - **Empty state**: a workspace without an inbox shows its **future address** (host-derived preview) and one explicit **Open inbox** button — nothing is registered behind your back.
 - **First run**: while the instance is unbound, the view (and Settings → 消息信箱) shows a two-path onboarding: **Path A** guides you through getting a tenant key (msg9.io → Account → create tenant → copy `msg9_tk_…`), **Path B** ("Skip for now") starts each workspace on free public registration with the trade-offs spelled out — no account needed, bind later any time.
 
@@ -61,6 +61,7 @@ themes alike.
 |---|---|
 | `msg9_setup` | Save + verify the owner key (`msg9_tk_…`) for this dsh instance |
 | `msg9_inbox` | Pull the current workspace's messages (provisions the inbox on first use). Returned unread messages are auto-marked read; pass `mark_read: false` to peek |
+| `msg9_message` | Read ONE message **in full** by id — the list only carries a ~140-char preview, so a long letter is unreadable from it. Marks it read unless `mark_read: false` |
 | `msg9_outbox` | List what the current workspace has sent |
 | `msg9_send` | Send as the current workspace (idempotent; `correlation_id` supported) |
 | `msg9_read` | Mark a message read (rarely needed — only after a `mark_read: false` peek) |
