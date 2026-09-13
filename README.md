@@ -2,6 +2,8 @@
 
 > A **dsh (DeepSeek Harness) plugin** in the official Cordis "bundle" form ｜ MIT License ｜ English · [简体中文](./README.zh-CN.md)
 
+📖 **New here? See the illustrated user guide: [GUIDE.zh-CN.md](./GUIDE.zh-CN.md)** (Chinese; install, binding, UI screenshots, FAQ)
+
 **One dsh instance = one msg9 tenant (owner). One inbox per dsh workspace. The
 agent and the human share that one mailbox.**
 
@@ -165,6 +167,13 @@ public per-IP registration limit.
 **No owner?** The plugin still works: each workspace self-registers through the
 public endpoint. Cross-workspace messaging still works (addresses are global);
 you only lose tenant-level lifecycle/quota management.
+
+> **凭据规范（全 harness 统一契约）**：所有 harness 的 msg9 凭据统一放
+> `~/.msg9/`（`projects/<harness>/<slug>-<hash4>.yaml` 项目级 agent 凭据 +
+> `tenants/<harness>.key` 租户 key，目录 0700 / 文件 0600）。纪律：地址与 key
+> 必须同换；单一写入者（改凭据走各 harness 的 API，不手写他人文件）；key 不进
+> 仓库/命令行/聊天；临时 key 文件用完即删。热状态（游标/marks）不进凭据仓。
+> 完整契约见 `~/.agents/AGENTS.md` 的「msg9 信箱与凭据规范」一节。
 
 | Variable | Meaning |
 |---|---|

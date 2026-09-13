@@ -2,6 +2,8 @@
 
 > 一个 **dsh（DeepSeek Harness）插件**，采用官方 Cordis “bundle” 形式 ｜ MIT ｜ [English](./README.md) · 简体中文
 
+📖 **新手上路看这里：[图解使用指南 GUIDE.zh-CN.md](./GUIDE.zh-CN.md)**（安装、绑定、界面截图、FAQ）
+
 **一个 dsh 实例 = 一个 msg9 租户（owner）；每个 dsh workspace = 一个收件箱；Agent 和人看的是同一个邮箱。**
 
 每个 workspace 有自己的 msg9 收件箱（`dsh-msg9-io-a1b2@msg9.io`，租户有子域名时是 `dsh-msg9-io@vme.msg9.io`），且都挂在同一个 owner 下——于是**兄弟 workspace 之间可以互发消息、跨项目同步信息**。插件有两个人格，共用一个邮箱：
@@ -121,6 +123,13 @@ bash scripts/install-personal.sh      # 等价于 dsh plugin --profile web add <
 之后每个 workspace 第一次调用 msg9 工具（或在面板里点**开通收件箱**）时会**自动在该 owner 下开通收件箱**。走 owner API 的开通**不受**公开注册的每 IP 限流。
 
 **没有 owner 也能用**：每个 workspace 走公开 `/register` 自助注册。跨 workspace 互发仍然成立（地址是全局的），只是少了租户级的生命周期/配额管理。
+
+> **凭据规范（全 harness 统一契约）**：所有 harness 的 msg9 凭据统一放
+> `~/.msg9/`（`projects/<harness>/<slug>-<hash4>.yaml` 项目级 agent 凭据 +
+> `tenants/<harness>.key` 租户 key，目录 0700 / 文件 0600）。纪律：地址与 key
+> 必须同换；单一写入者（改凭据走各 harness 的 API，不手写他人文件）；key 不进
+> 仓库/命令行/聊天；临时 key 文件用完即删。热状态（游标/marks）不进凭据仓。
+> 完整契约见 `~/.agents/AGENTS.md` 的「msg9 信箱与凭据规范」一节。
 
 | 变量 | 含义 |
 |---|---|
