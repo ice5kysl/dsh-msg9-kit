@@ -53,6 +53,8 @@ export interface WatchDeps {
   isPaused?(): boolean | Promise<boolean>
   /** Coalescing window for related mails (default 12s; 0 disables batching). */
   batchWindowMs?: number
+  /** 退避等待（429 时）；缺省用 defaultSleep。 */
+  sleep?(ms: number): Promise<void>
   /** Stable id source for messages (crypto.randomUUID in production). */
   uuid(): string
   now(): number
@@ -156,6 +158,21 @@ export function unseenMessages(messages: InboxMessage[], lastSeenId: string | un
   return messages
 }
 
+/**
+ * 防重入守卫：setInterval 不等待上一轮的异步任务，而单轮 poll 可能挂 30s
+ * （上游超时），间隔更短时会自我重叠。上一轮没完就跳过本轮。
+ */
+export function createNonReentrant(task: () => Promise<void>): () => void {
+  let running = false
+  return () => {
+    if (running) return
+    running = true
+    void task().finally(() => {
+      running = false
+    })
+  }
+}
+
 /** One poll across every provisioned inbox. Never throws. */
 export async function pollOnce(deps: WatchDeps, rt: WatchRuntime): Promise<void> {
   const state = await deps.loadState()
@@ -165,6 +182,15 @@ export async function pollOnce(deps: WatchDeps, rt: WatchRuntime): Promise<void>
       await pollInbox(deps, rt, key, inbox)
     } catch (error) {
       deps.log(`watch poll failed for ${key}: ${(error as Error)?.message ?? String(error)}`)
+      // v1.17 对齐 stream 模式：429 要读 Retry-After 退避，而不是下个周期
+      // 又立刻打一轮（单请求可挂 30s，叠加轮询间隔也救不了放大）。
+      const status = (error as { status?: unknown })?.status
+      if (status === 429) {
+        const serverWait = (error as { retryAfter?: unknown })?.retryAfter
+        const backoff = typeof serverWait === 'number' && serverWait > 0 ? serverWait * 1000 : 60_000
+        deps.log(`watch poll rate-limited for ${key}; backing off ${backoff / 1000}s`)
+        await (deps.sleep ?? defaultSleep)(backoff)
+      }
     }
   }
 }
@@ -291,7 +317,12 @@ async function pollInbox(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: 
   const all = page.messages ?? []
   if (page.next_cursor) {
     await deps.setWatchState(key, { watch_cursor: page.next_cursor })
-    if (all[0]) await deps.setWatchState(key, { watch_last_message_id: all[0].message_id })
+    // 时间基线与 id 基线一起记：id 滚出页面后靠它防止重复播报（与下方
+    // 无 next_cursor 的分支保持一致）。
+    if (all[0]) await deps.setWatchState(key, {
+      watch_last_message_id: all[0].message_id,
+      ...(all[0].created_at ? { watch_last_seen_at: all[0].created_at } : {}),
+    })
     return
   }
   const fresh = unseenMessages(all, inbox.watch_last_message_id, inbox.watch_last_seen_at)

@@ -69,6 +69,15 @@ const groupArchive = [
   { message_id: 'g2', from_address: 'peer@msg9.io', subject: 'follow', body: { text: 'archive body two' }, created_at: '2026-09-12T09:00:00Z' },
   { message_id: 'g1', from_address: 'boss@msg9.io', subject: 'kickoff', body: { text: '**archive body one**' }, created_at: '2026-09-12T08:00:00Z' },
 ]
+// The platform archives fan-out COPIES: one thread lands once per recipient.
+// Flipped on mid-suite so the panel's fold-by-thread rendering is exercised.
+let fanoutArchive = false
+const fanoutCopies = [
+  { message_id: 'f1', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'copy one' }, created_at: '2026-09-12T08:00:00Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f' },
+  { message_id: 'f2', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'copy two' }, created_at: '2026-09-12T08:00:01Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f' },
+  { message_id: 'f3', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'copy three' }, created_at: '2026-09-12T08:00:02Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f' },
+  { message_id: 'f4', from_address: 'boss@msg9.io', subject: 'standalone', body: { text: 'own thread' }, created_at: '2026-09-12T09:00:00Z' },
+]
 
 function reply(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json' })
@@ -203,7 +212,8 @@ const server = createServer(async (req, res) => {
     return reply(res, 200, { code: 0, data: { groups: groupsFixture, total: groupsFixture.length } })
   }
   if (req.method === 'GET' && /^\/api\/v1\/groups\/.+\/messages$/.test(path)) {
-    return reply(res, 200, { code: 0, data: { messages: groupArchive, total: groupArchive.length } })
+    const rows = fanoutArchive ? fanoutCopies : groupArchive
+    return reply(res, 200, { code: 0, data: { messages: rows, total: rows.length } })
   }
   if (req.method === 'GET' && path.startsWith('/api/v1/groups/')) {
     const address = decodeURIComponent(path.slice('/api/v1/groups/'.length))
@@ -1037,6 +1047,272 @@ await check('store.start() keeps one poller and its disposer stops it', async ()
   const stop = store.start()
   assert.equal(typeof stop, 'function')
   stop()
+})
+
+// ------------------------------------------------- panel fixes (2026-09-13)
+
+await check('panel: the first paint shows a loading state, never a setup-form flash', async () => {
+  // INITIAL.status === 'loading'：overview 还没回来，是否绑定租户是未知数。
+  // 此时渲染 SetupView 就是已绑定实例每次打开「消息」都闪一下绑定表单的 bug。
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(html.includes('Loading'), 'loading state shown while the overview is in flight')
+  assert.ok(!html.includes('Skip for now'), 'no setup-form flash for an already-bound instance')
+
+  const settings = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
+  assert.ok(settings.includes('Loading'), 'settings tenant card waits for the overview too')
+  assert.ok(!settings.includes('Skip for now'), 'no setup-form flash on the settings page either')
+})
+
+await check('store: a failed write never rolls an old list back over the new view', async () => {
+  // 读路径有 seq 防护，写路径的乐观回滚原本没有：失败回来时视图若已切换
+  // （workspace/folder 变了），回滚必须丢弃，否则旧列表塞回新视图。
+  function makeStore(writeName) {
+    let rejectWrite
+    const fake = {
+      overview: async () => ({
+        owner: null, api_url: 'http://fake', state_file: '', current: null,
+        workspaces: [
+          { key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false },
+          { key: 'ws-b', title: 'beta', path: '/work/b', address: 'b@msg9.io', provisioned: true, cursor: null, current: false },
+        ],
+      }),
+      messages: async (key) => ({ messages: [{ message_id: `${key}-1`, from_address: 'x@msg9.io' }], total: 1, unread_count: 1 }),
+      outbox: async () => ({ messages: [], total: 0 }),
+      contacts: async () => ({ contacts: [], total: 0 }),
+      unread: async () => ({ total: 0, byKey: {} }),
+      peers: async () => ({ peers: [] }),
+      groups: async () => ({ groups: [], total: 0 }),
+      [writeName]: () => new Promise((_, reject) => { rejectWrite = reject }),
+    }
+    return { store: client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 }), fail: () => rejectWrite(new Error('write failed')) }
+  }
+  const flows = [
+    ['markRead', (store) => store.markRead('ws-a-1')],
+    ['markDone', (store) => store.markDone('ws-a-1')],
+  ]
+  for (const [writeName, run] of flows) {
+    const { store, fail } = makeStore(writeName)
+    store.setCwd('/work/a')
+    await store.refreshOverview()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.deepEqual(store.getState().messages.map((row) => row.message_id), ['ws-a-1'])
+
+    // The write is in flight when the user switches workspaces.
+    const pending = run(store)
+    store.selectWorkspace('ws-b')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.deepEqual(store.getState().messages.map((row) => row.message_id), ['ws-b-1'], `${writeName}: ws-b list loaded`)
+
+    fail()
+    await pending
+    assert.equal(store.getState().notice.kind, 'error', `${writeName}: failure still surfaces`)
+    assert.deepEqual(store.getState().messages.map((row) => row.message_id), ['ws-b-1'], `${writeName}: stale rollback dropped, ws-b view intact`)
+    assert.equal(store.getState().unreadCount, 1, `${writeName}: badge belongs to ws-b, not rolled back`)
+  }
+})
+
+await check('store: markDone decrements the badge, but only for unread mail', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const before = store.getState().unreadCount
+  assert.equal(before, 3, 'fixture inbox starts with 3 unread')
+  await store.markDone('m1') // m1 has no read_at: done implies read, badge drops.
+  const done = store.getState().messages.find((row) => row.message_id === 'm1')
+  assert.ok(done.read_at, 'read_at filled in')
+  assert.equal(done.processed_by, 'human')
+  assert.equal(store.getState().unreadCount, before - 1, 'unread mail handled: badge decremented')
+
+  await store.markDone('m2') // m2 was already read: no double decrement.
+  assert.equal(store.getState().unreadCount, before - 1, 'already-read mail: badge untouched')
+})
+
+await check('store: switching workspaces clears the badges along with the lists', async () => {
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(store.getState().unreadCount, 3)
+  assert.equal(store.getState().outboxTotal, 1)
+  assert.equal(store.getState().contactsTotal, 1)
+
+  store.selectWorkspace('ws-b')
+  // 同步归零：新 workspace 的数据回来之前，徽标不能挂着旧 workspace 的计数。
+  assert.equal(store.getState().unreadCount, 0)
+  assert.equal(store.getState().messagesTotal, 0)
+  assert.equal(store.getState().outboxTotal, 0)
+  assert.equal(store.getState().contactsTotal, 0)
+
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(store.getState().unreadCount, 3, 'ws-b counts load right after')
+})
+
+await check('store: group archive append is busy-gated and deduped by message_id', async () => {
+  // 「加载更多」的 offset 以已加载数为准：服务端数据漂移会跨页带回重复行，
+  // 合并必须按 message_id 去重；连点由 busy 闸挡下（同 loadMoreDirectory）。
+  const calls = []
+  let releasePage = null
+  const firstPage = {
+    messages: [
+      { message_id: 'g1', from_address: 'a@msg9.io' },
+      { message_id: 'g2', from_address: 'b@msg9.io' },
+    ],
+    total: 3,
+  }
+  const driftedPage = {
+    messages: [
+      { message_id: 'g2', from_address: 'b@msg9.io' }, // offset 漂移：g2 又回来一次
+      { message_id: 'g3', from_address: 'c@msg9.io' },
+    ],
+    total: 3,
+  }
+  const fake = {
+    overview: async () => ({
+      owner: null, api_url: 'http://fake', state_file: '', current: null,
+      workspaces: [{ key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
+    }),
+    messages: async () => ({ messages: [], total: 0, unread_count: 0 }),
+    outbox: async () => ({ messages: [], total: 0 }),
+    contacts: async () => ({ contacts: [], total: 0 }),
+    unread: async () => ({ total: 0, byKey: {} }),
+    peers: async () => ({ peers: [] }),
+    groups: async () => ({ groups: [{ address: 'team@msg9.io', display_name: 'Team' }], total: 1 }),
+    groupDetail: async () => ({ group: { address: 'team@msg9.io', display_name: 'Team' } }),
+    groupMessages: (key, address, query) => {
+      calls.push(query.offset)
+      if (calls.length === 1) return Promise.resolve(firstPage)
+      return new Promise((resolve) => { releasePage = () => resolve(driftedPage) })
+    },
+  }
+  const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshOverview()
+  store.selectGroup('team@msg9.io')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(store.getState().groupArchive.map((row) => row.message_id), ['g1', 'g2'])
+  assert.deepEqual(calls, [0], 'first page loaded at offset 0')
+
+  const appending = store.refreshGroupArchive(true) // hangs until releasePage()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(store.getState().busy.archive, true, 'append in flight')
+  await store.refreshGroupArchive(true) // gated: no second request goes out
+  assert.deepEqual(calls, [0, 2], 'the in-flight append blocks the duplicate click')
+
+  releasePage()
+  await appending
+  assert.deepEqual(store.getState().groupArchive.map((row) => row.message_id), ['g1', 'g2', 'g3'], 'offset drift merged without the duplicate')
+  assert.equal(store.getState().busy.archive, false)
+})
+
+await check('groups archive: fan-out copies fold into one row per thread', async () => {
+  fanoutArchive = true
+  try {
+    const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+    store.setCwd('/work/a')
+    await store.refreshAll()
+    store.setTab('groups')
+    store.selectGroup('team-x@dsh.msg9.io')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(store.getState().groupArchive.length, 4, 'store keeps every archived copy (dedup is by message_id only)')
+
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+    const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    assert.equal(html.match(/fanout topic/g).length, 1, 'three copies of one thread render as ONE row')
+    assert.ok(html.includes('×3 copies'), 'the copy-count chip shows the folded size')
+    assert.ok(html.includes('standalone'), 'a message without a thread id stays its own row')
+  } finally {
+    fanoutArchive = false
+  }
+})
+
+await check('panel: a capped inbox/outbox says so instead of silently truncating', async () => {
+  // 收发箱每页 50 封封顶：total 大于已加载数时，列表底部必须给出提示行。
+  const fake = {
+    overview: async () => ({
+      owner: { id: 'own_1', name: 'fake' }, api_url: 'http://fake', state_file: '', current: null,
+      workspaces: [{ key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
+    }),
+    messages: async () => ({
+      messages: [
+        { message_id: 'm1', from_address: 'x@msg9.io', created_at: '2026-09-12T09:00:00Z' },
+        { message_id: 'm2', from_address: 'y@msg9.io', created_at: '2026-09-12T09:01:00Z' },
+      ],
+      total: 57,
+      unread_count: 0,
+    }),
+    outbox: async () => ({
+      messages: [{ message_id: 'o1', from_address: 'a@msg9.io', to_address: 'x@msg9.io', created_at: '2026-09-12T09:00:00Z' }],
+      total: 80,
+    }),
+    contacts: async () => ({ contacts: [], total: 0 }),
+    unread: async () => ({ total: 0, byKey: {} }),
+    peers: async () => ({ peers: [] }),
+    groups: async () => ({ groups: [], total: 0 }),
+  }
+  const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshOverview()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const inboxHtml = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(inboxHtml.includes('Showing the first 2 of 57'), 'inbox cap hint shown')
+
+  store.setTab('outbox')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const outboxHtml = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(outboxHtml.includes('Showing the first 1 of 80'), 'outbox cap hint shown')
+
+  // total 不超过已加载数时不显示（同一 fixture 把 total 调小验证）。
+  const smallFake = { ...fake, messages: async () => ({ messages: [{ message_id: 'm1', from_address: 'x@msg9.io' }], total: 1, unread_count: 0 }) }
+  const smallStore = client.createMsg9Store({ bridge: smallFake, pollMs: 10 ** 9 })
+  smallStore.setCwd('/work/a')
+  await smallStore.refreshOverview()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const smallHtml = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store: smallStore, useSessions }))
+  assert.ok(!smallHtml.includes('Showing the first'), 'no hint when everything fits')
+})
+
+await check('markdown links open in a new window (no webview hijack)', () => {
+  // 面板跑在 webview 里：邮件内的 <a> 原地跳转会把整个 dsh 界面劫持走。
+  // externalizeLinks 挂在 DOMPurify 的 afterSanitizeAttributes 钩子上（测试环境
+  // 没有 DOM，DOMPurify 不净化，所以这里直接驱动钩子函数本身）。
+  const attrs = {}
+  client.externalizeLinks({ tagName: 'A', setAttribute: (name, value) => { attrs[name] = value } })
+  assert.equal(attrs.target, '_blank')
+  assert.equal(attrs.rel, 'noopener noreferrer')
+
+  let touched = false
+  client.externalizeLinks({ tagName: 'P', setAttribute: () => { touched = true } })
+  assert.equal(touched, false, 'non-anchor elements are left alone')
+})
+
+await check('store: a successful send refreshes the outbox and the unread badge', async () => {
+  // 发送没有 SSE 失效事件兜底：不主动刷新的话发件箱一直显示旧的缓存列表。
+  const base = bridgeFetch()
+  const hits = { outbox: 0, unread: 0 }
+  const counting = async (url, init) => {
+    const target = String(url)
+    if (target.includes('/outbox')) hits.outbox += 1
+    if (target.includes('/unread')) hits.unread += 1
+    return base(url, init)
+  }
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: counting }), pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const before = { ...hits }
+  store.setCompose({ to: 'peer@msg9.io', text: 'flush the outbox cache' })
+  await store.send()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(store.getState().notice.kind, 'ok')
+  assert.ok(hits.outbox > before.outbox, 'outbox refetched after the send')
+  assert.ok(hits.unread > before.unread, 'unread badge refetched after the send')
 })
 
 // ------------------------------------------------- first-run tenant binding

@@ -526,7 +526,9 @@ export function registerMsg9Tools(ctx: Context): void {
           )
         }
         const { api_key } = await ownerRotateAgentKey(owner.api_url, owner.api_key, inbox.address, exec?.signal)
-        await upsertWorkspaceInbox(workspace.key, { ...inbox, api_key })
+        // 只回写 api_key：此处的 inbox 是上游调用前的快照，spread 回去会把
+        // 期间已推进的 cursor/marks/watch_* 盖旧（upsert 是 merge 语义）。
+        await upsertWorkspaceInbox(workspace.key, { api_key })
         return L(
           '已轮换「{title}」({address}) 的 key，新 key 已保存。',
           'Rotated the key for "{title}" ({address}); the new key is saved.',

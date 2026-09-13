@@ -107,6 +107,7 @@ export interface Msg9State {
     outbox: boolean
     contacts: boolean
     directory: boolean
+    archive: boolean
     send: boolean
     action: boolean
   }
@@ -219,8 +220,18 @@ const INITIAL: Msg9State = {
   composeOpen: false,
   compose: { to: '', subject: '', text: '' },
   notifyPaused: false,
-  busy: { overview: false, messages: false, outbox: false, contacts: false, directory: false, send: false, action: false },
+  busy: { overview: false, messages: false, outbox: false, contacts: false, directory: false, archive: false, send: false, action: false },
   loadedAt: null,
+}
+
+/** 同一 message_id 只留第一份（fan-out 存档与翻页漂移都可能带回重复行）。 */
+function dedupeById(rows: MessageRow[]): MessageRow[] {
+  const seen = new Set<string>()
+  return rows.filter((row) => {
+    if (seen.has(row.message_id)) return false
+    seen.add(row.message_id)
+    return true
+  })
 }
 
 /** Build a store. Tests pass a fake bridge; the app uses the default one. */
@@ -458,18 +469,24 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     const workspace = selected(get())
     const address = state.selectedGroup
     if (!workspace?.provisioned || !address) return
+    // 「加载更多」连点闸：上一页还没回来时再点，offset 以旧长度发出，跨页重复。
+    if (append && state.busy.archive) return
     const seq = ++groupsSeq
     const base = append ? state.groupArchive : []
     try {
+      setBusy({ archive: true })
       const view = await bridge.groupMessages(workspace.key, address, { limit: 50, offset: base.length })
       if (seq !== groupsSeq) return
       const messages = view.messages ?? []
       set({
-        groupArchive: append ? [...base, ...messages] : messages,
+        // 平台按 fan-out 副本存档，翻页 offset 也可能漂移：合并一律按 message_id 去重。
+        groupArchive: dedupeById(append ? [...base, ...messages] : messages),
         groupArchiveTotal: view.total ?? messages.length,
       })
     } catch {
       /* archive is advisory */
+    } finally {
+      if (seq === groupsSeq) setBusy({ archive: false })
     }
   }
 
@@ -503,6 +520,8 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     if (!workspace) return
     const before = state.messages
     const beforeUnread = state.unreadCount
+    const opKey = workspace.key
+    const opFolder = state.folder
     // Optimistic: the list is the human's view of the mailbox.
     set({
       messages: before.map((message) => (message.message_id === id ? { ...message, read_at: new Date().toISOString() } : message)),
@@ -513,8 +532,13 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
       void refreshUnread()
     } catch (error) {
       // Roll back BOTH halves of the optimistic update, or the list says
-      // "unread" while the badge stayed decremented.
-      set({ messages: before, unreadCount: beforeUnread })
+      // "unread" while the badge stayed decremented. 但先确认视图没换：
+      // 操作在途时用户切了 workspace/folder，列表已被新刷新接管，
+      // 把旧列表塞回去就是覆盖新视图（读路径靠 seq 防，写路径靠这个一致性校验）。
+      const view = get()
+      if (view.currentKey === opKey && view.folder === opFolder) {
+        set({ messages: before, unreadCount: beforeUnread })
+      }
       notice('error', errorText(error))
     }
   }
@@ -601,7 +625,13 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     },
     selectWorkspace(key) {
       if (key === state.currentKey) return
-      set({ currentKey: key, selectedId: null, selectedContact: null, selectedGroup: null, composeOpen: false, messages: [], outbox: [], contacts: [] })
+      set({
+        currentKey: key, selectedId: null, selectedContact: null, selectedGroup: null, composeOpen: false,
+        messages: [], outbox: [], contacts: [],
+        // 列表清空了徽标也要归零：新 workspace 的数据回来之前，
+        // 不能挂着旧 workspace 的未读/总数。
+        messagesTotal: 0, unreadCount: 0, outboxTotal: 0, contactsTotal: 0,
+      })
       void refreshInbox()
       void refreshOutbox()
       void refreshContacts()
@@ -748,7 +778,10 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
         }
         set({ compose: { to: '', subject: '', text: '' }, composeOpen: false })
         notice('ok', L('已发送到 {to}（{id}）', 'Sent to {to} ({id})', { to, id: result.message_id }))
+        // 发送没有 SSE 失效事件兜底：发件箱和未读徽标都要主动刷新，
+        // 否则发件箱会一直显示旧的（甚至空的）缓存列表。
         void refreshOutbox()
+        void refreshUnread()
       } catch (error) {
         notice('error', errorText(error))
       } finally {
@@ -759,15 +792,27 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
       const workspace = selected(get())
       if (!workspace) return
       const before = state.messages
+      const beforeUnread = state.unreadCount
+      const opKey = workspace.key
+      const opFolder = state.folder
+      const target = before.find((message) => message.message_id === id)
+      const now = new Date().toISOString()
       set({
         messages: before.map((message) =>
-          message.message_id === id ? { ...message, read_at: message.read_at ?? new Date().toISOString(), processed_by: 'human' as const } : message),
+          message.message_id === id ? { ...message, read_at: message.read_at ?? now, processed_by: 'human' as const } : message),
+        // 未读邮件被「标为已处理」时顺手补了 read_at，徽标跟着减；本来就已读的不能再减。
+        unreadCount: target && !target.read_at ? Math.max(0, state.unreadCount - 1) : state.unreadCount,
       })
       try {
         await bridge.markDone(workspace.key, id)
         void refreshUnread()
       } catch (error) {
-        set({ messages: before })
+        // 同 markReadOp：视图已切换（workspace/folder 变了）就丢弃回滚，
+        // 旧列表不能塞回已被新刷新接管的视图。
+        const view = get()
+        if (view.currentKey === opKey && view.folder === opFolder) {
+          set({ messages: before, unreadCount: beforeUnread })
+        }
         notice('error', errorText(error))
       }
     },

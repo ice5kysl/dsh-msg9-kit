@@ -103,6 +103,19 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   }, [store])
 
   const workspace = selectedWorkspace(state)
+  // 首次 overview 回来之前，是否绑定租户、有没有收件箱都还是未知数：
+  // 渲染加载态而不是 SetupView/空态，否则已绑定实例每次打开「消息」都闪一下绑定表单。
+  if (state.status === 'loading') {
+    return (
+      <div style={styles.root}>
+        <style>{M9_CSS}</style>
+        <div style={styles.empty}>
+          <p style={styles.emptyText}>{L('正在加载 msg9 状态…', 'Loading msg9 state…')}</p>
+        </div>
+      </div>
+    )
+  }
+
   // Nothing is configurable before the instance knows its tenant, so the
   // binding form comes first; "skip" keeps the public-registration path.
   const needsSetup = !state.owner && !state.setup.dismissed
@@ -252,6 +265,7 @@ function ListColumn({ state, store }: { state: Msg9State; store: Msg9Store }): J
   if (state.tab === 'square') return <SquareList state={state} store={store} />
   const outgoing = state.tab === 'outbox'
   const messages = outgoing ? state.outbox : state.messages
+  const total = outgoing ? state.outboxTotal : state.messagesTotal
   return (
     <section style={styles.listCol} className="m9-listcol">
       {state.tab === 'inbox' && (
@@ -276,6 +290,11 @@ function ListColumn({ state, store }: { state: Msg9State; store: Msg9Store }): J
         store={store}
         outgoing={outgoing}
       />
+      {total > messages.length && (
+        <div style={styles.listHint}>
+          {L('仅显示前 {shown} 封，共 {total} 封', 'Showing the first {shown} of {total} messages', { shown: messages.length, total })}
+        </div>
+      )}
     </section>
   )
 }
@@ -466,6 +485,19 @@ marked.use(markedHighlight({
   langPrefix: 'language-',
   highlight: (code, lang) => highlightCode(code, lang),
 }))
+
+/** 邮件里的链接一律新窗口打开：面板跑在 webview 里，原地跳转会把整个 dsh
+ *  界面劫持到外部站点。挂在 DOMPurify 的 afterSanitizeAttributes 钩子上，
+ *  净化后的每个 <a> 都补上 target/rel（导出以便测试直接驱动）。 */
+export function externalizeLinks(node: Element): void {
+  if (node.tagName !== 'A') return
+  node.setAttribute('target', '_blank')
+  node.setAttribute('rel', 'noopener noreferrer')
+}
+
+if (DOMPurify.isSupported) {
+  DOMPurify.addHook('afterSanitizeAttributes', externalizeLinks)
+}
 
 function markdownHtml(text: string): string {
   const raw = marked.parse(text, { gfm: true, breaks: true }) as string
@@ -879,7 +911,22 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
       const bt = Date.parse(b.created_at ?? '') || 0
       return ascending ? at - bt : bt - at
     })
-    return rows
+    // 平台按 fan-out 副本存档：同一线程（correlation_id，无则 message_id）的
+    // 多份副本折叠成一行，折叠数量用「×N 副本」小徽标标出。
+    const folded: { message: MessageRow; copies: number }[] = []
+    const byThread = new Map<string, { message: MessageRow; copies: number }>()
+    for (const row of rows) {
+      const key = row.correlation_id ?? row.message_id
+      const existing = byThread.get(key)
+      if (existing) {
+        existing.copies += 1
+      } else {
+        const entry = { message: row, copies: 1 }
+        byThread.set(key, entry)
+        folded.push(entry)
+      }
+    }
+    return folded
   }, [state.groupArchive, ascending])
   return (
     <div style={styles.groupArchive}>
@@ -898,10 +945,10 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
         <div style={styles.listEmpty}>{L('组里还没有消息。', 'No messages in this group yet.')}</div>
       ) : (
         <ul style={styles.list}>
-          {ordered.map((message) => {
+          {ordered.map(({ message, copies }) => {
             const expanded = message.message_id === expandedId
             return (
-              <li key={message.message_id}>
+              <li key={message.correlation_id ?? message.message_id}>
                 <button
                   type="button"
                   className="m9-row"
@@ -909,6 +956,11 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
                 >
                   <div style={styles.rowTop}>
                     <span style={styles.rowPeer}>{message.from_address}</span>
+                    {copies > 1 && (
+                      <span style={styles.groupTag} title={L('同一封邮件的 {n} 份 fan-out 副本', '{n} fan-out copies of the same mail', { n: copies })}>
+                        {L('×{n} 副本', '×{n} copies', { n: copies })}
+                      </span>
+                    )}
                     <span style={styles.rowTime}>{formatTime(message.created_at)}</span>
                   </div>
                   {message.subject ? <div style={styles.rowSubject}>{message.subject}</div> : null}
@@ -924,8 +976,8 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
         </ul>
       )}
       {hasMore && (
-        <button type="button" className="m9-btn" onClick={() => void store.refreshGroupArchive(true)}>
-          {L('加载更多', 'Load more')}
+        <button type="button" className="m9-btn" disabled={state.busy.archive} onClick={() => void store.refreshGroupArchive(true)}>
+          {state.busy.archive ? L('加载中…', 'Loading…') : L('加载更多', 'Load more')}
         </button>
       )}
     </div>
@@ -1289,6 +1341,7 @@ const styles: Record<string, CSSProperties> = {
   emptyText: { color: DIM, fontSize: 12, lineHeight: 1.6, margin: 0 },
   list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 2 },
   listEmpty: { padding: 16, color: DIM, fontSize: 12 },
+  listHint: { padding: '6px 0', color: DIM, fontSize: 10, textAlign: 'center', flexShrink: 0 },
   listHeader: { fontSize: 11, color: DIM, marginTop: 6, flexShrink: 0 },
   searchWrap: { position: 'relative', flexShrink: 0 },
   searchIcon: { position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: DIM, pointerEvents: 'none' },

@@ -132,32 +132,75 @@ export interface Msg9Bridge {
   handle(req: IncomingMessage, res: ServerResponse): Promise<void>
 }
 
+export interface UnreadView {
+  total: number
+  byKey: Record<string, number>
+  totalByKey: Record<string, number>
+}
+
+/**
+ * /unread 的放大防护：N 信箱 × M 标签页 × 每次 SSE 事件曾各打一轮上游。
+ * 现在同一进程共享一份 ~10s TTL 快照 + in-flight 合并；并发调用拿到同一个
+ * Promise。某个信箱本次拉取失败时沿用上轮快照里它的计数（有快照的话），
+ * 不再静默缺 key、把有信的信箱显示成 0。
+ */
+const UNREAD_TTL_MS = 10_000
+let unreadCache: { at: number; view: UnreadView } | undefined
+let unreadInflight: Promise<UnreadView> | undefined
+
+/** 本地状态变化后（已读/闭环/开通/迁移）立刻作废旧快照。 */
+export function invalidateUnreadCache(): void {
+  unreadCache = undefined
+}
+
 /**
  * Unread + mailbox-size snapshot across every provisioned inbox. Used by the
  * /unread route AND the host-side reconcile (which only emits when the
  * snapshot actually changed).
  */
-export async function computeUnread(deps: BridgeDeps, signal: AbortSignal): Promise<{ total: number; byKey: Record<string, number>; totalByKey: Record<string, number> }> {
-  const state = await deps.loadState()
-  const rows = Object.entries(state.workspaces).filter(([, inbox]) => Boolean(inbox.api_key))
-  const settled = await Promise.allSettled(
-    rows.map(async ([key, inbox]) => {
-      // folder=all: one call yields both the mailbox size and the unread count.
-      const page = await deps.api.listInbox(inbox.api_url, inbox.api_key, { folder: 'all', limit: 1 }, signal)
-      return [key, Number(page?.unread_count ?? 0), Number(page?.total ?? (page?.messages ?? []).length)] as const
-    }),
-  )
-  const byKey: Record<string, number> = {}
-  const totalByKey: Record<string, number> = {}
-  let total = 0
-  for (const result of settled) {
-    if (result.status !== 'fulfilled') continue
-    const [key, count, mailboxSize] = result.value
-    byKey[key] = count
-    totalByKey[key] = mailboxSize
-    total += count
-  }
-  return { total, byKey, totalByKey }
+export async function computeUnread(deps: BridgeDeps, signal: AbortSignal, options?: { ttlMs?: number }): Promise<UnreadView> {
+  const ttl = options?.ttlMs ?? UNREAD_TTL_MS
+  if (unreadInflight) return unreadInflight
+  if (unreadCache && Date.now() - unreadCache.at < ttl) return unreadCache.view
+  // 共享任务不带任何单个调用方的 signal：第一个调用方断开不应中止合并后
+  // 其余等待者的上游拉取（出站调用自带 30s 超时兜底）。
+  void signal
+  unreadInflight = (async () => {
+    const state = await deps.loadState()
+    const rows = Object.entries(state.workspaces).filter(([, inbox]) => Boolean(inbox.api_key))
+    const settled = await Promise.allSettled(
+      rows.map(async ([key, inbox]) => {
+        // folder=all: one call yields both the mailbox size and the unread count.
+        const page = await deps.api.listInbox(inbox.api_url, inbox.api_key, { folder: 'all', limit: 1 })
+        return [key, Number(page?.unread_count ?? 0), Number(page?.total ?? (page?.messages ?? []).length)] as const
+      }),
+    )
+    const previous = unreadCache?.view
+    const byKey: Record<string, number> = {}
+    const totalByKey: Record<string, number> = {}
+    let total = 0
+    for (let index = 0; index < rows.length; index += 1) {
+      const [key] = rows[index]!
+      const result = settled[index]!
+      if (result.status === 'fulfilled') {
+        const [, count, mailboxSize] = result.value
+        byKey[key] = count
+        totalByKey[key] = mailboxSize
+        total += count
+      } else if (previous && key in previous.byKey) {
+        // 部分失败：沿用上轮快照里该信箱的计数，而不是静默丢 key。
+        byKey[key] = previous.byKey[key]!
+        totalByKey[key] = previous.totalByKey[key] ?? 0
+        total += byKey[key]!
+      }
+    }
+    const view: UnreadView = { total, byKey, totalByKey }
+    unreadCache = { at: Date.now(), view }
+    return view
+  })().finally(() => {
+    unreadInflight = undefined
+  })
+  return unreadInflight
 }
 
 /** The real dependencies, bound to a host context. */
@@ -239,30 +282,58 @@ function isLoopbackHostname(hostname: string): boolean {
     || /^127(\.\d{1,3}){3}$/.test(hostname)
 }
 
+/** 对端 IP 是不是 loopback（含 IPv4-mapped 的 ::ffff:127.x）。 */
+function isLoopbackAddress(address: string): boolean {
+  const normalized = address.toLowerCase().replace(/^::ffff:/, '')
+  return normalized === '::1'
+    || normalized === '0:0:0:0:0:0:0:1'
+    || /^127(\.\d{1,3}){3}$/.test(normalized)
+}
+
 /**
  * Accept a request only from the local GUI or a non-browser local client.
  *
  * A browser `Origin` is authoritative: when it is present it MUST be
  * same-origin with the `Host` header, so a page on another site cannot drive
  * this bridge through the user's browser (CSRF). Requests with no `Origin` at
- * all — curl, the test doubles, other local tools — are accepted when they
- * addressed a loopback host.
+ * all — curl, the test doubles, other local tools — are accepted only when the
+ * CONNECTION comes from loopback (`req.socket.remoteAddress`): the `Host`
+ * header is client-supplied, so checking it alone let any local process
+ * impersonate the panel (read mail / send / POST /setup to swap the tenant
+ * key). The loopback Host check stays as a secondary guard; a missing
+ * remoteAddress only happens with injected test doubles, which keep the old
+ * Host-only behaviour.
  */
 export function isTrustedRequest(req: IncomingMessage): boolean {
   const host = hostnameOf(req.headers.host)
   if (!host) return false
   const origin = req.headers.origin
   if (origin) return isSameOrigin(origin, req.headers.host ?? '')
+  const remote = req.socket?.remoteAddress
+  if (remote && !isLoopbackAddress(remote)) return false
   return isLoopbackHostname(host)
+}
+
+/** host[:port] / [v6][:port] → the port, or undefined when absent. */
+function portOf(hostHeader: string): string | undefined {
+  if (hostHeader.startsWith('[')) {
+    const end = hostHeader.indexOf(']')
+    if (end < 0) return undefined
+    const rest = hostHeader.slice(end + 1)
+    return rest.startsWith(':') ? rest.slice(1) : undefined
+  }
+  const colon = hostHeader.lastIndexOf(':')
+  return colon > 0 ? hostHeader.slice(colon + 1) : undefined
 }
 
 /** `origin` addresses the same scheme/host/port as the `Host` header. */
 function isSameOrigin(origin: string, hostHeader: string): boolean {
   try {
     const parsed = new URL(origin)
-    if (parsed.hostname.toLowerCase() !== hostnameOf(hostHeader)) return false
-    const colon = hostHeader.lastIndexOf(':')
-    const expected = colon > 0 ? hostHeader.slice(colon + 1) : parsed.protocol === 'https:' ? '443' : '80'
+    // WHATWG URL 给 IPv6 保留方括号（'[::1]'），hostnameOf 会去掉——对齐再比。
+    const originHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    if (originHost !== hostnameOf(hostHeader)) return false
+    const expected = portOf(hostHeader) ?? (parsed.protocol === 'https:' ? '443' : '80')
     const actual = parsed.port || (parsed.protocol === 'https:' ? '443' : '80')
     return actual === expected
   } catch {
@@ -719,6 +790,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       await deps.api.markRead(inbox.api_url, inbox.api_key, messageId, 'human', signal)
       // The panel marked this one: attribute the read to the human.
       await setMessageMark(key, messageId, { read_by: 'human' })
+      invalidateUnreadCache()
       deps.events?.emit('read')
       return ok(res, { message_id: messageId, read: true })
     }
@@ -739,6 +811,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         await deps.api.markRead(inbox.api_url, inbox.api_key, messageId, 'human', signal).catch(() => {})
       }
       await setMessageMark(key, messageId, { read_by: 'human', processed_by: 'human' })
+      invalidateUnreadCache()
       deps.events?.emit('done')
       return ok(res, { message_id: messageId, processed: true })
     }
@@ -775,6 +848,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       const mailDomain = typeof me.mail_domain === 'string' ? me.mail_domain : undefined
       const addressDomain = typeof me.address_domain === 'string' ? me.address_domain : null
       await setOwner({ api_key: ownerKey, api_url: apiUrl, id, name, slug, mail_domain: mailDomain, address_domain: addressDomain })
+      invalidateUnreadCache()
       return ok(res, {
         owner: {
           name: name ?? null,
@@ -801,6 +875,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       const workspace = deps.listWorkspaces().find((row) => row.key === key)
         ?? { key, title: existing.title, path: existing.path }
       const result = await migrateInbox(workspace, existing, str(body.old_owner_key))
+      invalidateUnreadCache()
       deps.log(`migrated ${key}: ${existing.address} -> ${result.inbox.address}`)
       deps.events?.emit('migrate')
       return ok(res, {
@@ -829,6 +904,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         title ? { ...workspace, title } : workspace,
         signal,
       )
+      if (provisioned) invalidateUnreadCache()
       return ok(res, { key: workspace.key, address: inbox.address, provisioned })
     }
 

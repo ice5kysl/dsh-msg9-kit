@@ -30,6 +30,7 @@ import { matchWorkspaceByPath, setWorkspaceRegistry, type WorkspaceRegistryLike 
 import {
   StreamUnsupportedError,
   WakeBudget,
+  createNonReentrant,
   createWatchRuntime,
   defaultSleep,
   pluginNotice,
@@ -46,11 +47,11 @@ export const inject = ['tools', 'commands', 'sessions'] as const
 // Testable seams: the browser bridge, the shared inbox service and the watch
 // logic are part of the package's public surface, so they can be driven
 // without a cordis host.
-export { BRIDGE_PREFIX, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, createBridgeEventBus } from './http.ts'
-export { ensureInbox, ownerContext, resolveInbox } from './service.ts'
+export { BRIDGE_PREFIX, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, invalidateUnreadCache, createBridgeEventBus } from './http.ts'
+export { ensureInbox, migrateInbox, ownerContext, resolveInbox } from './service.ts'
 export { listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
-export { loadState, stateFilePath } from './store.ts'
-export { WakeBudget, createWatchRuntime, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
+export { loadState, setOwner, stateFilePath, upsertWorkspaceInbox } from './store.ts'
+export { WakeBudget, createNonReentrant, createWatchRuntime, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
 
 /** The slice of `@deepseek-ai/dsh-host-webserver` this plugin uses. */
 interface WebServerLike {
@@ -215,6 +216,7 @@ function startWatcher(
     isPaused: () => getNotifyPaused(),
     resolveAgentById: (id) => agents.get(id),
     batchWindowMs: Math.max(0, Number(process.env.MSG9_WATCH_BATCH_MS ?? 12_000) || 12_000),
+    sleep: defaultSleep,
     resolveAgent: async ({ inbox }) => {
       // Preferred: workspace registry knows the workspace's sessions, newest
       // first. Fallback: match a live agent by its session cwd.
@@ -260,7 +262,9 @@ function startWatcher(
         loopControllers.clear()
       }
       const startPolling = (): void => {
-        pollTimer ??= setInterval(() => void pollOnce(deps, rt), WATCH_POLL_MS)
+        // 防重入：setInterval 不等待上一轮的 poll（单请求可挂 30s），
+        // 间隔更短时会自我重叠——上一轮没完就跳过本轮。
+        pollTimer ??= setInterval(createNonReentrant(() => pollOnce(deps, rt)), WATCH_POLL_MS)
       }
 
       // One long-poll loop per provisioned inbox; a 60s reconcile adopts

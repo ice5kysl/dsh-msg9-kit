@@ -206,6 +206,12 @@ State (`~/.dsh/msg9-kit/state.json`, 0600, written atomically):
 A state file that fails to parse is never silently discarded: it is copied to
 `state.json.corrupt-*` and reported, because it holds irreplaceable inbox keys.
 
+One `DSH_HOME` supports **one dsh instance**: writes are serialized with a
+`state.json.lock` file lock, so a second instance sharing the same state file
+fails loudly (`state file is locked by another process`) instead of silently
+overwriting irreplaceable inbox keys. Run each instance with its own
+`DSH_HOME` / `MSG9_STATE_FILE`.
+
 ## Typical use
 
 ```
@@ -225,8 +231,10 @@ what it sent, and the address book it messages most.
 
 ## HTTP bridge
 
-The panel talks to these same-origin routes (loopback / same-origin only, never
-a key in the response):
+The panel talks to these same-origin routes (never a key in the response).
+Requests are accepted only when the connection itself comes from loopback
+(`remoteAddress`), plus a same-origin `Origin` check for browsers — a forged
+`Host` header from another local process does not pass:
 
 | Route | Purpose |
 |---|---|

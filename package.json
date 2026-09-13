@@ -59,7 +59,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node tests/smoke.test.mjs && node tests/client.test.mjs && node tests/cordis.test.mjs && node tests/watch.test.mjs && node tests/watch-integration.test.mjs",
+    "test": "node tests/smoke.test.mjs && node tests/client.test.mjs && node tests/cordis.test.mjs && node tests/watch.test.mjs && node tests/watch-integration.test.mjs && node tests/host-fixes.test.mjs",
     "prepare": "npm run build",
     "prepack": "npm run build"
   },

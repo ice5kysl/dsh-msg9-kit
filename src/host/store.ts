@@ -18,7 +18,7 @@
  * @module dsh-msg9-kit/store
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -157,9 +157,81 @@ export async function saveState(state: State): Promise<void> {
 let writeQueue: Promise<unknown> = Promise.resolve()
 
 function enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
-  const run = writeQueue.then(task)
+  const run = writeQueue.then(async () => {
+    // 进程内队列挡不住同 DSH_HOME 的另一个 dsh 实例：写前再拿文件锁，
+    // 否则两个实例的 read-modify-write 会互相覆盖（公开注册的 key 不可再生）。
+    const release = await acquireStateLock()
+    try {
+      return await task()
+    } finally {
+      await release()
+    }
+  })
   writeQueue = run.catch(() => {})
   return run
+}
+
+// ----------------------------------------------------------- 跨进程文件锁
+// 简单 O_EXCL 锁文件（state.json.lock，内容 {pid, at}），不引第三方依赖。
+// stale 判定：mtime 超过 30s，或持锁 PID 已死——两种都直接拆锁重来。
+
+const LOCK_STALE_MS = 30_000
+const LOCK_RETRY_MS = 100
+const LOCK_MAX_ATTEMPTS = 50 // 最多等 ~5s，然后响亮报错
+
+async function acquireStateLock(): Promise<() => Promise<void>> {
+  const lockPath = `${stateFilePath()}.lock`
+  await mkdir(dirname(lockPath), { recursive: true })
+  for (let attempt = 0; ; attempt += 1) {
+    let handle: Awaited<ReturnType<typeof open>> | undefined
+    try {
+      handle = await open(lockPath, 'wx', 0o600)
+      await handle.writeFile(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }))
+      await handle.close()
+      return async () => {
+        await rm(lockPath, { force: true })
+      }
+    } catch (error) {
+      await handle?.close().catch(() => {})
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      if (await isStaleLock(lockPath)) {
+        await rm(lockPath, { force: true })
+        continue
+      }
+      if (attempt >= LOCK_MAX_ATTEMPTS) {
+        throw new Error(
+          `msg9-kit state file is locked by another process (${lockPath}); ` +
+          'multiple dsh instances sharing one DSH_HOME are not supported',
+        )
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS))
+    }
+  }
+}
+
+async function isStaleLock(lockPath: string): Promise<boolean> {
+  let info
+  try {
+    info = await stat(lockPath)
+  } catch {
+    return true // 锁刚好被释放，下一轮重试即可拿到
+  }
+  if (Date.now() - info.mtimeMs > LOCK_STALE_MS) return true
+  const raw = await readFile(lockPath, 'utf8').catch(() => '')
+  let pid = NaN
+  try {
+    pid = Number(JSON.parse(raw).pid)
+  } catch {
+    /* 内容不可读就只看 mtime */
+  }
+  if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+    try {
+      process.kill(pid, 0)
+    } catch {
+      return true // 持锁进程已经死了
+    }
+  }
+  return false
 }
 
 /** Effective owner: an explicit env key wins over the saved one. */
@@ -199,10 +271,17 @@ export async function getWorkspaceInbox(key: string): Promise<WorkspaceInbox | u
   return state.workspaces[key]
 }
 
-export async function upsertWorkspaceInbox(key: string, inbox: WorkspaceInbox): Promise<void> {
+/**
+ * Merge a patch into a workspace inbox. Callers that hold a STALE snapshot
+ * (e.g. msg9_rotate, which read the inbox before an upstream call) must pass
+ * only the fields they actually changed — spreading the snapshot would write
+ * its outdated cursor/marks back over whatever advanced meanwhile.
+ */
+export async function upsertWorkspaceInbox(key: string, patch: Partial<WorkspaceInbox>): Promise<void> {
   return enqueueWrite(async () => {
     const state = await loadState()
-    state.workspaces[key] = { ...(state.workspaces[key] ?? {}), ...inbox }
+    const clean = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined))
+    state.workspaces[key] = { ...(state.workspaces[key] ?? {}), ...clean } as WorkspaceInbox
     await saveState(state)
   })
 }

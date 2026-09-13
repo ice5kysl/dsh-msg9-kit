@@ -161,6 +161,8 @@ bash scripts/install-personal.sh      # 等价于 dsh plugin --profile web add <
 
 状态文件解析失败时**不会**被静默清空：它会先被复制为 `state.json.corrupt-*` 再报错——因为里面存着不可再生的收件箱 key。
 
+一个 `DSH_HOME` 只支持**一个 dsh 实例**：写入前会对 `state.json.lock` 加文件锁，第二个共享同一状态文件的实例会响亮报错（`state file is locked by another process`），而不是互相覆盖不可再生的收件箱 key。多实例请各用各的 `DSH_HOME` / `MSG9_STATE_FILE`。
+
 ## 典型用法
 
 ```
@@ -179,7 +181,7 @@ msg9_send({ to: "dsh-alpha-a1b2@msg9.io", text: "schema 已更新", correlation_
 
 ## HTTP 桥
 
-面板调用的同源接口（只接受本机 / 同源请求，响应里永不含 key）：
+面板调用的同源接口（响应里永不含 key）。只接受连接来源本身是本机 loopback（`remoteAddress`）的请求，浏览器另有 `Origin` 同源校验——本机其他进程伪造 `Host` 头不再放行：
 
 | 路由 | 用途 |
 |---|---|

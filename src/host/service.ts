@@ -38,6 +38,10 @@ export interface InboxContext {
 /** The synthetic bucket used when the host cannot name the calling workspace. */
 export const DEFAULT_WORKSPACE: CurrentWorkspace = { key: 'default', title: 'default', path: '(unknown)' }
 
+/** owner 探测失败的重试间隔：key 失效时不能每次调用都白打一轮 /owner/me。 */
+const OWNER_PROBE_RETRY_MS = 60_000
+let ownerProbeFailedAt = 0
+
 /** Effective owner (tenant) and API base for this process. */
 export async function ownerContext(): Promise<{ owner: OwnerState | undefined; apiUrl: string }> {
   const owner = await getOwner()
@@ -48,7 +52,12 @@ export async function ownerContext(): Promise<{ owner: OwnerState | undefined; a
   // owners never gain a slug later, so a persisted null stays correct).
   // The ORG upgrade (v1.22) added address_domain: re-probe when it is missing
   // so previews/legacy-detection/display track the pod's real domain.
-  if (owner?.api_key && (owner.slug === undefined || owner.address_domain === undefined) && !process.env.MSG9_OWNER_KEY) {
+  if (
+    owner?.api_key
+    && (owner.slug === undefined || owner.address_domain === undefined)
+    && !process.env.MSG9_OWNER_KEY
+    && Date.now() - ownerProbeFailedAt >= OWNER_PROBE_RETRY_MS
+  ) {
     try {
       const me = await ownerMe(apiUrl, owner.api_key)
       const probed: OwnerState = {
@@ -58,9 +67,12 @@ export async function ownerContext(): Promise<{ owner: OwnerState | undefined; a
         address_domain: typeof me.address_domain === 'string' ? me.address_domain : null,
       }
       await setOwner(probed)
+      ownerProbeFailedAt = 0
       return { owner: probed, apiUrl }
     } catch {
-      // Probe is best-effort: leave the owner unprobed so a later call retries.
+      // Probe is best-effort: leave the owner unprobed, but负缓存一分钟——
+      // 探测失败（如 key 失效）时不能每次调用都白打一轮 /owner/me。
+      ownerProbeFailedAt = Date.now()
     }
   }
   return { owner, apiUrl }
@@ -196,19 +208,22 @@ function workspaceProfile(workspace: CurrentWorkspace): AgentProfile {
 }
 
 /**
- * Tenant migration, v1.9 order (forward → move history → release):
+ * Tenant migration, v1.9 order (forward → replace → move history → release):
  *
  *   1. provision a FRESH inbox for the workspace under the current owner
- *      (tenant-domain address), replace the state entry (cursors reset — they
- *      belong to the old inbox's stream);
+ *      (tenant-domain address) — server-side only, the state file still
+ *      points at the old inbox;
  *   2. set forwarding on the OLD inbox → the new address, with the old inbox's
  *      OWN key (no old-tenant owner key needed): the old address keeps
  *      receiving into the new mailbox, and stays reserved so nobody can
- *      re-register it and hijack delivery;
- *   3. when the previous tenant's key is supplied: move the old inbox's
- *      history over (same-tenant only — cross-tenant move-mail is a 403 the
- *      server refuses, reported in the note) and suspend the old agent. The
- *      forwarding rule survives the release.
+ *      re-register it and hijack delivery. If this FAILS the migration aborts
+ *      with a clear error and the local state is left untouched — replacing
+ *      the state first would silently strand mail in the old mailbox;
+ *   3. only then replace the state entry (cursors reset — they belong to the
+ *      old inbox's stream), and when the previous tenant's key is supplied:
+ *      move the old inbox's history over (same-tenant only — cross-tenant
+ *      move-mail is a 403 the server refuses, reported in the note) and
+ *      suspend the old agent. The forwarding rule survives the release.
  */
 export async function migrateInbox(
   workspace: CurrentWorkspace,
@@ -220,35 +235,47 @@ export async function migrateInbox(
     throw new Error(L('还没有绑定租户，无法迁移。', 'No tenant is bound; cannot migrate.'))
   }
   const agent = await provisionUnderOwner(apiUrl, owner, workspace, workspaceProfile(workspace))
-  const inbox: WorkspaceInbox = await ensureSigningKey(workspace.key, {
+  // 签名材料只在内存里备好：转发没设成之前 state 必须仍指向旧信箱，
+  // 所以不能走 ensureSigningKey（它会立刻 upsert 落库）。
+  let signingSeed: string | undefined
+  try {
+    const material = generateSigningMaterial()
+    await setSigningKey(apiUrl, agent.api_key, material.publicKey)
+    signingSeed = material.seed
+  } catch {
+    /* 服务端没有身份层：跳过，未签名发送仍被接受（warn 模式） */
+  }
+  const inbox: WorkspaceInbox = {
     address: agent.address,
     api_key: agent.api_key,
     api_url: apiUrl,
     title: workspace.title,
     path: workspace.path,
-  })
-  await replaceWorkspaceInbox(workspace.key, inbox)
+    ...(signingSeed ? { signing_seed: signingSeed } : {}),
+  }
   if (oldInbox.address === agent.address) {
+    await replaceWorkspaceInbox(workspace.key, inbox)
     return { inbox, oldDisabled: false, forwarding: false, movedMail: null }
   }
 
   // Step 2: forwarding first, so mail never lands in a mailbox nobody reads.
-  let forwarding = false
-  let note: string | undefined
   try {
     await setForwarding(oldInbox.api_url, oldInbox.api_key, agent.address)
-    forwarding = true
   } catch (error) {
-    note = L(
-      '旧地址转发设置失败（{reason}）——旧信箱仍可能收到新邮件。',
-      'Could not set forwarding on the old address ({reason}) — new mail may still arrive there.',
-      { reason: (error as Error)?.message ?? String(error) },
-    )
+    throw new Error(L(
+      '旧地址 {old} 的转发设置失败（{reason}），迁移已中止：本地配置未改动，仍指向旧信箱。',
+      'Could not set forwarding on the old address {old} ({reason}); migration aborted — local state still points at the old inbox.',
+      { old: oldInbox.address, reason: (error as Error)?.message ?? String(error) },
+    ))
   }
+  // 转发已生效，此刻替换本地状态才不会丢信。
+  await replaceWorkspaceInbox(workspace.key, inbox)
+  const forwarding = true
 
   // Step 3: history + release, when the previous tenant's key is around.
   let oldDisabled = false
   let movedMail: number | null = null
+  let note: string | undefined
   if (oldOwnerKey) {
     try {
       const moved = await ownerMoveMail(oldInbox.api_url, oldOwnerKey, oldInbox.address, { to: agent.address })

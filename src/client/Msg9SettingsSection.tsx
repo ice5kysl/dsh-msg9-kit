@@ -58,7 +58,11 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
 
       <section style={styles.card}>
         <div style={styles.cardTitle}>{L('租户', 'Tenant')}</div>
-        {state.owner ? (
+        {state.status === 'loading' ? (
+          // 首次 overview 未回来：是否绑定租户还是未知数，先显示加载态，
+          // 避免已绑定实例在设置页闪一下「绑定租户」表单。
+          <div style={styles.dim}>{L('加载中…', 'Loading…')}</div>
+        ) : state.owner ? (
           <dl style={styles.fields}>
             <div style={styles.fieldRow}>
               <dt style={styles.fieldName}>{L('名称', 'Name')}</dt>
