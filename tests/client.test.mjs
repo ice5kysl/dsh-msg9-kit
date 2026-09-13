@@ -80,6 +80,10 @@ const fanoutCopies = [
   // 同一线程（correlation_id 相同）里的另一封信——必须保持独立行，不能被折进去。
   { message_id: 'f4', from_address: 'peer@msg9.io', subject: 'another letter in thread', body: { text: 'a different letter' }, created_at: '2026-09-12T08:30:00Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f', to_address: 'a@dsh.msg9.io' },
   { message_id: 'f5', from_address: 'boss@msg9.io', subject: 'standalone', body: { text: 'own thread' }, created_at: '2026-09-12T09:00:00Z' },
+  // 本 workspace 自己发的信（频道视图里的 self 标记），自己一个线程。
+  { message_id: 'f6', from_address: 'dsh-alpha-1a2b@msg9.io', subject: 'my two cents', body: { text: 'from this workspace' }, created_at: '2026-09-12T09:30:00Z', correlation_id: 'thread-mine' },
+  // 超长正文：超过 clamp 阈值（2000 字符），尾巴带标记验证截断。
+  { message_id: 'f7', from_address: 'boss@msg9.io', subject: 'long read', body: { text: `${'long body line\n'.repeat(160)}TAIL_END_MARKER` }, created_at: '2026-09-12T10:00:00Z' },
 ]
 
 function reply(res, status, payload) {
@@ -1211,7 +1215,7 @@ await check('store: group archive append is busy-gated and deduped by message_id
   assert.equal(store.getState().busy.archive, false)
 })
 
-await check('groups archive: copies of ONE letter fold; different letters in a thread stay separate', async () => {
+await check('groups archive: the channel view threads letters, folds copies and marks my own', async () => {
   fanoutArchive = true
   try {
     const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
@@ -1222,14 +1226,37 @@ await check('groups archive: copies of ONE letter fold; different letters in a t
     for (let i = 0; i < 50 && store.getState().groupArchive.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 20))
     }
-    assert.equal(store.getState().groupArchive.length, 5, 'store keeps every archived copy (dedup is by message_id only)')
+    assert.equal(store.getState().groupArchive.length, 7, 'store keeps every archived copy (dedup is by message_id only)')
 
     const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
     const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
-    assert.equal(html.match(/fanout topic/g).length, 1, 'three delivery copies of one letter render as ONE row')
+    // 线程 thread-f：3 份投递副本折成一张卡片（×N 徽标保留），另一封信同组且按时间排在后面。
+    assert.equal(html.match(/same letter body/g).length, 1, 'three delivery copies of one letter render as ONE card')
     assert.ok(html.includes('×3 copies'), 'the copy-count chip shows the folded size')
     assert.ok(html.includes('another letter in thread'), 'a different letter sharing the thread id is NOT folded away')
-    assert.ok(html.includes('standalone'), 'a message without a thread id stays its own row')
+    assert.ok(html.indexOf('same letter body') < html.indexOf('a different letter'), 'letters inside a thread run oldest-first')
+    // 不同线程分开；线程之间按首信时间正序（thread-f → standalone → mine → long）。
+    assert.ok(html.indexOf('a different letter') < html.indexOf('own thread'), 'threads sort by first-letter time')
+    assert.ok(html.indexOf('own thread') < html.indexOf('from this workspace'), 'a letter without a thread id is its own thread')
+    // 频道形态：正文直接走 markdown 管线渲染，不再默认预览。
+    assert.ok(html.includes('m9-md'), 'bodies render inline through the markdown pipeline')
+    // 自己发的信有区分标记。
+    assert.ok(html.includes('Sent by this workspace'), 'own letters carry the me marker')
+    // 超长正文 clamp：尾巴不出现，给「展开全文」。
+    assert.ok(!html.includes('TAIL_END_MARKER'), 'long body is clamped')
+    assert.ok(html.includes('Show full text'), 'clamp offers an expander')
+    // 每封信都有「回复」（5 张卡片）。
+    assert.equal(html.match(/Reply<\/button>/g).length, 5, 'every letter has a reply action')
+    // 回复链路：reply_to 闭环、correlation_id 原样随行；存档行不带
+    // list_address 时回退到组地址（与 handler 里 `message.list_address ?? groupAddress` 一致）。
+    const row = store.getState().groupArchive.find((entry) => entry.message_id === 'f4')
+    store.replyTo({ ...row, list_address: row.list_address ?? 'team-x@dsh.msg9.io' })
+    assert.equal(store.getState().compose.to, 'team-x@dsh.msg9.io', 'archive reply targets the group')
+    assert.equal(store.getState().compose.replyTo, 'f4', 'reply_to = the letter id')
+    assert.equal(store.getState().compose.correlationId, 'thread-f', 'thread id rides verbatim')
+    const bare = { message_id: 'f9', from_address: 'boss@msg9.io', correlation_id: 'thread-f' } // 无 list_address 的存档行
+    store.replyTo({ ...bare, list_address: bare.list_address ?? 'team-x@dsh.msg9.io' })
+    assert.equal(store.getState().compose.to, 'team-x@dsh.msg9.io', 'rows without list_address fall back to the group address')
   } finally {
     fanoutArchive = false
   }

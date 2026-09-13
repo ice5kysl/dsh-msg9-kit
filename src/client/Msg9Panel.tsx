@@ -23,6 +23,7 @@ import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type C
 import { marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import DOMPurify from 'dompurify'
+import { bodyText, truncate } from '../shared/message.ts'
 import type { AccountAgentView, ContactRow, DirectoryAgentRow, GroupRow, MessageRow, PeerRow } from '../shared/types.ts'
 import { ArrowRight, Bell, BellOff, Check, Copy, Globe, Inbox, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X } from './icons.tsx'
 import { highlightCode, highlightReady } from './highlight.ts'
@@ -897,43 +898,63 @@ function GroupView({ state, store }: { state: Msg9State; store: Msg9Store }): JS
   )
 }
 
-/** The group's archive: every message fanned out to it, expandable in place.
- *  The server returns newest-first; the toggle flips the display order and
- *  defaults to chronological (正序) — a discussion reads like a chat log. */
+/** 长正文阈值（字符数）：超过就 clamp，点「展开全文」看完整版。 */
+const CLAMP_CHARS = 2000
+
+/** The group's archive as a chat channel: letters grouped into threads by
+ *  correlation_id, each letter a bubble with its body rendered inline through
+ *  the same markdown pipeline as the inbox detail. The toggle flips the thread
+ *  order and defaults to chronological (正序) — a discussion reads like a chat log. */
 function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
-  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(new Set())
   const [ascending, setAscending] = useState(true)
+  const myAddress = selectedWorkspace(state)?.address ?? null
+  const groupAddress = state.selectedGroup
   const hasMore = state.groupArchive.length < state.groupArchiveTotal
-  const ordered = useMemo(() => {
-    const rows = [...state.groupArchive]
-    rows.sort((a, b) => {
-      const at = Date.parse(a.created_at ?? '') || 0
-      const bt = Date.parse(b.created_at ?? '') || 0
-      return ascending ? at - bt : bt - at
-    })
-    // 平台按 fan-out 副本存档：同一封信会按成员各存一行（仅 message_id /
-    // to_address 不同）。折叠键用「信」的身份（发件人+主题+正文），不能用
-    // correlation_id——同一线程的回复共享它，按线程折会把不同的信藏进一行。
+  const threads = useMemo(() => {
+    // 线程 = correlation_id（无则自己成线程）。线程内按时间正序，同时把同一封信
+    // 的 fan-out 副本（发件人+主题+正文相同，仅 message_id/to 不同）折成一张
+    // 卡片——折叠键用「信」的身份，不能用 correlation_id：同一线程的回复共享它。
     const letterKey = (row: MessageRow): string => {
-      const text = typeof row.body?.text === 'string' ? row.body.text : ''
+      const text = bodyText(row)
       if (!text && !row.subject) return row.message_id
       return `${row.from_address}\n${row.subject ?? ''}\n${text}`
     }
-    const folded: { message: MessageRow; copies: number }[] = []
-    const byLetter = new Map<string, { message: MessageRow; copies: number }>()
-    for (const row of rows) {
-      const key = letterKey(row)
-      const existing = byLetter.get(key)
-      if (existing) {
-        existing.copies += 1
-      } else {
-        const entry = { message: row, copies: 1 }
-        byLetter.set(key, entry)
-        folded.push(entry)
+    const byThread = new Map<string, { id: string; letters: { message: MessageRow; copies: number }[] }>()
+    for (const row of state.groupArchive) {
+      const id = row.correlation_id ?? row.message_id
+      let thread = byThread.get(id)
+      if (!thread) {
+        thread = { id, letters: [] }
+        byThread.set(id, thread)
       }
+      const key = letterKey(row)
+      const existing = thread.letters.find((letter) => letterKey(letter.message) === key)
+      if (existing) existing.copies += 1
+      else thread.letters.push({ message: row, copies: 1 })
     }
-    return folded
+    const grouped = [...byThread.values()]
+    for (const thread of grouped) {
+      thread.letters.sort((a, b) => (Date.parse(a.message.created_at ?? '') || 0) - (Date.parse(b.message.created_at ?? '') || 0))
+    }
+    // 线程之间：正序按线程首信时间，倒序按末信时间。
+    const keyOf = (thread: { letters: { message: MessageRow }[] }): number => {
+      const letter = ascending ? thread.letters[0] : thread.letters[thread.letters.length - 1]
+      return Date.parse(letter?.message.created_at ?? '') || 0
+    }
+    grouped.sort((a, b) => (ascending ? keyOf(a) - keyOf(b) : keyOf(b) - keyOf(a)))
+    return grouped
   }, [state.groupArchive, ascending])
+
+  const toggleExpand = (id: string): void => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   return (
     <div style={styles.groupArchive}>
       <div style={styles.archiveHead}>
@@ -947,39 +968,32 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
           </button>
         </span>
       </div>
-      {ordered.length === 0 ? (
+      {threads.length === 0 ? (
         <div style={styles.listEmpty}>{L('组里还没有消息。', 'No messages in this group yet.')}</div>
       ) : (
-        <ul style={styles.list}>
-          {ordered.map(({ message, copies }) => {
-            const expanded = message.message_id === expandedId
-            return (
-              <li key={message.message_id}>
-                <button
-                  type="button"
-                  className="m9-row"
-                  onClick={() => setExpandedId(expanded ? null : message.message_id)}
-                >
-                  <div style={styles.rowTop}>
-                    <span style={styles.rowPeer}>{message.from_address}</span>
-                    {copies > 1 && (
-                      <span style={styles.groupTag} title={L('同一封邮件的 {n} 份 fan-out 副本', '{n} fan-out copies of the same mail', { n: copies })}>
-                        {L('×{n} 副本', '×{n} copies', { n: copies })}
-                      </span>
-                    )}
-                    <span style={styles.rowTime}>{formatTime(message.created_at)}</span>
-                  </div>
-                  {message.subject ? <div style={styles.rowSubject}>{message.subject}</div> : null}
-                  {expanded ? (
-                    <div className="m9-md" style={styles.archiveBody} dangerouslySetInnerHTML={{ __html: markdownHtml(fullBody(message)) }} />
-                  ) : (
-                    <div style={styles.rowPreview}>{previewOf(message)}</div>
-                  )}
-                </button>
-              </li>
-            )
-          })}
-        </ul>
+        <div style={styles.threadList}>
+          {threads.map((thread) => (
+            <div key={thread.id} style={styles.thread}>
+              {thread.letters.map(({ message, copies }, index) => (
+                <LetterCard
+                  key={message.message_id}
+                  message={message}
+                  copies={copies}
+                  reply={index > 0}
+                  mine={myAddress !== null && message.from_address === myAddress}
+                  expanded={expandedIds.has(message.message_id)}
+                  onToggleExpand={() => toggleExpand(message.message_id)}
+                  onReply={() => store.replyTo({
+                    ...message,
+                    // 存档行可能不带 list_address：回复一律发到组。沿用现有回复
+                    // 链路——reply_to 闭环、correlation_id 原样随行，语义不变。
+                    list_address: message.list_address ?? groupAddress ?? undefined,
+                  })}
+                />
+              ))}
+            </div>
+          ))}
+        </div>
       )}
       {hasMore && (
         <button type="button" className="m9-btn" disabled={state.busy.archive} onClick={() => void store.refreshGroupArchive(true)}>
@@ -987,6 +1001,61 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
         </button>
       )}
     </div>
+  )
+}
+
+/** 频道里的一封信（消息气泡）：发送者 + 时间 + 正文 inline 渲染
+ *  （marked + DOMPurify + Shiki，与收件箱详情同一条链路），长正文 clamp。 */
+function LetterCard({
+  message,
+  copies,
+  reply,
+  mine,
+  expanded,
+  onToggleExpand,
+  onReply,
+}: {
+  message: MessageRow
+  copies: number
+  /** 线程内的回复（非首信）：缩进 + 左边框，视觉上连成一串。 */
+  reply: boolean
+  /** 当前 workspace 自己发的信：靠右 + 底色，一眼看出"我在这个组说过什么"。 */
+  mine: boolean
+  expanded: boolean
+  onToggleExpand: () => void
+  onReply: () => void
+}): JSX.Element {
+  const text = bodyText(message)
+  const clamped = text.length > CLAMP_CHARS && !expanded
+  const shown = clamped ? truncate(text, CLAMP_CHARS) : fullBody(message)
+  return (
+    <article style={{ ...styles.letter, ...(reply ? styles.letterReply : {}), ...(mine ? styles.letterMine : {}) }}>
+      <header style={styles.letterHead}>
+        <span style={styles.letterSender}>{message.from_address}</span>
+        {mine && (
+          <span style={styles.mineTag} title={L('本 workspace 发的信', 'Sent by this workspace')}>{L('我', 'me')}</span>
+        )}
+        {copies > 1 && (
+          <span style={styles.groupTag} title={L('同一封邮件的 {n} 份 fan-out 副本', '{n} fan-out copies of the same mail', { n: copies })}>
+            {L('×{n} 副本', '×{n} copies', { n: copies })}
+          </span>
+        )}
+        <span style={styles.letterTime}>{formatTime(message.created_at)}</span>
+      </header>
+      {message.subject ? <div style={styles.letterSubject}>{message.subject}</div> : null}
+      <div className="m9-md" dangerouslySetInnerHTML={{ __html: markdownHtml(shown) }} />
+      <div style={styles.letterActions}>
+        {text.length > CLAMP_CHARS && (
+          <button type="button" className="m9-btn" onClick={onToggleExpand}>
+            {expanded ? L('收起', 'Show less') : L('展开全文', 'Show full text')}
+          </button>
+        )}
+        <button type="button" className="m9-btn" onClick={onReply}>
+          <Reply size={12} />
+          {L('回复', 'Reply')}
+        </button>
+      </div>
+    </article>
   )
 }
 
@@ -1374,7 +1443,27 @@ const styles: Record<string, CSSProperties> = {
   },
   groupArchive: { display: 'flex', flexDirection: 'column', gap: 6, borderTop: `1px solid ${BORDER}`, paddingTop: 10 },
   archiveHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-  archiveBody: { marginTop: 6, borderTop: `1px dashed ${BORDER}`, paddingTop: 6 },
+  threadList: { display: 'flex', flexDirection: 'column', gap: 12 },
+  thread: { display: 'flex', flexDirection: 'column', gap: 4 },
+  letter: {
+    maxWidth: '92%',
+    alignSelf: 'flex-start',
+    minWidth: 0,
+    border: `1px solid ${BORDER}`,
+    borderRadius: 10,
+    padding: '7px 10px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 4,
+  },
+  letterMine: { alignSelf: 'flex-end', background: ACTIVE_BG, borderColor: BORDER_STRONG },
+  letterReply: { marginLeft: 14, borderLeft: `2px solid ${BORDER_STRONG}` },
+  letterHead: { display: 'flex', alignItems: 'center', gap: 6 },
+  letterSender: { fontSize: 11, fontWeight: 600, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  mineTag: { flexShrink: 0, fontSize: 10, color: ACCENT, border: `1px solid ${BORDER_STRONG}`, borderRadius: 999, padding: '0 6px' },
+  letterTime: { color: DIM, fontSize: 10, flexShrink: 0, marginLeft: 'auto' },
+  letterSubject: { fontSize: 12, fontWeight: 600 },
+  letterActions: { display: 'flex', gap: 6, marginTop: 2 },
   rowSubject: { fontSize: 12, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   rowSubjectUnread: { fontSize: 12, marginTop: 2, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   rowPreview: {
