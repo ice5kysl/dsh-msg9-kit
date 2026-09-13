@@ -82,8 +82,9 @@ const fanoutCopies = [
   { message_id: 'f5', from_address: 'boss@msg9.io', subject: 'standalone', body: { text: 'own thread' }, created_at: '2026-09-12T09:00:00Z' },
   // 本 workspace 自己发的信（频道视图里的 self 标记），自己一个线程。
   { message_id: 'f6', from_address: 'dsh-alpha-1a2b@msg9.io', subject: 'my two cents', body: { text: 'from this workspace' }, created_at: '2026-09-12T09:30:00Z', correlation_id: 'thread-mine' },
-  // 超长正文：超过 clamp 阈值（2000 字符），尾巴带标记验证截断。
-  { message_id: 'f7', from_address: 'boss@msg9.io', subject: 'long read', body: { text: `${'long body line\n'.repeat(160)}TAIL_END_MARKER` }, created_at: '2026-09-12T10:00:00Z' },
+  // 超长正文：超过 clamp 阈值（2000 字符），开头带 ## 标题 + 表格（clamp 必须
+  // 保留换行，不能压平毁掉 markdown），尾巴带标记验证截断。
+  { message_id: 'f7', from_address: 'boss@msg9.io', subject: 'long read', body: { text: `## 建议书\n\n| option | latency | cost |\n| --- | --- | --- |\n| a-very-long-option | 120ms | $$$ |\n\n${'long body line\n'.repeat(160)}TAIL_END_MARKER` }, created_at: '2026-09-12T10:00:00Z' },
   // 带 markdown 表格的信：宽表格必须表格内部横滚，不能撑破卡片。
   { message_id: 'f8', from_address: 'peer@msg9.io', subject: 'proposal', body: { text: '| option | latency | cost |\n| --- | --- | --- |\n| a-very-long-option-name-that-keeps-going | 120ms | $$$ |' }, created_at: '2026-09-12T10:30:00Z' },
 ]
@@ -1271,6 +1272,9 @@ await check('groups archive: the channel view threads letters, folds copies and 
     assert.ok(openCard.includes('m9-md'), 'expanded card renders the markdown body')
     assert.ok(openCard.includes('m9-letter-md'), 'archive markdown carries the overflow-safe scoped class')
     assert.ok(!openCard.includes('TAIL_END_MARKER'), 'long body stays clamped at 2000 chars')
+    // clamp 保留换行（不是 truncate 压平）：标题和表格在截断后仍然渲染。
+    assert.ok(openCard.includes('<h2'), 'clamped body keeps the markdown heading (newlines preserved)')
+    assert.ok(openCard.includes('<table>'), 'clamped body keeps the markdown table (newlines preserved)')
     assert.ok(openCard.includes('Show full text'), 'clamp offers an expander')
     assert.ok(openCard.includes('Reply</button>'), 'expanded card has the reply action')
     const fullCard = renderToStaticMarkup(React.createElement(client.LetterCard, { ...cardProps, open: true, full: true }))
@@ -1357,6 +1361,24 @@ await check('markdown links open in a new window (no webview hijack)', () => {
   let touched = false
   client.externalizeLinks({ tagName: 'P', setAttribute: () => { touched = true } })
   assert.equal(touched, false, 'non-anchor elements are left alone')
+})
+
+await check('panel: root height sync targets the FIRST scrollable ancestor (no hard-coded host class)', () => {
+  // 宿主实测结构：scrollBody(overflow-y:auto) ← 两层 height 为 0 的 wrapper ← root。
+  // root 的 height:100% 解析不到有效高度，面板被宿主整体滚走；修法是把这个祖先的
+  // clientHeight 同步成 root 的 px 高度。这里验证祖先查找：取最近的可滚动祖先，
+  // 不是最远的，也不依赖 class 名。
+  const page = { parentElement: null }
+  const scrollBody = { parentElement: page }
+  const wrapperB = { parentElement: scrollBody }
+  const wrapperA = { parentElement: wrapperB }
+  const root = { parentElement: wrapperA }
+  const overflow = new Map([[scrollBody, 'auto'], [page, 'scroll']])
+  const computed = (el) => ({ overflowY: overflow.get(el) ?? 'visible' })
+
+  assert.equal(client.findScrollParent(root, computed), scrollBody, 'nearest scrollable ancestor wins')
+  assert.equal(client.findScrollParent(root, () => ({ overflowY: 'visible' })), null, 'no scrollable ancestor → no sync')
+  assert.equal(client.findScrollParent({ parentElement: null }, computed), null, 'detached root is a no-op')
 })
 
 await check('highlight: an unloaded grammar (```jsonc) degrades to plaintext instead of crashing the panel', async () => {

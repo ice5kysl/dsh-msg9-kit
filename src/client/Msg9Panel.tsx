@@ -19,7 +19,7 @@
  * @module dsh-msg9-kit/client-panel
  */
 
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import DOMPurify from 'dompurify'
@@ -59,6 +59,51 @@ interface SessionListLike {
   byId?: Record<string, { cwd?: string } | undefined>
 }
 
+/** 从 root 向上找第一个 computed overflowY 为 auto/scroll 的祖先。
+ *  不写死宿主的 class 名（*_scrollBody），宿主改版也能活；找不到返回 null。
+ *  computed 可注入，测试用纯对象链驱动（导出以便测试）。 */
+export function findScrollParent(
+  node: { parentElement: Element | null },
+  computed: (el: Element) => { overflowY: string },
+): Element | null {
+  for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+    const overflowY = computed(parent).overflowY
+    if (overflowY === 'auto' || overflowY === 'scroll') return parent
+  }
+  return null
+}
+
+/** dsh web 把面板包在一个 overflow-y:auto 的滚动容器里，中间隔着两层无高度
+ *  的 wrapper——root 的 height:100% 解析不到有效高度，面板按内容撑开后被宿主
+ *  整体滚走（左/中栏和右栏组头一起）。修：找到那个祖先，用 ResizeObserver +
+ *  window resize 把它的 clientHeight 同步成 root 的 px 高度，三栏重新获得
+ *  有界高度。返回 callback ref：分支切换/卸载时自动重挂与清理。 */
+function useRootHeightSync(): (node: HTMLDivElement | null) => void {
+  const cleanupRef = useRef<(() => void) | null>(null)
+  return useCallback((node: HTMLDivElement | null) => {
+    cleanupRef.current?.()
+    cleanupRef.current = null
+    if (!node || typeof getComputedStyle !== 'function' || typeof window === 'undefined') return
+    const found = findScrollParent(node, (el) => getComputedStyle(el))
+    if (!found) return
+    const box = found as HTMLElement
+    const sync = (): void => {
+      node.style.height = `${box.clientHeight}px`
+    }
+    sync()
+    let observer: ResizeObserver | undefined
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(sync)
+      observer.observe(box)
+    }
+    window.addEventListener('resize', sync)
+    cleanupRef.current = () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', sync)
+    }
+  }, [])
+}
+
 /** Read the selected session's directory out of the standard slot share. */
 function useSessionCwd(props: Msg9PanelProps): string | undefined {
   const selector = props.useSessions
@@ -78,6 +123,8 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   const { store } = props
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState)
   const cwd = useSessionCwd(props)
+  // 宿主的滚动容器高度 → root 的 px 高度（见 useRootHeightSync）。
+  const rootHeightRef = useRootHeightSync()
 
   // Follow the current session's workspace.
   useEffect(() => {
@@ -108,7 +155,7 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   // 渲染加载态而不是 SetupView/空态，否则已绑定实例每次打开「消息」都闪一下绑定表单。
   if (state.status === 'loading') {
     return (
-      <div style={styles.root}>
+      <div style={styles.root} ref={rootHeightRef}>
         <style>{M9_CSS}</style>
         <div style={styles.empty}>
           <p style={styles.emptyText}>{L('正在加载 msg9 状态…', 'Loading msg9 state…')}</p>
@@ -123,7 +170,7 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
 
   if (needsSetup) {
     return (
-      <div style={styles.root}>
+      <div style={styles.root} ref={rootHeightRef}>
         <style>{M9_CSS}</style>
         <SetupView state={state} store={store} />
       </div>
@@ -132,7 +179,7 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
 
   if (state.status === 'error' && state.error) {
     return (
-      <div style={styles.root}>
+      <div style={styles.root} ref={rootHeightRef}>
         <style>{M9_CSS}</style>
         <div style={styles.errorBlock}>
           <div>{L('无法读取 msg9 状态：{error}', 'Cannot read msg9 state: {error}', { error: state.error })}</div>
@@ -148,7 +195,7 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
 
   if (!workspace || !workspace.provisioned) {
     return (
-      <div style={styles.root}>
+      <div style={styles.root} ref={rootHeightRef}>
         <style>{M9_CSS}</style>
         <Notice state={state} store={store} />
         {!workspace ? (
@@ -176,7 +223,7 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   }
 
   return (
-    <div style={styles.root}>
+    <div style={styles.root} ref={rootHeightRef}>
       <style>{M9_CSS}</style>
       <Notice state={state} store={store} />
       <div style={styles.columns}>
@@ -1073,7 +1120,15 @@ export function LetterCard({
 }): JSX.Element {
   const text = bodyText(message)
   const clamped = text.length > CLAMP_CHARS && !full
-  const shown = clamped ? truncate(text, CLAMP_CHARS) : fullBody(message)
+  // Clamp must PRESERVE newlines: truncate() collapses all whitespace into one
+  // line, which destroys every heading/table/list in letters over the limit.
+  // Cut at the last newline before the limit instead (never mid-line).
+  let shown = fullBody(message)
+  if (clamped) {
+    const cut = text.slice(0, CLAMP_CHARS)
+    const lastBreak = cut.lastIndexOf('\n')
+    shown = `${lastBreak > CLAMP_CHARS / 2 ? cut.slice(0, lastBreak) : cut}\n…`
+  }
   return (
     <article style={{ ...styles.letter, ...(reply ? styles.letterReply : {}), ...(mine ? styles.letterMine : {}) }}>
       <span className="m9-tl-node" style={{ ...styles.tlNode, left: reply ? -30 : -16, ...(mine ? styles.tlNodeMine : {}) }} />
