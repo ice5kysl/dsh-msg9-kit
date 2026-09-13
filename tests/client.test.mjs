@@ -73,10 +73,13 @@ const groupArchive = [
 // Flipped on mid-suite so the panel's fold-by-thread rendering is exercised.
 let fanoutArchive = false
 const fanoutCopies = [
-  { message_id: 'f1', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'copy one' }, created_at: '2026-09-12T08:00:00Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f' },
-  { message_id: 'f2', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'copy two' }, created_at: '2026-09-12T08:00:01Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f' },
-  { message_id: 'f3', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'copy three' }, created_at: '2026-09-12T08:00:02Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f' },
-  { message_id: 'f4', from_address: 'boss@msg9.io', subject: 'standalone', body: { text: 'own thread' }, created_at: '2026-09-12T09:00:00Z' },
+  // 真实 fan-out：同一封信按成员各存一行，from/subject/body 完全一致，仅 message_id/to_address 不同。
+  { message_id: 'f1', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'same letter body' }, created_at: '2026-09-12T08:00:00Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f', to_address: 'a@dsh.msg9.io' },
+  { message_id: 'f2', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'same letter body' }, created_at: '2026-09-12T08:00:01Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f', to_address: 'b@dsh.msg9.io' },
+  { message_id: 'f3', from_address: 'peer@msg9.io', subject: 'fanout topic', body: { text: 'same letter body' }, created_at: '2026-09-12T08:00:02Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f', to_address: 'c@dsh.msg9.io' },
+  // 同一线程（correlation_id 相同）里的另一封信——必须保持独立行，不能被折进去。
+  { message_id: 'f4', from_address: 'peer@msg9.io', subject: 'another letter in thread', body: { text: 'a different letter' }, created_at: '2026-09-12T08:30:00Z', list_address: 'team-x@dsh.msg9.io', group_copy: true, correlation_id: 'thread-f', to_address: 'a@dsh.msg9.io' },
+  { message_id: 'f5', from_address: 'boss@msg9.io', subject: 'standalone', body: { text: 'own thread' }, created_at: '2026-09-12T09:00:00Z' },
 ]
 
 function reply(res, status, payload) {
@@ -1208,7 +1211,7 @@ await check('store: group archive append is busy-gated and deduped by message_id
   assert.equal(store.getState().busy.archive, false)
 })
 
-await check('groups archive: fan-out copies fold into one row per thread', async () => {
+await check('groups archive: copies of ONE letter fold; different letters in a thread stay separate', async () => {
   fanoutArchive = true
   try {
     const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
@@ -1216,13 +1219,16 @@ await check('groups archive: fan-out copies fold into one row per thread', async
     await store.refreshAll()
     store.setTab('groups')
     store.selectGroup('team-x@dsh.msg9.io')
-    await new Promise((resolve) => setTimeout(resolve, 20))
-    assert.equal(store.getState().groupArchive.length, 4, 'store keeps every archived copy (dedup is by message_id only)')
+    for (let i = 0; i < 50 && store.getState().groupArchive.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(store.getState().groupArchive.length, 5, 'store keeps every archived copy (dedup is by message_id only)')
 
     const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
     const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
-    assert.equal(html.match(/fanout topic/g).length, 1, 'three copies of one thread render as ONE row')
+    assert.equal(html.match(/fanout topic/g).length, 1, 'three delivery copies of one letter render as ONE row')
     assert.ok(html.includes('×3 copies'), 'the copy-count chip shows the folded size')
+    assert.ok(html.includes('another letter in thread'), 'a different letter sharing the thread id is NOT folded away')
     assert.ok(html.includes('standalone'), 'a message without a thread id stays its own row')
   } finally {
     fanoutArchive = false

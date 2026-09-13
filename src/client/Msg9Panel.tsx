@@ -911,18 +911,24 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
       const bt = Date.parse(b.created_at ?? '') || 0
       return ascending ? at - bt : bt - at
     })
-    // 平台按 fan-out 副本存档：同一线程（correlation_id，无则 message_id）的
-    // 多份副本折叠成一行，折叠数量用「×N 副本」小徽标标出。
+    // 平台按 fan-out 副本存档：同一封信会按成员各存一行（仅 message_id /
+    // to_address 不同）。折叠键用「信」的身份（发件人+主题+正文），不能用
+    // correlation_id——同一线程的回复共享它，按线程折会把不同的信藏进一行。
+    const letterKey = (row: MessageRow): string => {
+      const text = typeof row.body?.text === 'string' ? row.body.text : ''
+      if (!text && !row.subject) return row.message_id
+      return `${row.from_address}\n${row.subject ?? ''}\n${text}`
+    }
     const folded: { message: MessageRow; copies: number }[] = []
-    const byThread = new Map<string, { message: MessageRow; copies: number }>()
+    const byLetter = new Map<string, { message: MessageRow; copies: number }>()
     for (const row of rows) {
-      const key = row.correlation_id ?? row.message_id
-      const existing = byThread.get(key)
+      const key = letterKey(row)
+      const existing = byLetter.get(key)
       if (existing) {
         existing.copies += 1
       } else {
         const entry = { message: row, copies: 1 }
-        byThread.set(key, entry)
+        byLetter.set(key, entry)
         folded.push(entry)
       }
     }
@@ -948,7 +954,7 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
           {ordered.map(({ message, copies }) => {
             const expanded = message.message_id === expandedId
             return (
-              <li key={message.correlation_id ?? message.message_id}>
+              <li key={message.message_id}>
                 <button
                   type="button"
                   className="m9-row"
