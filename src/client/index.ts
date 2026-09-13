@@ -43,7 +43,7 @@ export { Msg9Panel } from './Msg9Panel.tsx'
 export { Msg9SettingsSection } from './Msg9SettingsSection.tsx'
 export { SetupView, externalizeLinks } from './Msg9Panel.tsx'
 export { createBridge } from './api.ts'
-export { highlightReady } from './highlight.ts'
+export { highlightReady, highlightCode } from './highlight.ts'
 export { createMsg9Store, getMsg9Store, selectedWorkspace } from './store.ts'
 
 /** Minimal service faces this plugin consumes (typed locally at the boundary). */

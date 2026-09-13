@@ -63,7 +63,10 @@ const ITALIC = 1
  */
 export function highlightCode(code: string, lang: string | undefined): string {
   if (highlighter) {
-    const language = lang && highlighter.getLanguage(lang) ? lang : 'text'
+    // NOTE: `getLanguage(name)` THROWS on an unloaded grammar (ShikiError) —
+    // one ```jsonc fence in a letter would crash the whole panel render.
+    // Membership must go through getLoadedLanguages() instead.
+    const language = lang && highlighter.getLoadedLanguages().includes(lang) ? lang : 'text'
     try {
       const { tokens } = highlighter.codeToTokens(code, { lang: language, theme: 'css-variables' })
       return tokens

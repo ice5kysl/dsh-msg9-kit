@@ -1324,6 +1324,17 @@ await check('markdown links open in a new window (no webview hijack)', () => {
   assert.equal(touched, false, 'non-anchor elements are left alone')
 })
 
+await check('highlight: an unloaded grammar (```jsonc) degrades to plaintext instead of crashing the panel', async () => {
+  // 真实事故：roadmap 组的信带 jsonc 代码块，getLanguage 对未加载语言直接
+  // 抛 ShikiError，React 整树崩溃、页面空白。语言成员判定必须走
+  // getLoadedLanguages()，未知语言回落纯文本。
+  await client.highlightReady
+  const html = client.highlightCode('{"a": 1}', 'jsonc')
+  assert.ok(html.includes('{&quot;a&quot;: 1}') || html.includes('{"a": 1}'), 'content escaped, not highlighted')
+  const known = client.highlightCode('const x = 1', 'typescript')
+  assert.ok(known.includes('<span'), 'a loaded grammar still gets real highlighting')
+})
+
 await check('store: a successful send refreshes the outbox and the unread badge', async () => {
   // 发送没有 SSE 失效事件兜底：不主动刷新的话发件箱一直显示旧的缓存列表。
   const base = bridgeFetch()
