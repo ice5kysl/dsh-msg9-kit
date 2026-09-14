@@ -261,6 +261,18 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
 }
 
 /** Column 1: workspace, compose, and the three boxes. */
+/** Workspace 地址的域名部分（@ 起）加底色标识——一眼区分"信箱名"和"它属于哪个域"。 */
+function AddressWithDomain({ address }: { address: string }): JSX.Element {
+  const at = address.indexOf('@')
+  if (at < 0) return <>{address}</>
+  return (
+    <>
+      {address.slice(0, at)}
+      <span style={styles.domainChip}>{address.slice(at)}</span>
+    </>
+  )
+}
+
 function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
   const workspace = selectedWorkspace(state)
   const items: { id: Tab; label: string; badge?: string; icon: JSX.Element }[] = [
@@ -285,12 +297,19 @@ function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JS
           </option>
         ))}
       </select>
-      <div style={styles.navAddress} title={workspace?.address ?? ''}>{workspace?.address}</div>
-      <div style={styles.navTenant} title={L('当前租户', 'Current tenant')}>
-        {state.owner?.slug
-          ? (state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`)
-          : state.owner?.name ?? L('公开注册', 'public registration')}
-      </div>
+      {workspace?.address ? (
+        <div style={styles.navAddress} title={workspace.address}>
+          <AddressWithDomain address={workspace.address} />
+        </div>
+      ) : (
+        <div style={styles.navAddress} title={L('当前租户', 'Current tenant')}>
+          <span style={styles.domainChip}>
+            {state.owner?.slug
+              ? (state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`)
+              : state.owner?.name ?? L('公开注册', 'public registration')}
+          </span>
+        </div>
+      )}
       <div style={styles.composeRow}>
         <button type="button" className="m9-btn m9-btn-primary" style={styles.composeButton} onClick={() => store.openCompose()}>
           <PenLine size={13} />
@@ -1785,7 +1804,7 @@ const styles: Record<string, CSSProperties> = {
   bellButton: { border: `1px solid ${BORDER_STRONG}`, borderRadius: 8, padding: 5 },
   navItems: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 },
   navBadge: { marginLeft: 'auto', fontSize: 10, color: DIM },
-  navTenant: { color: DIM, fontSize: 10, marginTop: -6, paddingLeft: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  domainChip: { background: ACTIVE_BG, borderRadius: 4, padding: '0 3px', color: FG },
   bellMuted: { color: ACCENT },
   listCol: {
     width: 320,
