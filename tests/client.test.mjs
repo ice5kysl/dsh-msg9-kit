@@ -831,7 +831,7 @@ await check('panel renders the current workspace mailbox (server-side markup)', 
   assert.ok(html.includes('Outbox'), 'nav: outbox')
   assert.ok(html.includes('Contacts'), 'nav: contacts')
   assert.ok(html.includes('Compose'), 'nav: compose button')
-  assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'address shown')
+  assert.ok(html.includes('dsh-alpha-1a2b') && html.includes('@msg9.io</span>'), 'address shown with the domain chip')
   assert.ok(html.includes('peer@msg9.io'), 'sender shown')
   assert.ok(html.includes('hello'), 'subject shown')
   assert.ok(html.includes('first body line'), 'preview shown')

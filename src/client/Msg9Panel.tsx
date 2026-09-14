@@ -273,8 +273,56 @@ function AddressWithDomain({ address }: { address: string }): JSX.Element {
   )
 }
 
+/** Workspace 切换器：收起 = 当前地址（域名 chip），点开 = workspace 列表。
+ *  合并了原生 select + 地址行两行，省一行垂直空间。 */
+function WorkspaceSwitcher({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
+  const [open, setOpen] = useState(false)
+  const current = state.workspaces.find((row) => row.key === state.currentKey)
+  return (
+    <div style={styles.switcherWrap}>
+      <button
+        type="button"
+        className="m9-select"
+        style={styles.switcherButton}
+        onClick={() => setOpen((v) => !v)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        title={L('切换 workspace 收件箱', 'Switch workspace inbox')}
+      >
+        <span style={styles.switcherLabel}>
+          {current?.address ? <AddressWithDomain address={current.address} /> : (current?.title ?? '—')}
+        </span>
+        <ChevronDown size={13} style={{ flexShrink: 0, color: DIM }} />
+      </button>
+      {open ? (
+        <div className="m9-switcher-pop" style={styles.switcherPop}>
+          {state.workspaces.map((row) => (
+            <button
+              key={row.key}
+              type="button"
+              className={row.key === state.currentKey ? 'm9-row active' : 'm9-row'}
+              style={styles.switcherItem}
+              onMouseDown={(event) => {
+                event.preventDefault()
+                store.selectWorkspace(row.key)
+                setOpen(false)
+              }}
+            >
+              <span style={styles.switcherItemTitle}>
+                {row.title}
+                {row.provisioned ? '' : L('（未开通）', ' (no inbox)')}
+              </span>
+              {row.address ? (
+                <span style={styles.switcherItemAddr}><AddressWithDomain address={row.address} /></span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
-  const workspace = selectedWorkspace(state)
   const items: { id: Tab; label: string; badge?: string; icon: JSX.Element }[] = [
     { id: 'inbox', label: L('收件箱', 'Inbox'), badge: badgeText(state.unreadCount), icon: <Inbox size={15} /> },
     { id: 'outbox', label: L('发件箱', 'Outbox'), badge: badgeText(state.outboxTotal), icon: <Send size={15} /> },
@@ -284,32 +332,7 @@ function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JS
   ]
   return (
     <nav style={styles.nav} className="m9-nav">
-      <select
-        className="m9-select"
-        value={state.currentKey ?? ''}
-        onChange={(event) => store.selectWorkspace(event.target.value)}
-        title={L('切换 workspace 收件箱', 'Switch workspace inbox')}
-      >
-        {state.workspaces.map((row) => (
-          <option key={row.key} value={row.key}>
-            {row.title}
-            {row.provisioned ? '' : L('（未开通）', ' (no inbox)')}
-          </option>
-        ))}
-      </select>
-      {workspace?.address ? (
-        <div style={styles.navAddress} title={workspace.address}>
-          <AddressWithDomain address={workspace.address} />
-        </div>
-      ) : (
-        <div style={styles.navAddress} title={L('当前租户', 'Current tenant')}>
-          <span style={styles.domainChip}>
-            {state.owner?.slug
-              ? (state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`)
-              : state.owner?.name ?? L('公开注册', 'public registration')}
-          </span>
-        </div>
-      )}
+      <WorkspaceSwitcher state={state} store={store} />
       <div style={styles.composeRow}>
         <button type="button" className="m9-btn m9-btn-primary" style={styles.composeButton} onClick={() => store.openCompose()}>
           <PenLine size={13} />
@@ -1799,6 +1822,13 @@ const styles: Record<string, CSSProperties> = {
     overflowY: 'auto',
   },
   navAddress: { color: DIM, fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  switcherWrap: { position: 'relative' },
+  switcherButton: { width: '100%', display: 'flex', alignItems: 'center', gap: 4, textAlign: 'left' },
+  switcherLabel: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 },
+  switcherPop: { position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4, background: BG, border: `1px solid ${BORDER_STRONG}`, borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,0.12)', zIndex: 30, maxHeight: 320, overflowY: 'auto', padding: 4 },
+  switcherItem: { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 1, width: '100%', textAlign: 'left' },
+  switcherItemTitle: { fontSize: 12, color: FG },
+  switcherItemAddr: { fontSize: 10, color: DIM, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   composeRow: { display: 'flex', alignItems: 'center', gap: 6 },
   composeButton: { flex: 1 },
   bellButton: { border: `1px solid ${BORDER_STRONG}`, borderRadius: 8, padding: 5 },
