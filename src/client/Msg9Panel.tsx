@@ -90,7 +90,13 @@ function useRootHeightSync(): (node: HTMLDivElement | null) => void {
     if (!found) return
     const box = found as HTMLElement
     const sync = (): void => {
+      // flex:1 1 0% lets the host's flex layout stretch the panel PAST the px
+      // height we set (observed live: height:824px computing to 1715px) —
+      // pin all three properties or the outer scroller keeps swallowing the
+      // whole panel.
+      node.style.flex = '0 0 auto'
       node.style.height = `${box.clientHeight}px`
+      node.style.maxHeight = `${box.clientHeight}px`
     }
     sync()
     let observer: ResizeObserver | undefined
