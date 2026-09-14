@@ -1017,39 +1017,45 @@ function GroupView({ state, store }: { state: Msg9State; store: Msg9Store }): JS
   }
   const memberCount = group.member_count ?? group.members?.length ?? 0
   return (
-    // 右栏为 flex 列、自身不滚（overflow: hidden）：组信息卡 + 计数/正倒序行
-    // 固定，只有存档列表区独立滚动（见 GroupArchive 的 m9-archive-scroll）。
+    // 右栏为 flex 列、自身不滚（overflow: hidden）。主人的取舍：组信息卡
+    // 随内容滚走（放进 GroupArchive 的滚动区），只有「组内消息计数 + 正倒序」
+    // 行钉在顶部。
     <section style={styles.groupCol}>
-      <article style={{ ...styles.detail, flexShrink: 0 }}>
-        <header style={styles.detailHeader}>
-          <div style={styles.detailSubject}>{group.display_name ?? group.address}</div>
-          <div style={styles.detailMeta}>
-            <span style={styles.detailAddresses}>{group.address}</span>
-            <span style={styles.groupTag}>{group.open ? L('开放组', 'open') : L('封闭组', 'closed')}</span>
-            <span style={styles.metaTime}>{L('{n} 名成员', '{n} members', { n: memberCount })}</span>
-          </div>
-          {group.created_by ? (
-            <div style={styles.detailMeta}>
-              <span style={styles.metaTime}>{L('组主：{by}', 'Created by {by}', { by: group.created_by })}</span>
-            </div>
-          ) : null}
-          {group.description ? <div style={styles.agentDescription}>{group.description}</div> : null}
-          {group.members?.length ? (
-            <div style={styles.agentLinks}>
-              {group.members.map((member) => (
-                <span key={member} style={styles.agentLink}>{member}</span>
-              ))}
-            </div>
-          ) : null}
-          <div style={styles.detailActions}>
-            <button type="button" className="m9-btn m9-btn-primary" onClick={() => store.composeTo(group.address)}>
-              <Send size={12} />
-              {L('发信到组', 'Message the group')}
-            </button>
-          </div>
-        </header>
-      </article>
-      <GroupArchive state={state} store={store} />
+      <GroupArchive
+        state={state}
+        store={store}
+        header={
+          <article style={styles.detail}>
+            <header style={styles.detailHeader}>
+              <div style={styles.detailSubject}>{group.display_name ?? group.address}</div>
+              <div style={styles.detailMeta}>
+                <span style={styles.detailAddresses}>{group.address}</span>
+                <span style={styles.groupTag}>{group.open ? L('开放组', 'open') : L('封闭组', 'closed')}</span>
+                <span style={styles.metaTime}>{L('{n} 名成员', '{n} members', { n: memberCount })}</span>
+              </div>
+              {group.created_by ? (
+                <div style={styles.detailMeta}>
+                  <span style={styles.metaTime}>{L('组主：{by}', 'Created by {by}', { by: group.created_by })}</span>
+                </div>
+              ) : null}
+              {group.description ? <div style={styles.agentDescription}>{group.description}</div> : null}
+              {group.members?.length ? (
+                <div style={styles.agentLinks}>
+                  {group.members.map((member) => (
+                    <span key={member} style={styles.agentLink}>{member}</span>
+                  ))}
+                </div>
+              ) : null}
+              <div style={styles.detailActions}>
+                <button type="button" className="m9-btn m9-btn-primary" onClick={() => store.composeTo(group.address)}>
+                  <Send size={12} />
+                  {L('发信到组', 'Message the group')}
+                </button>
+              </div>
+            </header>
+          </article>
+        }
+      />
     </section>
   )
 }
@@ -1156,7 +1162,7 @@ export function buildLetterTree(letters: LetterFold[]): LetterNode {
  *  collapsed by default (header + one-line preview), expanded to the full
  *  markdown body through the same pipeline as the inbox detail. The toggle
  *  flips the thread order and defaults to chronological (正序). */
-function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
+function GroupArchive({ state, store, header }: { state: Msg9State; store: Msg9Store; header?: JSX.Element }): JSX.Element {
   // openIds: 卡片级展开（默认全部折叠）；fullIds: 长正文的「展开全文」（2000 字符 clamp）；
   // closedIds: 子树折叠（默认全部展开，层级清晰可见）。
   const [openIds, setOpenIds] = useState<ReadonlySet<string>>(new Set())
@@ -1221,12 +1227,15 @@ function GroupArchive({ state, store }: { state: Msg9State; store: Msg9Store }):
       </div>
       {threads.length === 0 ? (
         <div style={styles.archiveScroll}>
+          {header}
           <div style={styles.listEmpty}>{L('组里还没有消息。', 'No messages in this group yet.')}</div>
         </div>
       ) : (
-        // 唯一滚动区：回复树、卡片和「加载更多」都在里面；上面的计数行不滚。
+        // 唯一滚动区：组信息卡（随内容滚走）、回复树、卡片和「加载更多」都在
+        // 里面；上面的计数行不滚。
         // overflowX hidden 是兜底——卡片内容（表格/代码块）一律内部横滚，不探出右缘。
         <div className="m9-archive-scroll" style={styles.archiveScroll}>
+          {header}
           <div style={styles.threadList}>
             {threads.map((thread) => {
               const allOpen = thread.letters.every(({ message }) => openIds.has(message.message_id))

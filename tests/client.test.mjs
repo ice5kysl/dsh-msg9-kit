@@ -1283,12 +1283,12 @@ await check('groups archive: the channel view threads letters, folds copies and 
 
     const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
     const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
-    // 布局：组头（信息卡 + 发信按钮）和计数/正倒序行在滚动容器外且位于其前；
-    // 滚动容器 m9-archive-scroll 里只有存档内容（含底部的加载更多）。
+    // 布局（主人标注后的取舍）：计数/正倒序行在滚动容器外（钉住）；组信息卡
+    // （含发信按钮）在滚动容器内，随存档内容一起滚走。
     assert.ok(html.includes('m9-archive-scroll'), 'the archive has its own scroll region')
-    assert.ok(html.indexOf('Message the group') < html.indexOf('m9-archive-scroll'), 'group header stays above (outside) the scroll region')
-    assert.ok(html.indexOf('Oldest first') < html.indexOf('m9-archive-scroll'), 'counter + order toggle stays above the scroll region')
-    assert.ok(!html.slice(html.indexOf('m9-archive-scroll')).includes('Message the group'), 'scroll region holds only archive content')
+    assert.ok(html.indexOf('Oldest first') < html.indexOf('m9-archive-scroll'), 'counter + order toggle stays pinned above the scroll region')
+    assert.ok(html.slice(html.indexOf('m9-archive-scroll')).includes('Message the group'), 'the group info card scrolls WITH the archive content')
+    assert.ok(html.slice(html.indexOf('m9-archive-scroll')).indexOf('Message the group') < html.slice(html.indexOf('m9-archive-scroll')).indexOf('m9-letterhead'), 'the group card sits at the top of the scroll region, letters follow')
     // 卡片宽度约束锚点：maxWidth 封顶，任何卡片不超出右栏可视宽度。
     assert.ok(html.includes('max-width:92%'), 'letter cards carry the max-width clamp')
     // 宽表格处理规则随 M9_CSS 注入（表格内部横滚，不撑破卡片）。
