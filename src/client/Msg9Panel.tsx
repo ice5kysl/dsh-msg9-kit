@@ -96,13 +96,18 @@ function useRootHeightSync(): (node: HTMLDivElement | null) => void {
       // pin all three properties or the outer scroller keeps swallowing the
       // whole panel.
       //
-      // Height source: the scroll box's clientHeight, but never more than what
-      // is actually VISIBLE — when the host page is taller than the window
-      // (small window / browser zoom / page-level scroll), the raw clientHeight
-      // pushes the panel bottom (and the nav's pinned tenant footer) below the
-      // fold. Clamp to the viewport-visible remainder.
-      const visible = Math.floor(window.innerHeight - box.getBoundingClientRect().top)
-      const height = Math.max(200, Math.min(box.clientHeight, visible))
+      // Height budget = the smaller of two rooms:
+      //  a) room inside the scroll box (its clientHeight minus any siblings
+      //     ABOVE us — tab strip etc. — measured with scrollTop folded in);
+      //  b) room left in the viewport below our OWN top (the box may start
+      //     above us; clamping to the box's top would push our bottom —
+      //     and the nav's pinned tenant footer — below the fold).
+      // Recomputed on host scroll too, because scrolling moves our rect.
+      const rootTop = node.getBoundingClientRect().top
+      const offsetInBox = rootTop - box.getBoundingClientRect().top + box.scrollTop
+      const roomInBox = box.clientHeight - Math.max(0, offsetInBox)
+      const roomInView = window.innerHeight - rootTop
+      const height = Math.max(200, Math.min(roomInBox, roomInView))
       node.style.flex = '0 0 auto'
       node.style.height = `${height}px`
       node.style.maxHeight = `${height}px`
@@ -114,9 +119,12 @@ function useRootHeightSync(): (node: HTMLDivElement | null) => void {
       observer.observe(box)
     }
     window.addEventListener('resize', sync)
+    // Host scrolling moves our rect within the viewport — re-budget the height.
+    box.addEventListener('scroll', sync, { passive: true })
     cleanupRef.current = () => {
       observer?.disconnect()
       window.removeEventListener('resize', sync)
+      box.removeEventListener('scroll', sync)
     }
   }, [])
 }
