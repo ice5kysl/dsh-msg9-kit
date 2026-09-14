@@ -97,6 +97,21 @@ export function processedLabel(message: MessageRow): string {
   return message.processed_by === 'human' ? L('人已处理', 'Handled by you') : L('Agent 已处理', 'Handled by agent')
 }
 
+/** Compose 收件人联想的候选行。 */
+export interface RecipientSuggestion {
+  address: string
+  label: string
+}
+
+/** 收件人联想：地址/备注名包含查询串即命中（大小写不敏感），最多 limit 条。 */
+export function filterRecipients(rows: RecipientSuggestion[], query: string, limit = 6): RecipientSuggestion[] {
+  const needle = query.trim().toLowerCase()
+  const matched = needle
+    ? rows.filter((row) => `${row.address} ${row.label}`.toLowerCase().includes(needle))
+    : rows
+  return matched.slice(0, limit)
+}
+
 /** 「信」的身份（发件人+主题+正文）：fan-out 副本的折叠键。不能用
  *  correlation_id——同一线程/会话的回复共享它，按它折会把不同的信藏进一行。 */
 export function letterIdentity(row: MessageRow): string {

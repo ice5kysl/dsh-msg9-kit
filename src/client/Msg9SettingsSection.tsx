@@ -51,9 +51,6 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
             'msg9 is email for agents: one inbox per dsh workspace — the agent mails through tools while you read the same mailbox in the "Messages" view tab. Sibling workspaces can message each other to sync across projects.',
           )}
         </div>
-        <a className="m9-link" style={styles.link} href="https://msg9.io" target="_blank" rel="noreferrer">
-          msg9.io
-        </a>
       </section>
 
       <section style={styles.card}>
@@ -137,13 +134,29 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
         )}
         {pending.length > 0 ? (
           <div style={styles.pending}>
-            {L('尚未开通：{list}', 'Not opened yet: {list}', { list: pending.map((row) => row.title).join('、') })}
+            <span style={styles.dim}>{L('尚未开通：', 'Not opened yet:')}</span>
+            <PendingChips titles={pending.map((row) => row.title)} />
           </div>
         ) : null}
       </section>
 
       <MigrationCard state={state} store={store} />
     </div>
+  )
+}
+
+/** 尚未开通的 workspace：flex wrap 小 chips，最多显示 8 个，超出「…等 N 个」。
+ *  导出以便测试直接驱动截断逻辑。 */
+export function PendingChips({ titles }: { titles: string[] }): JSX.Element {
+  const shown = titles.slice(0, 8)
+  const rest = titles.length - shown.length
+  return (
+    <span style={styles.pendingChips}>
+      {shown.map((title) => (
+        <span key={title} style={styles.pendingChip}>{title}</span>
+      ))}
+      {rest > 0 && <span style={styles.pendingChip}>{L('…等 {n} 个', '…and {n} more', { n: rest })}</span>}
+    </span>
   )
 }
 
@@ -202,7 +215,6 @@ const styles: Record<string, CSSProperties> = {
   wrap: { display: 'flex', flexDirection: 'column', gap: 20, padding: '16px 0', maxWidth: 640, color: FG, fontSize: 13 },
   card: { display: 'flex', flexDirection: 'column', gap: 8 },
   cardTitle: { fontSize: 13, fontWeight: 600 },
-  link: { fontSize: 12, alignSelf: 'flex-start' },
   fields: { margin: 0, display: 'flex', flexDirection: 'column', gap: 6 },
   fieldRow: { display: 'flex', gap: 12, fontSize: 13 },
   fieldName: { flex: 'none', width: 72, color: DIM, fontSize: 12 },
@@ -235,6 +247,8 @@ const styles: Record<string, CSSProperties> = {
     textAlign: 'center',
     fontWeight: 600,
   },
-  pending: { fontSize: 12, color: DIM, borderTop: `1px solid ${BORDER}`, paddingTop: 8 },
+  pending: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, color: DIM, borderTop: `1px solid ${BORDER}`, paddingTop: 8 },
+  pendingChips: { display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 44, overflow: 'hidden' },
+  pendingChip: { fontSize: 11, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '1px 8px', whiteSpace: 'nowrap' },
   migrateKeyRow: { display: 'flex', flexDirection: 'column', gap: 4, maxWidth: 380 },
 }

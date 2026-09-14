@@ -37,6 +37,7 @@ import {
   contactLabel,
   conversationOf,
   filterContacts,
+  filterRecipients,
   folderLabel,
   formatTime,
   fullBody,
@@ -662,6 +663,10 @@ function ConversationView({ state, store, seed }: { state: Msg9State; store: Msg
 
 /** The composer occupies the detail column while open. */
 function Composer({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
+  const [mode, setMode] = useState<'write' | 'preview'>('write')
+  const [suggestOpen, setSuggestOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+  // 收件人联想数据源：联系人 + 同租户兄弟信箱 + 租户网络的 agent（去重）。
   const suggestions = useMemo(() => {
     const rows: { address: string; label: string }[] = []
     for (const contact of state.contacts) rows.push({ address: contact.contact, label: contactLabel(contact) })
@@ -670,8 +675,18 @@ function Composer({ state, store }: { state: Msg9State; store: Msg9Store }): JSX
         rows.push({ address: peer.address, label: peer.title ?? L('同租户收件箱', 'sibling inbox') })
       }
     }
+    for (const agent of state.accountAgents) {
+      if (!rows.some((row) => row.address === agent.address)) {
+        rows.push({ address: agent.address, label: agent.display_name ?? agent.owner_name })
+      }
+    }
     return rows
-  }, [state.contacts, state.peers])
+  }, [state.contacts, state.peers, state.accountAgents])
+  const filtered = useMemo(() => filterRecipients(suggestions, state.compose.to), [suggestions, state.compose.to])
+  const pickRecipient = (address: string): void => {
+    store.setCompose({ to: address })
+    setSuggestOpen(false)
+  }
 
   return (
     <section style={styles.detailCol}>
@@ -687,20 +702,59 @@ function Composer({ state, store }: { state: Msg9State; store: Msg9Store }): JSX
       </div>
       <label style={styles.field}>
         <span style={styles.fieldLabel}>{L('收件人', 'To')}</span>
-        <input
-          className="m9-input"
-          list="msg9-recipients"
-          value={state.compose.to}
-          placeholder="peer@msg9.io"
-          onChange={(event) => store.setCompose({ to: event.target.value })}
-        />
-        <datalist id="msg9-recipients">
-          {suggestions.map((row) => (
-            <option key={row.address} value={row.address}>
-              {row.label}
-            </option>
-          ))}
-        </datalist>
+        <div style={styles.recipientWrap}>
+          <input
+            className="m9-input"
+            value={state.compose.to}
+            placeholder="peer@msg9.io"
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(event) => {
+              store.setCompose({ to: event.target.value })
+              setSuggestOpen(true)
+              setActiveIndex(0)
+            }}
+            onFocus={() => setSuggestOpen(true)}
+            // 失焦延迟关闭：让下拉项的 mousedown 先落地（下拉用 mousedown 选中）。
+            onBlur={() => setTimeout(() => setSuggestOpen(false), 150)}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                setSuggestOpen(false)
+                return
+              }
+              if (!suggestOpen || filtered.length === 0) return
+              if (event.key === 'ArrowDown') {
+                event.preventDefault()
+                setActiveIndex((index) => (index + 1) % filtered.length)
+              } else if (event.key === 'ArrowUp') {
+                event.preventDefault()
+                setActiveIndex((index) => (index - 1 + filtered.length) % filtered.length)
+              } else if (event.key === 'Enter') {
+                event.preventDefault()
+                pickRecipient(filtered[activeIndex]?.address ?? state.compose.to)
+              }
+            }}
+          />
+          {suggestOpen && filtered.length > 0 && (
+            <ul className="m9-recipients" style={styles.recipientList}>
+              {filtered.map((row, index) => (
+                <li key={row.address}>
+                  <button
+                    type="button"
+                    className={index === activeIndex ? 'm9-row active' : 'm9-row'}
+                    onMouseDown={(event) => {
+                      event.preventDefault()
+                      pickRecipient(row.address)
+                    }}
+                  >
+                    <div style={styles.contactName}>{row.label}</div>
+                    <div style={styles.rowPreview}>{row.address}</div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </label>
       <label style={styles.field}>
         <span style={styles.fieldLabel}>{L('主题', 'Subject')}</span>
@@ -710,15 +764,30 @@ function Composer({ state, store }: { state: Msg9State; store: Msg9Store }): JSX
           onChange={(event) => store.setCompose({ subject: event.target.value })}
         />
       </label>
-      <label style={styles.field}>
-        <span style={styles.fieldLabel}>{L('正文', 'Message')}</span>
-        <textarea
-          className="m9-textarea"
-          rows={8}
-          value={state.compose.text}
-          onChange={(event) => store.setCompose({ text: event.target.value })}
-        />
-      </label>
+      <div style={styles.field}>
+        <div style={styles.composeModeRow}>
+          <span style={styles.fieldLabel}>{L('正文', 'Message')}</span>
+          <span style={styles.capsRow}>
+            <button type="button" className={mode === 'write' ? 'm9-chip active' : 'm9-chip'} onClick={() => setMode('write')}>
+              {L('编写', 'Write')}
+            </button>
+            <button type="button" className={mode === 'preview' ? 'm9-chip active' : 'm9-chip'} onClick={() => setMode('preview')}>
+              {L('预览', 'Preview')}
+            </button>
+          </span>
+        </div>
+        {mode === 'write' ? (
+          <textarea
+            className="m9-textarea"
+            rows={8}
+            value={state.compose.text}
+            onChange={(event) => store.setCompose({ text: event.target.value })}
+          />
+        ) : (
+          // 预览走同一 markdown 管线（代码块带 Shiki 高亮），不引新依赖。
+          <div className="m9-md m9-letter-md" style={styles.composePreview} dangerouslySetInnerHTML={{ __html: markdownHtml(state.compose.text || L('（空消息）', '(empty message)')) }} />
+        )}
+      </div>
       <div style={styles.composerActions}>
         <button type="button" className="m9-btn m9-btn-primary" disabled={state.busy.send} onClick={() => void store.send()}>
           <Send size={12} />
@@ -738,20 +807,6 @@ function Composer({ state, store }: { state: Msg9State; store: Msg9Store }): JSX
 function ContactList({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
   const [query, setQuery] = useState('')
   const rows = useMemo(() => filterContacts(state.contacts, query), [state.contacts, query])
-  const networkGroups = useMemo(() => {
-    const groups = new Map<string, { owner_id: string; owner_name: string; address_domain: string; agents: AccountAgentView[] }>()
-    for (const agent of state.accountAgents) {
-      const group = groups.get(agent.owner_id) ?? {
-        owner_id: agent.owner_id,
-        owner_name: agent.owner_name,
-        address_domain: agent.address_domain,
-        agents: [],
-      }
-      group.agents.push(agent)
-      groups.set(agent.owner_id, group)
-    }
-    return [...groups.values()]
-  }, [state.accountAgents])
   return (
     <section style={styles.listCol} className="m9-listcol">
       <div style={styles.searchWrap}>
@@ -766,7 +821,12 @@ function ContactList({ state, store }: { state: Msg9State; store: Msg9Store }): 
       </div>
       {rows.length === 0 ? (
         <div style={styles.listEmpty}>
-          {state.busy.contacts ? L('加载中…', 'Loading…') : L('没有联系人。', 'No contacts.')}
+          {state.busy.contacts
+            ? L('加载中…', 'Loading…')
+            : query.trim()
+              ? L('没有匹配的联系人。', 'No contacts match.')
+              // 空态只覆盖联系人列表区：下面的兄弟信箱/租户网络仍可操作，文案要给引导。
+              : L('还没有联系人。从下面的网络里挑一个添加，或在右侧表单里新增。', 'No contacts yet — pick one from the network below, or add one with the form.')}
         </div>
       ) : (
         <ul style={styles.list}>
@@ -794,26 +854,54 @@ function ContactList({ state, store }: { state: Msg9State; store: Msg9Store }): 
           </ul>
         </>
       )}
-      {networkGroups.length > 0 && (
-        <>
-          <div style={styles.listHeader}>
-            {state.accountOrg?.label
-              ? L('我的租户网络 · {org}', 'My tenant network · {org}', { org: state.accountOrg.label })
-              : L('我的租户网络', 'My tenant network')}
-          </div>
-          {networkGroups.map((group) => (
-            <div key={group.owner_id}>
-              <div style={styles.networkOwner}>{group.owner_name} · {group.address_domain}</div>
-              <ul style={styles.list}>
-                {group.agents.map((agent) => (
-                  <AccountAgentRowView key={agent.address} agent={agent} state={state} store={store} />
-                ))}
-              </ul>
-            </div>
-          ))}
-        </>
-      )}
+      <TenantNetwork state={state} store={store} />
     </section>
+  )
+}
+
+/** 「我的租户网络」：account 上每个 owner 的 agent。太长会挤掉兄弟信箱，
+ *  默认折叠成一行标题（含 agent 总数徽标），点开才展开列表。
+ *  defaultExpanded 仅供测试直接渲染展开态。 */
+export function TenantNetwork({ state, store, defaultExpanded = false }: { state: Msg9State; store: Msg9Store; defaultExpanded?: boolean }): JSX.Element | null {
+  const [expanded, setExpanded] = useState(defaultExpanded)
+  const networkGroups = useMemo(() => {
+    const groups = new Map<string, { owner_id: string; owner_name: string; address_domain: string; agents: AccountAgentView[] }>()
+    for (const agent of state.accountAgents) {
+      const group = groups.get(agent.owner_id) ?? {
+        owner_id: agent.owner_id,
+        owner_name: agent.owner_name,
+        address_domain: agent.address_domain,
+        agents: [],
+      }
+      group.agents.push(agent)
+      groups.set(agent.owner_id, group)
+    }
+    return [...groups.values()]
+  }, [state.accountAgents])
+  if (networkGroups.length === 0) return null
+  const total = networkGroups.reduce((sum, group) => sum + group.agents.length, 0)
+  return (
+    <>
+      <button type="button" className="m9-letterhead" style={styles.networkToggle} onClick={() => setExpanded((value) => !value)}>
+        {expanded ? <ChevronDown size={12} style={styles.tlArrow} /> : <ChevronRight size={12} style={styles.tlArrow} />}
+        <span style={styles.listHeader}>
+          {state.accountOrg?.label
+            ? L('我的租户网络 · {org}', 'My tenant network · {org}', { org: state.accountOrg.label })
+            : L('我的租户网络', 'My tenant network')}
+        </span>
+        <span style={styles.threadCount}>({total})</span>
+      </button>
+      {expanded && networkGroups.map((group) => (
+        <div key={group.owner_id}>
+          <div style={styles.networkOwner}>{group.owner_name} · {group.address_domain}</div>
+          <ul style={styles.list}>
+            {group.agents.map((agent) => (
+              <AccountAgentRowView key={agent.address} agent={agent} state={state} store={store} />
+            ))}
+          </ul>
+        </div>
+      ))}
+    </>
   )
 }
 
@@ -1526,6 +1614,14 @@ function SquareList({ state, store }: { state: Msg9State; store: Msg9Store }): J
                   {known.has(agent.address) && <span style={styles.knownTag}>{L('已相识', 'known')}</span>}
                 </div>
                 <div style={styles.rowPreview}>{agent.address}</div>
+                {/* 第二行预览：profile.description 截断；没有则用前两个 capability。 */}
+                {(agent.description?.trim() || (agent.capabilities ?? []).length > 0) && (
+                  <div style={styles.rowPreview}>
+                    {agent.description?.trim()
+                      ? truncate(agent.description.trim(), 90)
+                      : (agent.capabilities ?? []).slice(0, 2).join(' · ')}
+                  </div>
+                )}
                 {agent.capabilities?.length ? (
                   <div style={styles.capsRow}>
                     {agent.capabilities.map((cap) => (
@@ -1574,6 +1670,9 @@ function SquareDetail({ state, store }: { state: Msg9State; store: Msg9Store }):
           <div style={styles.detailMeta}>
             <span style={styles.detailAddresses}>{agent.address}</span>
             {agent.created_at ? <span style={styles.metaTime}>{formatTime(agent.created_at)}</span> : null}
+            {/* 广场按定义只列 visibility: public 的 Agent——徽标由这个事实派生
+                （host 不把 visibility 字段透传到 client 行，见 http.ts /directory）。 */}
+            <span style={styles.knownTag}>{L('公开', 'public')}</span>
           </div>
           {agent.description ? <div style={styles.agentDescription}>{agent.description}</div> : null}
           {agent.capabilities?.length ? (
@@ -1739,7 +1838,7 @@ const styles: Record<string, CSSProperties> = {
   errorBlock: { margin: 16, display: 'flex', flexDirection: 'column', gap: 10, color: '#991b1b', fontSize: 12 },
   empty: { margin: 'auto', padding: 24, maxWidth: 560, textAlign: 'center', display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' },
   emptyText: { color: DIM, fontSize: 12, lineHeight: 1.6, margin: 0 },
-  list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 2 },
+  list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 1 },
   listEmpty: { padding: 16, color: DIM, fontSize: 12 },
   listHint: { padding: '6px 0', color: DIM, fontSize: 10, textAlign: 'center', flexShrink: 0 },
   listHeader: { fontSize: 11, color: DIM, marginTop: 6, flexShrink: 0 },
@@ -1774,8 +1873,9 @@ const styles: Record<string, CSSProperties> = {
   thread: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
   treeNode: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
   // 子树容器：左侧竖线即该层的时间线（嵌套自然形成多级层级线）。
-  treeChildren: { marginLeft: 4, paddingLeft: 18, borderLeft: `1px solid ${BORDER}`, display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
-  threadHead: { display: 'flex', alignItems: 'center', gap: 6, paddingBottom: 2 },
+  // 层级要一眼可见：线用 BORDER_STRONG，节点圆点实色 10px。
+  treeChildren: { marginLeft: 4, paddingLeft: 18, borderLeft: `1px solid ${BORDER_STRONG}`, display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+  threadHead: { display: 'flex', alignItems: 'center', gap: 6 },
   threadCount: { fontSize: 10, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '0 7px' },
   letter: {
     position: 'relative',
@@ -1794,7 +1894,7 @@ const styles: Record<string, CSSProperties> = {
   },
   letterMine: { alignSelf: 'flex-end', background: ACTIVE_BG, borderColor: BORDER_STRONG },
   // 节点圆点：挂在 treeChildren 的竖线上（border 1px + paddingLeft 18px → 线心约在 -19）。
-  tlNode: { position: 'absolute', left: -23, top: 13, width: 8, height: 8, borderRadius: 4, background: BORDER_STRONG },
+  tlNode: { position: 'absolute', left: -24, top: 12, width: 10, height: 10, borderRadius: 5, background: BORDER_STRONG },
   tlNodeMine: { background: ACCENT },
   tlArrow: { flexShrink: 0, color: DIM },
   letterHeadRow: { display: 'flex', alignItems: 'center', gap: 2, minWidth: 0 },
@@ -1802,15 +1902,24 @@ const styles: Record<string, CSSProperties> = {
   letterSender: { fontSize: 11, fontWeight: 600, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   mineTag: { flexShrink: 0, fontSize: 10, color: ACCENT, border: `1px solid ${BORDER_STRONG}`, borderRadius: 999, padding: '0 6px' },
   letterTime: { color: DIM, fontSize: 10, flexShrink: 0, marginLeft: 'auto' },
-  letterSubject: { fontSize: 12, fontWeight: 600, overflowWrap: 'anywhere' },
-  letterBody: { minWidth: 0, overflowWrap: 'anywhere', wordBreak: 'break-word' },
+  letterSubject: {
+    fontSize: 13,
+    fontWeight: 600,
+    overflowWrap: 'anywhere',
+    // 主题行收敛：与正文标题层级相当，最多两行截断（不再特大加粗多行）。
+    display: '-webkit-box',
+    WebkitLineClamp: 2,
+    WebkitBoxOrient: 'vertical',
+    overflow: 'hidden',
+  },
+  letterBody: { minWidth: 0, maxWidth: '70ch', overflowWrap: 'anywhere', wordBreak: 'break-word' },
   letterActions: { display: 'flex', gap: 6, marginTop: 2 },
-  rowSubject: { fontSize: 12, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  rowSubjectUnread: { fontSize: 12, marginTop: 2, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  rowSubject: { fontSize: 12, marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  rowSubjectUnread: { fontSize: 12, marginTop: 1, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   rowPreview: {
     color: DIM,
     fontSize: 11,
-    marginTop: 2,
+    marginTop: 1,
     lineHeight: 1.5,
     overflow: 'hidden',
     textOverflow: 'ellipsis',
@@ -1836,6 +1945,24 @@ const styles: Record<string, CSSProperties> = {
   composerHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   composerActions: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   composerHint: { color: DIM, fontSize: 10 },
+  composeModeRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  composePreview: { minHeight: 120, border: `1px solid ${BORDER}`, borderRadius: 8, padding: '6px 9px', maxWidth: '70ch' },
+  recipientWrap: { position: 'relative' },
+  recipientList: {
+    position: 'absolute',
+    top: '100%',
+    left: 0,
+    right: 0,
+    zIndex: 20,
+    margin: '2px 0 0',
+    padding: 4,
+    listStyle: 'none',
+    background: BG,
+    border: `1px solid ${BORDER_STRONG}`,
+    borderRadius: 8,
+    maxHeight: 236,
+    overflowY: 'auto',
+  },
   field: { display: 'flex', flexDirection: 'column', gap: 3 },
   fieldLabel: { color: DIM, fontSize: 10 },
   contactRow: {
@@ -1872,6 +1999,7 @@ const styles: Record<string, CSSProperties> = {
   agentLinks: { display: 'flex', flexDirection: 'column', gap: 2, fontSize: 11, color: DIM, wordBreak: 'break-all' },
   agentLink: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
   networkOwner: { fontSize: 11, fontWeight: 600, color: DIM, padding: '4px 2px 2px' },
+  networkToggle: { marginTop: 6 },
   statusTag: {
     marginLeft: 6,
     fontSize: 10,

@@ -853,6 +853,12 @@ await check('panel renders the current workspace mailbox (server-side markup)', 
   const composing = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
   assert.ok(composing.includes('peer@msg9.io'), 'reply pre-fills the recipient')
   assert.ok(composing.includes('Send'), 'composer offered')
+  // Compose 增强：编写 | 预览 切换（默认编写态，textarea 在）。
+  assert.ok(composing.includes('Write'), 'write tab offered')
+  assert.ok(composing.includes('Preview'), 'preview tab offered')
+  assert.ok(composing.includes('m9-textarea'), 'write mode shows the textarea by default')
+  // 列表密度：行内 padding 收紧（M9_CSS 随面板注入）。
+  assert.ok(composing.includes('padding: 5px 10px'), 'list rows use the denser padding')
 })
 
 await check('square tab lists public agents and shows the agent card', async () => {
@@ -869,6 +875,8 @@ await check('square tab lists public agents and shows the agent card', async () 
   assert.ok(html.includes('nova@vme.msg9.io'), 'agent of another tenant listed')
   assert.ok(html.includes('design-review'), 'capability chip listed')
   assert.ok(html.includes('known'), 'the local inbox is tagged as known')
+  // 列表行在地址下多一行 description 截断预览（没有则用前两个 capability）。
+  assert.ok(html.includes('design reviewer of another tenant'), 'description preview on the list row')
 
   // Selecting an agent shows its yellow-pages card with the follow-up actions.
   store.selectAgent('nova@vme.msg9.io')
@@ -877,6 +885,7 @@ await check('square tab lists public agents and shows the agent card', async () 
   assert.ok(card.includes('design reviewer of another tenant'), 'description on the card')
   assert.ok(card.includes('/opt/nova'), 'profile link on the card')
   assert.ok(card.includes('Add contact'), 'add-contact action offered')
+  assert.ok(card.includes('>public</span>'), 'square card carries the visibility badge (the square is by definition public)')
 
   // Adding it lands in the workspace's address book (alias = display name).
   const added = await store.addContact({ contact: 'nova@vme.msg9.io', alias: 'Nova' })
@@ -907,11 +916,17 @@ await check('contacts tab shows the tenant network grouped by owner', async () =
   assert.equal(store.getState().accountAgents.length, 3)
   const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
-  assert.ok(html.includes('My tenant network'), 'network section shown')
-  assert.ok(html.includes('KimiCode · kimi.msg9.io'), 'grouped under the other owner')
-  assert.ok(html.includes('nova@kimi.msg9.io'), 'agent of the other owner listed')
-  assert.ok(html.includes('design-review'), 'capabilities ride along')
-  assert.ok(html.includes('suspended'), 'non-active status is tagged')
+  // 租户网络默认折叠成一行标题（含 agent 总数徽标）——太长会挤掉兄弟信箱。
+  assert.ok(html.includes('My tenant network'), 'network header shown')
+  assert.ok(html.includes('(3)'), 'collapsed header carries the agent-count badge')
+  assert.ok(!html.includes('nova@kimi.msg9.io'), 'agents hidden until the header is expanded')
+
+  // 展开态（SSR 无事件，直接渲染 defaultExpanded 的 TenantNetwork）。
+  const expanded = renderToStaticMarkup(React.createElement(client.TenantNetwork, { state: store.getState(), store, defaultExpanded: true }))
+  assert.ok(expanded.includes('KimiCode · kimi.msg9.io'), 'grouped under the other owner')
+  assert.ok(expanded.includes('nova@kimi.msg9.io'), 'agent of the other owner listed')
+  assert.ok(expanded.includes('design-review'), 'capabilities ride along')
+  assert.ok(expanded.includes('suspended'), 'non-active status is tagged')
 })
 
 await check('account agents: the §28 org endpoint wins once it ships; 404 falls back to the account view', async () => {
@@ -1067,6 +1082,8 @@ await check('settings section renders the service intro, tenant and its open inb
 
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
   assert.ok(html.includes('msg9.io'), 'service intro shown')
+  // 标题去重：intro 卡只留一个 msg9.io 标题，不再多一个同名链接。
+  assert.equal(html.match(/>msg9\.io</g).length, 1, 'the msg9.io title is not duplicated')
   assert.ok(html.includes('Tenant'), html)
   assert.ok(html.includes('dsh'), 'tenant name shown')
   assert.ok(html.includes('own_1'), 'tenant id shown')
@@ -1276,6 +1293,8 @@ await check('groups archive: the channel view threads letters, folds copies and 
     // 默认折叠：只有头行 + 纯文本预览，没有 markdown 正文，也没有「回复」。
     // （断言匹配渲染出的 class 属性——M9_CSS 样式文本里本来就含 ".m9-md" 字样。）
     assert.ok(!html.includes('class="m9-md'), 'collapsed channel renders previews, not markdown bodies')
+    // 主题行收敛：13px/600 + 两行截断（-webkit-box clamp）。
+    assert.ok(html.includes('display:-webkit-box'), 'letter subjects clamp to two lines')
     assert.ok(!html.includes('Reply</button>'), 'the reply action lives in the expanded card')
     // 线程 thread-f：3 份投递副本折成一张卡片（×N 徽标折叠态可见），另一封信同组且按时间排在后面。
     assert.equal(html.match(/same letter body/g).length, 1, 'three delivery copies of one letter render as ONE card')
@@ -1380,6 +1399,8 @@ await check('groups archive: reply_to builds a nested reply tree (copies resolve
     }
     // 层级锚点：根的子树容器 + t3 的子树容器（两级嵌套），t31 在第二个容器内。
     assert.equal(html.match(/m9-tree-children/g).length, 2, 'two nesting levels (root → replies → reply-of-reply)')
+    // 时间线要一眼可见：竖线用加粗一级的边框色（BORDER_STRONG）。
+    assert.ok(html.includes('border-left:1px solid var(--dsw-alias-border-l2'), 'connector lines use the stronger border color')
     const secondNest = html.indexOf('m9-tree-children', html.indexOf('reply two'))
     assert.ok(secondNest > html.indexOf('reply two') && secondNest < html.indexOf('reply two dot one'), 'reply-of-reply nests under its parent')
     // 另一个线程（无 correlation_id）独立成树。
@@ -1435,6 +1456,7 @@ await check('inbox detail: opening a letter opens its whole conversation (Gmail 
     // 默认展开最新 + 当前点开的（2 张 markdown 卡），中间那封折叠成头行预览。
     assert.equal(html.match(/class="m9-md /g).length, 2, 'seed + latest expanded, the middle letter collapsed to its header')
     assert.ok(html.includes('<strong>question one</strong>'), 'expanded seed renders markdown')
+    assert.ok(html.includes('max-width:70ch'), 'letter body capped at 70ch per line')
     assert.ok(html.includes('my question'), 'collapsed letter still shows its one-line preview')
     // 签名徽标与动作保留（最新一封已读且已验证签名）。
     assert.ok(html.includes('Signature verified'), 'signature badge on the expanded letter')
@@ -1541,6 +1563,43 @@ await check('panel: root height sync targets the FIRST scrollable ancestor (no h
   assert.equal(client.findScrollParent(root, computed), scrollBody, 'nearest scrollable ancestor wins')
   assert.equal(client.findScrollParent(root, () => ({ overflowY: 'visible' })), null, 'no scrollable ancestor → no sync')
   assert.equal(client.findScrollParent({ parentElement: null }, computed), null, 'detached root is a no-op')
+})
+
+await check('contacts empty state guides; recipient suggestions filter to 6; pending chips truncate', async () => {
+  // #3 空态只覆盖联系人列表区，文案给引导（而不是让人以为整页空）。
+  const fake = {
+    overview: async () => ({
+      owner: { id: 'own_1', name: 'fake' }, api_url: 'http://fake', state_file: '', current: null,
+      workspaces: [{ key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
+    }),
+    messages: async () => ({ messages: [], total: 0, unread_count: 0 }),
+    outbox: async () => ({ messages: [], total: 0 }),
+    contacts: async () => ({ contacts: [], total: 0 }),
+    unread: async () => ({ total: 0, byKey: {} }),
+    peers: async () => ({ peers: [] }),
+    accountAgents: async () => ({ agents: [], total: 0 }),
+    groups: async () => ({ groups: [], total: 0 }),
+  }
+  const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  store.setTab('contacts')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(html.includes('No contacts yet — pick one from the network below'), 'empty state guides instead of declaring the page empty')
+
+  // #5 收件人联想：大小写不敏感过滤，最多 6 条。
+  const pool = Array.from({ length: 8 }, (_, index) => ({ address: `agent-${index}@msg9.io`, label: `Agent ${index}` }))
+  pool.push({ address: 'nova@vme.msg9.io', label: 'Nova' })
+  assert.equal(client.filterRecipients(pool, '').length, 6, 'dropdown caps at 6 rows')
+  assert.deepEqual(client.filterRecipients(pool, 'NOVA').map((row) => row.address), ['nova@vme.msg9.io'], 'case-insensitive match on address/label')
+
+  // #7 未开通 chips：最多 8 个，超出「…等 N 个」。
+  const chips = renderToStaticMarkup(React.createElement(client.PendingChips, { titles: Array.from({ length: 10 }, (_, index) => `ws-${index}`) }))
+  assert.ok(chips.includes('ws-7'), 'first 8 chips shown')
+  assert.ok(!chips.includes('ws-8'), 'the rest collapse into the overflow chip')
+  assert.ok(chips.includes('…and 2 more'), 'overflow chip carries the remaining count')
 })
 
 await check('highlight: an unloaded grammar (```jsonc) degrades to plaintext instead of crashing the panel', async () => {

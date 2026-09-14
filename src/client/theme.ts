@@ -44,7 +44,7 @@ export const M9_CSS = `
 .m9-chip { border: 1px solid ${BORDER}; border-radius: 999px; background: transparent; color: ${DIM}; padding: 3px 11px; font-size: 11px; font-family: inherit; cursor: pointer; }
 .m9-chip:hover { color: ${FG}; border-color: ${BORDER_STRONG}; }
 .m9-chip.active { background: ${ACTIVE_BG}; color: ${ACCENT}; border-color: transparent; font-weight: 600; }
-.m9-row { display: block; width: 100%; text-align: left; border: 1px solid transparent; border-radius: 8px; background: transparent; color: inherit; padding: 8px 10px; font-family: inherit; cursor: pointer; }
+.m9-row { display: block; width: 100%; text-align: left; border: 1px solid transparent; border-radius: 8px; background: transparent; color: inherit; padding: 5px 10px; font-family: inherit; cursor: pointer; }
 .m9-row:hover { background: ${HOVER_BG}; }
 .m9-row.active { background: ${ACTIVE_BG}; }
 .m9-link { color: ${ACCENT}; text-decoration: none; }
