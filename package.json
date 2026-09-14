@@ -1,6 +1,6 @@
 {
   "name": "dsh-msg9-kit",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "dsh (DeepSeek Harness) msg9 kit: one msg9.io inbox per workspace. Model tools (send/receive/read/contacts/resolve) plus a /msg9 command in the agent, and a ✉ sidebar icon that opens the same mailbox in the GUI — inbox, outbox and address book, with an unread badge. 给每个 dsh workspace 一个 msg9.io 收件箱：Agent 用工具收发，界面里点 ✉ 就能看同一份邮件。",
   "type": "module",
   "main": "lib/index.js",

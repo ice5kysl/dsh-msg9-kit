@@ -286,6 +286,11 @@ function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JS
         ))}
       </select>
       <div style={styles.navAddress} title={workspace?.address ?? ''}>{workspace?.address}</div>
+      <div style={styles.navTenant} title={L('当前租户', 'Current tenant')}>
+        {state.owner?.slug
+          ? (state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`)
+          : state.owner?.name ?? L('公开注册', 'public registration')}
+      </div>
       <div style={styles.composeRow}>
         <button type="button" className="m9-btn m9-btn-primary" style={styles.composeButton} onClick={() => store.openCompose()}>
           <PenLine size={13} />
@@ -302,6 +307,9 @@ function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JS
         >
           {state.notifyPaused ? <BellOff size={14} style={styles.bellMuted} /> : <Bell size={14} />}
         </button>
+        <button type="button" className="m9-iconbtn" style={styles.bellButton} onClick={() => void store.refreshAll()} title={L('刷新', 'Refresh')}>
+          <RefreshCw size={14} className={state.busy.overview ? 'm9-spin' : undefined} />
+        </button>
       </div>
       <div style={styles.navItems}>
         {items.map((item) => (
@@ -316,16 +324,6 @@ function NavColumn({ state, store }: { state: Msg9State; store: Msg9Store }): JS
             {item.badge ? <span style={styles.navBadge}>{item.badge}</span> : null}
           </button>
         ))}
-      </div>
-      <div style={styles.navFooter}>
-        <button type="button" className="m9-iconbtn" onClick={() => void store.refreshAll()} title={L('刷新', 'Refresh')}>
-          <RefreshCw size={13} className={state.busy.overview ? 'm9-spin' : undefined} />
-        </button>
-        <span style={styles.navTenant}>
-          {state.owner?.slug
-            ? (state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}`)
-            : state.owner?.name ?? L('公开注册', 'public registration')}
-        </span>
       </div>
     </nav>
   )
@@ -1787,9 +1785,8 @@ const styles: Record<string, CSSProperties> = {
   bellButton: { border: `1px solid ${BORDER_STRONG}`, borderRadius: 8, padding: 5 },
   navItems: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 },
   navBadge: { marginLeft: 'auto', fontSize: 10, color: DIM },
-  navFooter: { marginTop: 'auto', display: 'flex', alignItems: 'center', gap: 6, paddingTop: 8, borderTop: `1px solid ${BORDER}` },
+  navTenant: { color: DIM, fontSize: 10, marginTop: -6, paddingLeft: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   bellMuted: { color: ACCENT },
-  navTenant: { color: DIM, fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   listCol: {
     width: 320,
     flexShrink: 0,
