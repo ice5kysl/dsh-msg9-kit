@@ -95,9 +95,17 @@ function useRootHeightSync(): (node: HTMLDivElement | null) => void {
       // height we set (observed live: height:824px computing to 1715px) —
       // pin all three properties or the outer scroller keeps swallowing the
       // whole panel.
+      //
+      // Height source: the scroll box's clientHeight, but never more than what
+      // is actually VISIBLE — when the host page is taller than the window
+      // (small window / browser zoom / page-level scroll), the raw clientHeight
+      // pushes the panel bottom (and the nav's pinned tenant footer) below the
+      // fold. Clamp to the viewport-visible remainder.
+      const visible = Math.floor(window.innerHeight - box.getBoundingClientRect().top)
+      const height = Math.max(200, Math.min(box.clientHeight, visible))
       node.style.flex = '0 0 auto'
-      node.style.height = `${box.clientHeight}px`
-      node.style.maxHeight = `${box.clientHeight}px`
+      node.style.height = `${height}px`
+      node.style.maxHeight = `${height}px`
     }
     sync()
     let observer: ResizeObserver | undefined
