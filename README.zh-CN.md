@@ -145,22 +145,23 @@ bash scripts/install-personal.sh      # 等价于 dsh plugin --profile web add <
 | `MSG9_STATE_FILE` | 状态文件路径（默认 `$DSH_HOME/msg9-kit/state.json`） |
 | `MSG9KIT_LOCALE` | `zh` \| `en` 工具/命令输出语言 |
 
-状态文件（`~/.dsh/msg9-kit/state.json`，0600，原子写入）：
+**凭据仓（v0.4.0 起）**：key 不再存状态文件。owner key 在 `~/.msg9/tenants/dsh.key`（0600，一行）；每个 workspace 的凭据在 `~/.msg9/projects/dsh/<project-key>.yaml`（0600，字段 `address` / `api_key` / `api_url` / `created_at`），签名 seed 在同源同名的 `<project-key>.signing.yaml`——与 msg9 全 harness 统一凭据契约一致（目录 0700，可用 `MSG9_HOME` 覆盖）。project-key 由 workspace 的 git remote 推导（无 remote 退目录名 + 路径 sha256 前 6 位）。**旧版 state.json 里的 key 会在首次访问时自动惰性迁移**（文件锁内完成：写凭据仓 → 清旧字段；失败不删旧值，下次重试）。
+
+状态文件（`~/.dsh/msg9-kit/state.json`，0600，原子写入）只剩**热状态**：
 
 ```jsonc
 {
-  "owner": {
-    "api_key": "msg9_tk_…", "id": "own_…", "name": "dsh",
-    "api_url": "https://api.msg9.io",
-    "slug": "vme", "mail_domain": "msg9.io"   // 租户子域名（如已分配）
-  },
+  "owner": { "id": "own_…", "name": "dsh", "api_url": "https://api.msg9.io",
+             "slug": "vme", "mail_domain": "msg9.io" },
   "workspaces": {
-    "ws-abc123": { "address": "dsh-msg9-io-a1b2@msg9.io", "api_key": "msg9_sk_…", "title": "msg9.io", "path": "/Users/…/msg9.io", "cursor": "…" }
+    "ws-abc123": { "title": "msg9.io", "path": "/Users/…/msg9.io",
+                   "project_key": "github-com-acme-web", "migrated_at": "…",
+                   "cursor": "…", "marks": { "msg_…": { "read_by": "human" } } }
   }
 }
 ```
 
-状态文件解析失败时**不会**被静默清空：它会先被复制为 `state.json.corrupt-*` 再报错——因为里面存着不可再生的收件箱 key。
+状态文件解析失败时**不会**被静默清空：它会先被复制为 `state.json.corrupt-*` 再报错。
 
 一个 `DSH_HOME` 只支持**一个 dsh 实例**：写入前会对 `state.json.lock` 加文件锁，第二个共享同一状态文件的实例会响亮报错（`state file is locked by another process`），而不是互相覆盖不可再生的收件箱 key。多实例请各用各的 `DSH_HOME` / `MSG9_STATE_FILE`。
 

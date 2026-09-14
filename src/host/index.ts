@@ -22,9 +22,10 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { listInbox, streamInbox } from './api.ts'
 import { registerMsg9Commands } from './commands.ts'
+import { resolveCredentials } from './credentials.ts'
 import { BRIDGE_PREFIX, createMsg9Bridge, defaultBridgeDeps, computeUnread, createBridgeEventBus } from './http.ts'
 import { L } from './locale.ts'
-import { loadState, setWatchState, getNotifyPaused, type WorkspaceInbox } from './store.ts'
+import { loadState, setWatchState, getNotifyPaused, type LiveInbox } from './store.ts'
 import { registerMsg9Tools } from './tools.ts'
 import { matchWorkspaceByPath, setWorkspaceRegistry, type WorkspaceRegistryLike } from './workspace.ts'
 import {
@@ -49,8 +50,22 @@ export const inject = ['tools', 'commands', 'sessions'] as const
 // without a cordis host.
 export { BRIDGE_PREFIX, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, invalidateUnreadCache, createBridgeEventBus } from './http.ts'
 export { ensureInbox, migrateInbox, ownerContext, resolveInbox } from './service.ts'
+export {
+  credentialsMigrated,
+  deriveProjectKey,
+  ensureCredentialsMigrated,
+  msg9Home,
+  projectYamlPath,
+  readProjectCredentials,
+  readSigningSeed,
+  resolveCredentials,
+  resolveOwner,
+  saveOwner,
+  signingYamlPath,
+  tenantKeyPath,
+} from './credentials.ts'
 export { listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
-export { loadState, setOwner, stateFilePath, upsertWorkspaceInbox } from './store.ts'
+export { loadState, stateFilePath, upsertWorkspaceInbox, withStateLock } from './store.ts'
 export { WakeBudget, createNonReentrant, createWatchRuntime, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
 
 /** The slice of `@deepseek-ai/dsh-host-webserver` this plugin uses. */
@@ -209,7 +224,19 @@ function startWatcher(
   const rt = createWatchRuntime()
 
   const deps: WatchDeps = {
-    loadState,
+    // state.json 只存热状态：watcher 的 loadState 经 resolveCredentials 回填
+    // 身份与密钥（含惰性迁移），watch.ts 逻辑不变。
+    loadState: async () => {
+      const state = await loadState()
+      await Promise.all(Object.keys(state.workspaces).map(async (key) => {
+        const inbox = state.workspaces[key]!
+        if (!inbox.api_key || !inbox.api_url || !inbox.address) {
+          const resolved = await resolveCredentials(key, { log })
+          if (resolved) state.workspaces[key] = resolved
+        }
+      }))
+      return state
+    },
     setWatchState,
     listInbox: (apiUrl, apiKey, query) => listInbox(apiUrl, apiKey, query),
     onEvent: (event) => events.emit(event),
@@ -329,9 +356,15 @@ function startWatcher(
       const workspace = matchWorkspaceByPath(ctx, cwd)
       if (!workspace) return
       const state = await loadState()
-      const inbox: WorkspaceInbox | undefined = state.workspaces[workspace.key]
-      if (!inbox?.api_key) return
-      const siblings = Object.values(state.workspaces).filter((row) => row.api_key && row.address !== inbox.address)
+      if (!state.workspaces[workspace.key]) return
+      const inbox: LiveInbox | undefined = await resolveCredentials(workspace.key, { log })
+      if (!inbox) return
+      const siblings: LiveInbox[] = []
+      for (const key of Object.keys(state.workspaces)) {
+        if (key === workspace.key) continue
+        const resolved = await resolveCredentials(key, { log })
+        if (resolved && resolved.address !== inbox.address) siblings.push(resolved)
+      }
       const roster = siblings.length > 0
         ? L(
             '\n本实例的其他 workspace 邮箱（跨项目协作对象）：\n{list}\n需要同步进展、结论或请求协助时，用 msg9_send 直接发给它们。',

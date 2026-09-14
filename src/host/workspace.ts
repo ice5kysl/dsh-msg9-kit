@@ -94,6 +94,15 @@ export function listWorkspaces(ctx: Context): CurrentWorkspace[] {
   }
 }
 
+/** 只看注入的 registry（无 ctx 的调用方，如凭据迁移的 cwd: 合一）。 */
+export function listRegisteredWorkspaces(): CurrentWorkspace[] {
+  try {
+    return (injectedRegistry?.list?.() ?? []).map(toCurrent)
+  } catch {
+    return []
+  }
+}
+
 /** One registry workspace by its durable id. */
 export function workspaceByKey(ctx: Context, key: string): CurrentWorkspace | undefined {
   return listWorkspaces(ctx).find((workspace) => workspace.key === key)

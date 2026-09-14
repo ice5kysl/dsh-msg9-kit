@@ -22,6 +22,7 @@ process.env.MSG9_WATCH_MS = '1000'
 process.env.MSG9_WATCH_BATCH_MS = '200'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-watchit-'))
 process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
+process.env.MSG9_HOME = join(stateDir, 'msg9-home')
 delete process.env.MSG9_OWNER_KEY
 
 // ------------------------------------------------------------- fake msg9

@@ -7,9 +7,14 @@
  *
  *   $DSH_HOME/msg9-kit/state.json        (default ~/.dsh/msg9-kit/state.json)
  *   {
- *     "owner":      { "api_key": "msg9_tk_…", "id": "own_…", "api_url": "…" },
- *     "workspaces": { "<workspaceId>": { "address": "…", "api_key": "msg9_sk_…", … } }
+ *     "owner":      { "api_url": "…", "id": "own_…", "slug": "…" },   // 元数据（探测缓存）
+ *     "workspaces": { "<workspaceId>": { "project_key": "…", "title": "…", "cursor": "…" } }
  *   }
+ *
+ * state.json 只放热状态与元数据。身份与密钥（owner key、inbox address/api_key、
+ * signing seed）的唯一真实来源是 msg9 统一凭据仓 `~/.msg9/`（见
+ * credentials.ts）；state.json 里若还读到这些字段，那是凭据仓之前的历史
+ * 残留，读到即触发惰性迁移，迁完删除。
  *
  * The owner key is optional: without it each workspace falls back to public
  * self-registration, which still allows cross-workspace messaging (addresses
@@ -22,8 +27,12 @@ import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/prom
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-export interface OwnerState {
-  api_key: string
+/**
+ * state.json 里持久化的 owner：元数据（探测缓存）+ 迁移前遗留的明文 key。
+ * key 的唯一真实来源是 msg9 统一凭据仓 `~/.msg9/tenants/dsh.key`，
+ * 这里的 `api_key` 是凭据仓之前的历史残留——读到即触发惰性迁移，迁完删除。
+ */
+export interface StoredOwnerState {
   api_url: string
   id?: string
   name?: string
@@ -43,12 +52,22 @@ export interface OwnerState {
    * the server has none (flat namespace).
    */
   address_domain?: string | null
+  /** 凭据迁入 ~/.msg9 的时间（遗留字段清理完成的标记）。 */
+  migrated_at?: string
+  /** 迁移前遗留的 owner key：惰性迁往 ~/.msg9/tenants/dsh.key 后删除。 */
+  api_key?: string
+}
+
+/** 内存里的 owner：api_key 已从凭据仓 / 环境变量 / 遗留字段解析出来。 */
+export interface OwnerState extends StoredOwnerState {
+  api_key: string
 }
 
 export interface WorkspaceInbox {
-  address: string
-  api_key: string
-  api_url: string
+  /** msg9 统一凭据仓里的 project-key（`~/.msg9/projects/dsh/<key>.yaml`）。 */
+  project_key?: string
+  /** 凭据迁入 ~/.msg9 的时间。 */
+  migrated_at?: string
   title: string
   path: string
   /** Incremental inbox cursor (opaque `next_cursor` from the last pull). */
@@ -68,12 +87,6 @@ export interface WorkspaceInbox {
    * to whatever session is newest. */
   last_wake_agent_id?: string
   /**
-   * Ed25519 signing seed (base64, 32-byte RFC 8032) for msg9-sig-v1 sends.
-   * Installed lazily on first use after the v1.3 identity upgrade; the public
-   * half lives on the server (`PUT /agent/signing-key`).
-   */
-  signing_seed?: string
-  /**
    * Local read/processed attribution, keyed by message id. msg9's server-side
    * `read_at` cannot say WHO marked it (the panel and the agent share one key),
    * so the marking channel records itself here until the server grows native
@@ -81,6 +94,21 @@ export interface WorkspaceInbox {
    * marked done); unprocessed mail is what「待处理」filters on.
    */
   marks?: Record<string, MessageMark>
+  // ---- 以下四个字段是 msg9 统一凭据仓之前的历史残留：身份与密钥的唯一真实
+  // 来源是 ~/.msg9/projects/dsh/<project_key>.yaml（+ .signing.yaml），读到
+  // 即触发惰性迁移（见 credentials.ts），迁完从 state.json 删除。
+  address?: string
+  api_key?: string
+  api_url?: string
+  /** Ed25519 signing seed (base64, 32-byte RFC 8032)，迁移前存这里。 */
+  signing_seed?: string
+}
+
+/** 内存里的完整信箱：热状态 + 已从凭据仓解析出的身份与密钥。 */
+export interface LiveInbox extends WorkspaceInbox {
+  address: string
+  api_key: string
+  api_url: string
 }
 
 export interface MessageMark {
@@ -91,7 +119,7 @@ export interface MessageMark {
 }
 
 export interface State {
-  owner?: OwnerState
+  owner?: StoredOwnerState
   workspaces: Record<string, WorkspaceInbox>
   /** Global notification mute: the watcher keeps its cursors advancing (no
    * backlog replay) but never wakes/injects sessions. The panel badge keeps
@@ -171,6 +199,16 @@ function enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
   return run
 }
 
+/**
+ * 在进程内写队列 + 跨进程文件锁内执行一段 read-modify-write。惰性迁移
+ * （credentials.ts）用它把"写凭据 yaml + 清 state 残留"与日常写入串行化。
+ * 注意：任务体内只能直接 loadState/saveState，不能再调 enqueueWrite 系
+ * 函数（会自死锁）。
+ */
+export function withStateLock<T>(task: () => Promise<T>): Promise<T> {
+  return enqueueWrite(task)
+}
+
 // ----------------------------------------------------------- 跨进程文件锁
 // 简单 O_EXCL 锁文件（state.json.lock，内容 {pid, at}），不引第三方依赖。
 // stale 判定：mtime 超过 30s，或持锁 PID 已死——两种都直接拆锁重来。
@@ -232,24 +270,6 @@ async function isStaleLock(lockPath: string): Promise<boolean> {
     }
   }
   return false
-}
-
-/** Effective owner: an explicit env key wins over the saved one. */
-export async function getOwner(): Promise<OwnerState | undefined> {
-  const envKey = process.env.MSG9_OWNER_KEY
-  if (envKey) {
-    return { api_key: envKey, api_url: defaultApiUrl(), name: process.env.MSG9_OWNER_NAME }
-  }
-  const state = await loadState()
-  return state.owner
-}
-
-export async function setOwner(owner: OwnerState): Promise<void> {
-  return enqueueWrite(async () => {
-    const state = await loadState()
-    state.owner = owner
-    await saveState(state)
-  })
 }
 
 /** The global notification mute (panel bell / msg9_notify). */

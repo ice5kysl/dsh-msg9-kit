@@ -16,13 +16,14 @@
 
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 process.env.MSG9KIT_LOCALE = 'en'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-'))
 process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
+process.env.MSG9_HOME = join(stateDir, 'msg9-home')
 delete process.env.MSG9_OWNER_KEY
 
 // ---------------------------------------------------------------- fake msg9
@@ -193,7 +194,7 @@ const workspaces = [
 ]
 const sessionCwd = { 'sess-a': '/work/a', 'sess-b': '/work/b', 'sess-c': '/work/c' }
 
-const { apply, inject, name: pluginName } = await import('../lib/index.js')
+const { apply, inject, name: pluginName, readProjectCredentials, resolveCredentials } = await import('../lib/index.js')
 
 const tools = []
 const commands = []
@@ -322,7 +323,7 @@ await check('msg9_setup validates and stores the owner key', async () => {
   assert.ok(text.includes('Owner configured'), text)
   assert.ok(text.includes('max_agents=50'), text)
   const saved = await readState()
-  assert.equal(saved.owner.api_key, 'msg9_tk_abc')
+  assert.equal(saved.owner.api_key, undefined, '明文 owner key 不进 state.json（在凭据仓）')
   assert.equal(seen.ownerMe, 1)
 })
 
@@ -332,26 +333,32 @@ await check('workspace A inbox is provisioned under the owner, keyed by workspac
   assert.ok(text.includes('[alpha]'), text)
   const saved = await readState()
   const inbox = saved.workspaces['ws-a']
-  assert.ok(inbox.address.startsWith('dsh-alpha-'), inbox.address)
-  assert.ok(inbox.api_key.startsWith('msg9_sk_owner_'), inbox.api_key)
-  assert.deepEqual(seen.ownerCreate[0], [inbox.address.replace('@msg9.io', '')])
+  assert.ok(inbox.project_key, 'state.json 只留 project_key 引用')
+  assert.equal(inbox.api_key, undefined, '明文 key 不进 state.json')
+  const creds = await readProjectCredentials(inbox.project_key)
+  assert.ok(creds.address.startsWith('dsh-alpha-'), creds.address)
+  assert.ok(creds.api_key.startsWith('msg9_sk_owner_'), creds.api_key)
+  assert.deepEqual(seen.ownerCreate[0], [creds.address.replace('@msg9.io', '')])
   // Provisioning writes the yellow-pages profile (v1.5).
   const profile = seen.provisionProfiles[0]
   assert.equal(profile.display_name, 'alpha')
   assert.ok(profile.description.includes('alpha'), JSON.stringify(profile))
   assert.equal(profile.links.workspace, '/work/a')
   assert.equal(profile.visibility, 'public')
-  // …and installs an Ed25519 signing key (v1.3 identity), persisted locally.
+  // …and installs an Ed25519 signing key (v1.3 identity), persisted in the
+  // credentials store (signing yaml), not in state.json.
   assert.equal((seen.signingKeys ?? []).length, 1, 'signing key registered with msg9')
-  assert.ok(inbox.signing_seed, 'the seed is kept in the state file')
+  assert.equal(inbox.signing_seed, undefined, '签名种子不进 state.json')
+  assert.ok((await resolveCredentials('ws-a')).signing_seed, 'the seed is kept in the signing yaml')
 })
 
 await check('workspace B inbox is a separate address (sibling under the same owner)', async () => {
   const text = await tool('msg9_inbox').execute({}, exec('sess-b'))
   assert.ok(text.includes('[Beta Repo]'), text)
   const saved = await readState()
-  assert.ok(saved.workspaces['ws-b'].address.startsWith('dsh-beta-repo-'), saved.workspaces['ws-b'].address)
-  assert.notEqual(saved.workspaces['ws-a'].address, saved.workspaces['ws-b'].address)
+  const creds = await readProjectCredentials(saved.workspaces['ws-b'].project_key)
+  assert.ok(creds.address.startsWith('dsh-beta-repo-'), creds.address)
+  assert.notEqual((await resolveCredentials('ws-a')).address, creds.address)
 })
 
 await check('second inbox pull reuses the stored inbox (no re-provision)', async () => {
@@ -361,9 +368,8 @@ await check('second inbox pull reuses the stored inbox (no re-provision)', async
 
 await check('msg9_peers lists both sibling workspaces', async () => {
   const text = await tool('msg9_peers').execute({})
-  const saved = await readState()
-  assert.ok(text.includes(saved.workspaces['ws-a'].address), text)
-  assert.ok(text.includes(saved.workspaces['ws-b'].address), text)
+  assert.ok(text.includes((await resolveCredentials('ws-a')).address), text)
+  assert.ok(text.includes((await resolveCredentials('ws-b')).address), text)
   // Locally-known inboxes carry title AND path, so the agent can tell what
   // each sibling project is.
   assert.ok(text.includes('(alpha · /work/a)'), text)
@@ -373,23 +379,25 @@ await check('msg9_peers lists both sibling workspaces', async () => {
 })
 
 await check('a workspace can send to a sibling inbox', async () => {
-  const saved = await readState()
+  const addressA = (await resolveCredentials('ws-a')).address
   const text = await tool('msg9_send').execute(
-    { to: saved.workspaces['ws-a'].address, text: 'sync from B', idempotency_key: 'idem-1' },
+    { to: addressA, text: 'sync from B', idempotency_key: 'idem-1' },
     exec('sess-b'),
   )
   assert.ok(text.includes('[Beta Repo]'), text)
   const last = seen.send[seen.send.length - 1]
   assert.equal(last.idempotencyKey, 'idem-1')
-  assert.equal(last.body.to, saved.workspaces['ws-a'].address)
-  assert.ok(last.auth.includes(saved.workspaces['ws-b'].api_key))
+  assert.equal(last.body.to, addressA)
+  assert.ok(last.auth.includes((await resolveCredentials('ws-b')).api_key))
 })
 
 await check('msg9_rotate rotates the current workspace key', async () => {
   const text = await tool('msg9_rotate').execute({}, exec('sess-b'))
   assert.ok(text.includes('Rotated the key'), text)
+  const rotated = (await resolveCredentials('ws-b')).api_key
+  assert.ok(rotated.startsWith('msg9_sk_rotated_'), rotated)
   const saved = await readState()
-  assert.ok(saved.workspaces['ws-b'].api_key.startsWith('msg9_sk_rotated_'), saved.workspaces['ws-b'].api_key)
+  assert.equal(saved.workspaces['ws-b'].api_key, undefined, '轮换只动凭据仓，state.json 无 key')
   assert.equal(seen.rotate.length, 1)
 })
 
@@ -462,12 +470,14 @@ await check('without an owner, a new workspace falls back to public registration
   const saved = await readState()
   delete saved.owner
   await writeState(saved)
+  // owner key 在凭据仓里：要让"未配置 owner"成立，tenants/dsh.key 也得删掉。
+  await rm(join(process.env.MSG9_HOME, 'tenants', 'dsh.key'), { force: true })
   const before = seen.register
   const text = await tool('msg9_inbox').execute({}, exec('sess-c'))
   assert.ok(text.includes('[c]'), text)
   assert.equal(seen.register, before + 1)
-  const after = await readState()
-  assert.ok(after.workspaces['cwd:/work/c'].api_key.startsWith('msg9_sk_pub_'), after.workspaces['cwd:/work/c'].api_key)
+  const creds = (await resolveCredentials('cwd:/work/c'))
+  assert.ok(creds.api_key.startsWith('msg9_sk_pub_'), creds.api_key)
 })
 
 await check('msg9_outbox lists what the workspace sent', async () => {

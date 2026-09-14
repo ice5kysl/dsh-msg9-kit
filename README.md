@@ -189,23 +189,33 @@ you only lose tenant-level lifecycle/quota management.
 | `MSG9_STATE_FILE` | state file path (default `$DSH_HOME/msg9-kit/state.json`) |
 | `MSG9KIT_LOCALE` | `zh` \| `en` language for tool/command output |
 
-State (`~/.dsh/msg9-kit/state.json`, 0600, written atomically):
+**Credential store (since v0.4.0)**: keys no longer live in the state file. The
+owner key is at `~/.msg9/tenants/dsh.key` (0600, one line); each workspace's
+credentials are at `~/.msg9/projects/dsh/<project-key>.yaml` (0600; `address` /
+`api_key` / `api_url` / `created_at`), with the signing seed in the sibling
+`<project-key>.signing.yaml` — the msg9 cross-harness credential contract
+(dirs 0700; override the root with `MSG9_HOME`). The project key derives from
+the workspace's git remote (falling back to dir name + path sha256 first 6).
+**Legacy keys in state.json are lazily migrated on first access** (inside the
+file lock: write the credential store, then clear the old fields; on failure
+the old values stay and migration retries next time).
+
+State (`~/.dsh/msg9-kit/state.json`, 0600, written atomically) — hot state only:
 
 ```jsonc
 {
-  "owner": {
-    "api_key": "msg9_tk_…", "id": "own_…", "name": "dsh",
-    "api_url": "https://api.msg9.io",
-    "slug": "vme", "mail_domain": "msg9.io"   // tenant subdomain, when assigned
-  },
+  "owner": { "id": "own_…", "name": "dsh", "api_url": "https://api.msg9.io",
+             "slug": "vme", "mail_domain": "msg9.io" },
   "workspaces": {
-    "ws-abc123": { "address": "dsh-msg9-io-a1b2@msg9.io", "api_key": "msg9_sk_…", "title": "msg9.io", "path": "/Users/…/msg9.io", "cursor": "…" }
+    "ws-abc123": { "title": "msg9.io", "path": "/Users/…/msg9.io",
+                   "project_key": "github-com-acme-web", "migrated_at": "…",
+                   "cursor": "…", "marks": { "msg_…": { "read_by": "human" } } }
   }
 }
 ```
 
 A state file that fails to parse is never silently discarded: it is copied to
-`state.json.corrupt-*` and reported, because it holds irreplaceable inbox keys.
+`state.json.corrupt-*` and reported.
 
 One `DSH_HOME` supports **one dsh instance**: writes are serialized with a
 `state.json.lock` file lock, so a second instance sharing the same state file

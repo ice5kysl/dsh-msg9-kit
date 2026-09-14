@@ -6,7 +6,8 @@
  */
 
 import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
-import { defaultApiUrl, getOwner, loadState, stateFilePath } from './store.ts'
+import { resolveCredentials, resolveOwner } from './credentials.ts'
+import { defaultApiUrl, loadState, stateFilePath } from './store.ts'
 import { L } from './locale.ts'
 
 function mask(key: string): string {
@@ -20,9 +21,13 @@ export function registerMsg9Commands(commands: CommandRuntime): void {
     name: 'msg9',
     description: L('查看 msg9 owner 与已登记的 workspace 收件箱', 'Show the msg9 owner and registered workspace inboxes'),
     async handler() {
-      const owner = await getOwner()
+      const owner = await resolveOwner()
       const state = await loadState()
-      const rows = Object.values(state.workspaces)
+      const rows: { title: string; address: string }[] = []
+      for (const key of Object.keys(state.workspaces)) {
+        const resolved = await resolveCredentials(key)
+        if (resolved) rows.push({ title: resolved.title, address: resolved.address })
+      }
 
       const head = owner
         ? L('owner：{name}（{key}）  API {api}', 'owner: {name} ({key})  API {api}', {

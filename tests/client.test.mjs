@@ -26,6 +26,8 @@ import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto
 process.env.MSG9KIT_LOCALE = 'en'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-client-'))
 process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
+// 凭据仓也指向临时目录：惰性迁移绝不能把测试夹具写进真实 ~/.msg9。
+process.env.MSG9_HOME = join(stateDir, 'msg9-home')
 delete process.env.MSG9_OWNER_KEY
 
 const require_ = createRequire(import.meta.url)
@@ -335,6 +337,7 @@ const {
   defaultBridgeDeps,
   isTrustedRequest,
   createBridgeEventBus,
+  readProjectCredentials,
 } = await import('../lib/index.js')
 
 const bridge = createMsg9Bridge(defaultBridgeDeps(host))
@@ -1765,10 +1768,12 @@ await check('tenant migration: legacy inbox is re-provisioned and the old one su
   assert.equal(payload.data.moved_mail, 2)
   assert.deepEqual(seen.moveMail.at(-1), { address: 'dsh-alpha-1a2b@msg9.io', to: payload.data.new_address })
 
-  // The state entry now points at the new inbox; old cursors did not survive.
+  // The state entry now references the new inbox via the credentials store
+  // (address/key live in ~/.msg9, not in state.json); old cursors did not survive.
   const state = JSON.parse(await readFile(process.env.MSG9_STATE_FILE, 'utf8'))
-  assert.equal(state.workspaces['ws-a'].address, payload.data.new_address)
   assert.equal(state.workspaces['ws-a'].cursor, undefined)
+  const migratedCreds = await readProjectCredentials(state.workspaces['ws-a'].project_key)
+  assert.equal(migratedCreds.address, payload.data.new_address)
 
   // Overview is clean again.
   const after = await call(`${BRIDGE_PREFIX}/overview`)

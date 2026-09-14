@@ -21,6 +21,7 @@ import { join } from 'node:path'
 process.env.MSG9KIT_LOCALE = 'en'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-cordis-'))
 process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
+process.env.MSG9_HOME = join(stateDir, 'msg9-home')
 delete process.env.MSG9_OWNER_KEY
 await writeFile(process.env.MSG9_STATE_FILE, JSON.stringify({ workspaces: {} }))
 

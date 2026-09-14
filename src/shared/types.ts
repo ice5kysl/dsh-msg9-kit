@@ -43,6 +43,8 @@ export interface OverviewView {
   owner: OwnerView | null
   api_url: string
   state_file: string
+  /** state.json 已无任何明文凭据（全部迁入 ~/.msg9 凭据仓）。 */
+  credentials_migrated?: boolean
   current: WorkspaceView | null
   workspaces: WorkspaceView[]
 }

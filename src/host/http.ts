@@ -49,7 +49,8 @@ import {
   sendMessage,
 } from './api.ts'
 import { ensureInbox, ensureSigningKey, maskKey, migrateInbox, ownerContext, type InboxContext } from './service.ts'
-import { defaultApiUrl, getNotifyPaused, loadState, setMessageMark, setNotifyPaused, setOwner, stateFilePath, type OwnerState, type State } from './store.ts'
+import { credentialsMigrated, resolveCredentials, saveOwner } from './credentials.ts'
+import { defaultApiUrl, getNotifyPaused, loadState, setMessageMark, setNotifyPaused, stateFilePath, type LiveInbox, type OwnerState, type State } from './store.ts'
 import type { OverviewView, WorkspaceView } from '../shared/types.ts'
 import {
   deriveAddress,
@@ -91,6 +92,8 @@ export interface BridgeDeps {
   listWorkspaces(): CurrentWorkspace[]
   matchWorkspaceByPath(cwd: string | undefined): CurrentWorkspace | undefined
   log(message: string): void
+  /** 凭据解析（含惰性迁移）；缺省走 credentials.ts 的真实实现。 */
+  resolveCredentials?(key: string): Promise<LiveInbox | undefined>
   /** Optional SSE invalidation bus (clients stop polling /unread when present). */
   events?: BridgeEventBus
 }
@@ -132,6 +135,11 @@ export interface Msg9Bridge {
   handle(req: IncomingMessage, res: ServerResponse): Promise<void>
 }
 
+/** 经 deps 注入点解析凭据（测试可替换），缺省走 credentials.ts。 */
+function resolveVia(deps: BridgeDeps, key: string): Promise<LiveInbox | undefined> {
+  return deps.resolveCredentials ? deps.resolveCredentials(key) : resolveCredentials(key, { log: deps.log })
+}
+
 export interface UnreadView {
   total: number
   byKey: Record<string, number>
@@ -167,7 +175,12 @@ export async function computeUnread(deps: BridgeDeps, signal: AbortSignal, optio
   void signal
   unreadInflight = (async () => {
     const state = await deps.loadState()
-    const rows = Object.entries(state.workspaces).filter(([, inbox]) => Boolean(inbox.api_key))
+    // 统一从凭据仓解析（含惰性迁移）；解析不到的 entry 不参与计数。
+    const keys = Object.keys(state.workspaces)
+    const resolved = await Promise.all(keys.map((key) => resolveVia(deps, key)))
+    const rows = keys
+      .map((key, index) => [key, resolved[index]] as const)
+      .filter((pair): pair is readonly [string, LiveInbox] => Boolean(pair[1]))
     const settled = await Promise.allSettled(
       rows.map(async ([key, inbox]) => {
         // folder=all: one call yields both the mailbox size and the unread count.
@@ -426,20 +439,28 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         current: workspace.key === currentKey,
       })
     }
+    // 统一从凭据仓解析（含惰性迁移）：address 与 provisioned 以解析结果为准。
+    const resolvedByKey = new Map<string, LiveInbox>()
+    await Promise.all(Object.keys(state.workspaces).map(async (key) => {
+      const resolved = await resolveVia(deps, key)
+      if (resolved) resolvedByKey.set(key, resolved)
+    }))
     for (const [key, inbox] of Object.entries(state.workspaces)) {
       const existing = rows.get(key)
+      const resolved = resolvedByKey.get(key)
+      const address = resolved?.address ?? null
       // Legacy = provisioned under a previous tenant: the address lives
       // outside the current tenant domain and should be migrated.
-      const legacy = Boolean(inbox.api_key && tenantMode && inbox.address && !inbox.address.endsWith(`@${domain}`))
+      const legacy = Boolean(resolved && tenantMode && address && !address.endsWith(`@${domain}`))
       rows.set(key, {
         key,
         title: inbox.title || existing?.title || key,
         path: inbox.path || existing?.path || '',
-        address: inbox.address,
-        planned_address: inbox.api_key
+        address,
+        planned_address: resolved
           ? (legacy ? planned({ key, title: inbox.title || existing?.title || key, path: inbox.path || existing?.path || '' }) : null)
           : (existing?.planned_address ?? null),
-        provisioned: Boolean(inbox.api_key),
+        provisioned: Boolean(resolved),
         legacy,
         cursor: inbox.cursor ?? null,
         current: key === currentKey,
@@ -455,12 +476,11 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
 
   /** The inbox behind a state key, provisioning it when the workspace is known. */
   async function inboxFor(key: string, signal: AbortSignal): Promise<InboxContext> {
-    const state = await deps.loadState()
-    const existing = state.workspaces[key]
-    if (existing?.api_key) {
+    const resolved = await resolveVia(deps, key)
+    if (resolved) {
       return {
-        workspace: { key, title: existing.title, path: existing.path },
-        inbox: existing.signing_seed ? existing : await ensureSigningKey(key, existing, deps.log),
+        workspace: { key, title: resolved.title, path: resolved.path },
+        inbox: resolved.signing_seed ? resolved : await ensureSigningKey(resolved, deps.log),
         provisioned: false,
       }
     }
@@ -502,6 +522,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       } : null,
       api_url: owner?.api_url || apiUrl,
       state_file: deps.stateFilePath(),
+      // 在 workspaceViews 之后取：解析过程可能刚完成惰性迁移。
+      credentials_migrated: await credentialsMigrated(),
       current: workspaces.find((row) => row.current) ?? null,
       workspaces,
     }
@@ -509,7 +531,11 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
 
   async function peers(signal: AbortSignal): Promise<{ address: string; title: string | null; path: string | null; local: boolean }[]> {
     const state = await deps.loadState()
-    const localByAddress = new Map(Object.values(state.workspaces).map((inbox) => [inbox.address, inbox]))
+    const localByAddress = new Map<string, LiveInbox>()
+    await Promise.all(Object.keys(state.workspaces).map(async (key) => {
+      const resolved = await resolveVia(deps, key)
+      if (resolved) localByAddress.set(resolved.address, resolved)
+    }))
     const { owner } = await ownerContext()
 
     if (owner?.api_key) {
@@ -524,7 +550,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         capabilities: row.profile?.capabilities ?? [],
       }))
     }
-    return Object.values(state.workspaces).map((inbox) => ({
+    return [...localByAddress.values()].map((inbox) => ({
       address: inbox.address,
       title: inbox.title,
       path: inbox.path,
@@ -854,7 +880,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       const slug = typeof me.slug === 'string' ? me.slug : null
       const mailDomain = typeof me.mail_domain === 'string' ? me.mail_domain : undefined
       const addressDomain = typeof me.address_domain === 'string' ? me.address_domain : null
-      await setOwner({ api_key: ownerKey, api_url: apiUrl, id, name, slug, mail_domain: mailDomain, address_domain: addressDomain })
+      await saveOwner({ api_key: ownerKey, api_url: apiUrl, id, name, slug, mail_domain: mailDomain, address_domain: addressDomain })
       invalidateUnreadCache()
       return ok(res, {
         owner: {
@@ -876,9 +902,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       const body = await readJsonBody(req)
       const key = str(body.key)
       if (!key) throw new BridgeError(400, 'missing-key', 'field "key" is required')
-      const state = await deps.loadState()
-      const existing = state.workspaces[key]
-      if (!existing?.api_key) throw new BridgeError(404, 'unknown-workspace', `no inbox is registered as "${key}"`)
+      const existing = await resolveVia(deps, key)
+      if (!existing) throw new BridgeError(404, 'unknown-workspace', `no inbox is registered as "${key}"`)
       const workspace = deps.listWorkspaces().find((row) => row.key === key)
         ?? { key, title: existing.title, path: existing.path }
       const result = await migrateInbox(workspace, existing, str(body.old_owner_key))

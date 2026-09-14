@@ -22,7 +22,7 @@
 
 import type { InboxMessage, InboxPage } from './api.ts'
 import { bodyText, truncate } from '../shared/message.ts'
-import type { State, WorkspaceInbox } from './store.ts'
+import type { LiveInbox, State } from './store.ts'
 
 /** The live-agent face the watcher delivers to (subset of dsh's agent). */
 export interface WatchAgent {
@@ -44,7 +44,7 @@ export interface WatchDeps {
   setWatchState(key: string, patch: { watch_cursor?: string; watch_last_message_id?: string; watch_last_seen_at?: string; last_wake_agent_id?: string }): Promise<void>
   listInbox(apiUrl: string, apiKey: string, query: { folder?: string; limit?: number; since?: string }): Promise<InboxPage>
   /** The workspace's live agent, if any (delivery is skipped when offline). */
-  resolveAgent(workspace: { key: string; inbox: WorkspaceInbox }): WatchAgent | undefined | Promise<WatchAgent | undefined>
+  resolveAgent(workspace: { key: string; inbox: LiveInbox }): WatchAgent | undefined | Promise<WatchAgent | undefined>
   /** Sticky-target lookup: is this session still alive? */
   resolveAgentById?(id: string): WatchAgent | undefined
   /** SSE invalidation hook: fired when fresh mail is SEEN (before delivery). */
@@ -177,9 +177,12 @@ export function createNonReentrant(task: () => Promise<void>): () => void {
 export async function pollOnce(deps: WatchDeps, rt: WatchRuntime): Promise<void> {
   const state = await deps.loadState()
   for (const [key, inbox] of Object.entries(state.workspaces)) {
-    if (!inbox.api_key) continue
+    // state.json 迁移后不再存密钥：生产接线（index.ts）的 loadState 会经
+    // resolveCredentials 回填；测试替身直接给完整 inbox。缺身份/密钥的
+    // entry（凭据丢失）跳过，不当作致命错误。
+    if (!inbox.api_key || !inbox.api_url || !inbox.address) continue
     try {
-      await pollInbox(deps, rt, key, inbox)
+      await pollInbox(deps, rt, key, inbox as LiveInbox)
     } catch (error) {
       deps.log(`watch poll failed for ${key}: ${(error as Error)?.message ?? String(error)}`)
       // v1.17 对齐 stream 模式：429 要读 Retry-After 退避，而不是下个周期
@@ -251,8 +254,9 @@ export async function streamInboxLoop(
   let failures = 0
   while (!signal.aborted) {
     const state = await deps.loadState()
-    const inbox = state.workspaces[key]
-    if (!inbox?.api_key) return
+    const raw = state.workspaces[key]
+    if (!raw?.api_key || !raw.api_url || !raw.address) return
+    const inbox = raw as LiveInbox
     try {
       if (!inbox.watch_cursor) {
         await pollInbox(deps, rt, key, inbox)
@@ -295,7 +299,7 @@ export async function streamInboxLoop(
   }
 }
 
-async function pollInbox(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: WorkspaceInbox): Promise<void> {
+async function pollInbox(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: LiveInbox): Promise<void> {
   const since = inbox.watch_cursor
   if (since) {
     const page = await deps.listInbox(inbox.api_url, inbox.api_key, { folder: 'all', limit: 20, since })
@@ -342,7 +346,7 @@ async function pollInbox(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: 
  * becomes ONE interruption, delivered whole. The mute check happens here so
  * paused mail is tracked (cursor already advanced) but never replayed later.
  */
-async function enqueueDelivery(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: WorkspaceInbox, messages: InboxMessage[]): Promise<void> {
+async function enqueueDelivery(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: LiveInbox, messages: InboxMessage[]): Promise<void> {
   if (await deps.isPaused?.()) {
     deps.log(`watch: notify paused — ${messages.length} mail(s) for ${inbox.address} tracked silently`)
     return
@@ -357,7 +361,7 @@ async function enqueueDelivery(deps: WatchDeps, rt: WatchRuntime, key: string, i
 }
 
 /** Deliver the coalesced batch of one inbox (also the batching test's entry). */
-export async function flushBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: WorkspaceInbox): Promise<void> {
+export async function flushBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: LiveInbox): Promise<void> {
   const batch = rt.batches.get(key)
   if (!batch) return
   if (batch.timer) clearTimeout(batch.timer)
@@ -385,7 +389,7 @@ export async function flushBatch(deps: WatchDeps, rt: WatchRuntime, key: string,
  */
 export async function onlyUnprocessed(
   deps: WatchDeps,
-  inbox: WorkspaceInbox,
+  inbox: LiveInbox,
   messages: InboxMessage[],
 ): Promise<InboxMessage[]> {
   if (messages.length === 0) return messages
@@ -403,7 +407,7 @@ export async function onlyUnprocessed(
   }
 }
 
-async function deliverBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: WorkspaceInbox, messages: InboxMessage[]): Promise<void> {
+async function deliverBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: LiveInbox, messages: InboxMessage[]): Promise<void> {
   // v1.13 alignment + v1.20 hardening: a message already closed ANYWHERE
   // (panel, this agent via tools, another client) must not wake anyone again.
   // The cursor tracks "notified", not "handled", so the server decides here.

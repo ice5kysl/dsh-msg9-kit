@@ -18,13 +18,14 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer, request } from 'node:http'
-import { mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 process.env.MSG9KIT_LOCALE = 'en'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-hostfix-'))
 process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
+process.env.MSG9_HOME = join(stateDir, 'msg9-home')
 delete process.env.MSG9_OWNER_KEY
 
 const {
@@ -38,6 +39,10 @@ const {
   migrateInbox,
   ownerContext,
   pollOnce,
+  readProjectCredentials,
+  readSigningSeed,
+  resolveCredentials,
+  saveOwner,
   upsertWorkspaceInbox,
 } = await import('../lib/index.js')
 
@@ -268,13 +273,15 @@ await check('#3: msg9_rotate 不盖旧 cursor/marks/watch_*', async () => {
   const text = await rotate.execute({}, { agent: { id: 'sess-b' } })
   assert.ok(text.includes('Rotated the key'), text)
 
+  const resolved = await resolveCredentials('ws-b')
+  assert.equal(resolved.api_key, 'msg9_sk_rotated_1', '新 key 已保存（凭据仓）')
+  assert.equal(resolved.signing_seed, 'c2VlZA==', '签名种子保留')
   const saved = (await readState()).workspaces['ws-b']
-  assert.equal(saved.api_key, 'msg9_sk_rotated_1', '新 key 已保存')
+  assert.equal(saved.api_key, undefined, 'state.json 不存 key')
   assert.equal(saved.cursor, 'C1', 'cursor 不被快照盖旧')
   assert.equal(saved.watch_cursor, 'W1', 'watch_cursor 保留')
   assert.equal(saved.watch_last_seen_at, '2026-09-13T01:00:00Z', 'watch_last_seen_at 保留')
   assert.deepEqual(saved.marks, { m1: { read_by: 'agent' } }, 'marks 保留')
-  assert.equal(saved.signing_seed, 'c2VlZA==', '签名种子保留')
 })
 
 // ------------------------------------- #4: /unread 缓存 + 合并 + 失败沿用快照
@@ -282,15 +289,17 @@ await check('#3: msg9_rotate 不盖旧 cursor/marks/watch_*', async () => {
 function unreadDeps(pages) {
   // pages: (key) => page | Error — 每次调用按 key 取
   const calls = []
+  const state = {
+    workspaces: {
+      'ws-u-a': { address: 'ua@msg9.io', api_key: 'k1', api_url: apiUrl, title: 'a', path: '/a' },
+      'ws-u-b': { address: 'ub@msg9.io', api_key: 'k2', api_url: apiUrl, title: 'b', path: '/b' },
+    },
+  }
   return {
     calls,
     deps: {
-      loadState: async () => ({
-        workspaces: {
-          'ws-u-a': { address: 'ua@msg9.io', api_key: 'k1', api_url: apiUrl, title: 'a', path: '/a' },
-          'ws-u-b': { address: 'ub@msg9.io', api_key: 'k2', api_url: apiUrl, title: 'b', path: '/b' },
-        },
-      }),
+      loadState: async () => state,
+      resolveCredentials: async (key) => state.workspaces[key],
       api: {
         listInbox: async (_url, key) => {
           calls.push(key)
@@ -394,10 +403,9 @@ await check('#6: 轮询模式 429 读 Retry-After 退避', async () => {
 // --------------------------------------------------- #7: owner 探测负缓存
 
 await check('#7: owner 探测失败有一分钟负缓存', async () => {
-  await writeState({
-    owner: { api_key: 'msg9_tk_bad', api_url: apiUrl }, // slug/address_domain 未探测 → 触发惰性探测
-    workspaces: {},
-  })
+  // 失效的 key 直接放凭据仓（state 只留元数据，slug 未探测 → 触发惰性探测）
+  await writeState({ workspaces: {} })
+  await saveOwner({ api_key: 'msg9_tk_bad', api_url: apiUrl })
   const before = seen.ownerMeBad
   const first = await ownerContext()
   const second = await ownerContext()
@@ -415,6 +423,8 @@ const OLD_INBOX = {
 }
 
 async function seedMigrationState() {
+  // 凭据仓为准：清掉上一个夹具留下的 tenant key，让本夹具的遗留 key 走迁移。
+  await rm(join(process.env.MSG9_HOME, 'tenants', 'dsh.key'), { force: true })
   await writeState({
     owner: { api_key: 'msg9_tk_good', api_url: apiUrl, slug: 'vme', mail_domain: 'msg9.io', address_domain: 'vme.msg9.io' },
     workspaces: { 'ws-m': { ...OLD_INBOX } },
@@ -431,10 +441,12 @@ await check('#8: 转发失败则中止迁移，state 仍指向旧信箱', async 
       /forwarding|转发/,
     )
     assert.deepEqual(seen.order, ['provision', 'signing-key', 'forwarding'], '到转发为止，没有后续步骤')
-    const saved = await readState()
-    assert.equal(saved.workspaces['ws-m'].address, OLD_INBOX.address, '旧地址原样保留')
-    assert.equal(saved.workspaces['ws-m'].api_key, OLD_INBOX.api_key, '旧 key 原样保留')
-    assert.equal(saved.workspaces['ws-m'].cursor, 'OLDC', '旧 cursor 不动')
+    const entry = (await readState()).workspaces['ws-m']
+    assert.equal(entry.cursor, 'OLDC', '旧 cursor 不动')
+    // 旧凭据原样保留（惰性迁移已把它们挪进凭据仓，activate 没有执行）。
+    const kept = await readProjectCredentials(entry.project_key)
+    assert.equal(kept.address, OLD_INBOX.address, '凭据仓仍指向旧信箱')
+    assert.equal(kept.api_key, OLD_INBOX.api_key, '旧 key 原样保留')
     assert.equal(seen.moveMail.length, 0)
     assert.equal(seen.disabled.length, 0)
   } finally {
@@ -452,11 +464,14 @@ await check('#8: 转发成功后（且先于搬信/停用）才替换 state', as
   assert.deepEqual(seen.order, ['provision', 'signing-key', 'forwarding', 'move-mail', 'disable'])
   assert.equal(seen.forwarding.at(-1).auth, `Bearer ${OLD_INBOX.api_key}`, '转发用旧信箱自己的 key 设置')
   assert.equal(seen.forwarding.at(-1).target, result.inbox.address)
-  const saved = await readState()
-  assert.equal(saved.workspaces['ws-m'].address, result.inbox.address, 'state 换成新信箱')
-  assert.equal(saved.workspaces['ws-m'].api_key, 'msg9_sk_migrated')
-  assert.equal(saved.workspaces['ws-m'].cursor, undefined, '旧 cursor 不随迁（属于旧信箱的流）')
-  assert.ok(saved.workspaces['ws-m'].signing_seed, '签名种子随替换落库')
+  const entry = (await readState()).workspaces['ws-m']
+  assert.ok(entry.project_key, 'state 只留 project_key 引用')
+  assert.equal(entry.api_key, undefined, 'state.json 不存 key')
+  assert.equal(entry.cursor, undefined, '旧 cursor 不随迁（属于旧信箱的流）')
+  const creds = await readProjectCredentials(entry.project_key)
+  assert.equal(creds.address, result.inbox.address, '凭据仓换成新信箱')
+  assert.equal(creds.api_key, 'msg9_sk_migrated')
+  assert.ok(await readSigningSeed(entry.project_key), '签名种子随替换落凭据仓')
 })
 
 // --------------------------------------- #9: bootstrap 补记 watch_last_seen_at

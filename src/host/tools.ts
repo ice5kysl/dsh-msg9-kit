@@ -45,17 +45,21 @@ import {
   DEFAULT_WORKSPACE,
 } from './service.ts'
 import {
+  resolveCredentials,
+  resolveOwner,
+  saveOwner,
+  writeProjectCredentials,
+} from './credentials.ts'
+import {
   defaultApiUrl,
   getNotifyPaused,
-  getOwner,
   loadState,
   setCursor,
   setLastMessageId,
   setMessageMark,
   setNotifyPaused,
-  setOwner,
   stateFilePath,
-  upsertWorkspaceInbox,
+  type LiveInbox,
 } from './store.ts'
 import { resolveWorkspace } from './workspace.ts'
 import { L } from './locale.ts'
@@ -157,7 +161,7 @@ export function registerMsg9Tools(ctx: Context): void {
         const me = await ownerMe(apiUrl, args.owner_key, exec?.signal)
         const ownerId = typeof me?.id === 'string' ? me.id : undefined
         const ownerName = typeof me?.name === 'string' ? me.name : undefined
-        await setOwner({ api_key: args.owner_key, api_url: apiUrl, id: ownerId, name: ownerName })
+        await saveOwner({ api_key: args.owner_key, api_url: apiUrl, id: ownerId, name: ownerName })
 
         const quota = (me?.quota ?? {}) as Record<string, unknown>
         const maxAgents = quota.max_agents
@@ -462,10 +466,12 @@ export function registerMsg9Tools(ctx: Context): void {
     async execute(args, exec) {
       try {
         const state = await loadState()
-        const localByAddress = new Map(
-          Object.values(state.workspaces).map((inbox) => [inbox.address, inbox] as const),
-        )
-        const owner = await getOwner()
+        const localByAddress = new Map<string, LiveInbox>()
+        await Promise.all(Object.keys(state.workspaces).map(async (key) => {
+          const resolved = await resolveCredentials(key)
+          if (resolved) localByAddress.set(resolved.address, resolved)
+        }))
+        const owner = await resolveOwner()
 
         if (owner?.api_key) {
           const limit = Math.max(1, Math.min(args.limit ?? 100, 200))
@@ -489,7 +495,7 @@ export function registerMsg9Tools(ctx: Context): void {
           )
         }
 
-        const local = Object.values(state.workspaces)
+        const local = [...localByAddress.values()]
         if (local.length === 0) {
           return L(
             '本机还没有为任何 workspace 开通收件箱（也未配置 owner）。先运行 msg9_inbox 即可自动开通当前 workspace。',
@@ -518,17 +524,19 @@ export function registerMsg9Tools(ctx: Context): void {
     async execute(_args, exec) {
       try {
         const { workspace, inbox } = await resolveInbox(ctx, exec)
-        const owner = await getOwner()
+        const owner = await resolveOwner()
         if (!owner?.api_key) {
           return L(
             '未配置 owner，无法轮换 key。请先用 msg9_setup 配置 owner（或重新注册该 workspace）。',
             'No owner configured, so the key cannot be rotated. Run msg9_setup first (or re-register this workspace).',
           )
         }
+        if (!inbox.project_key) {
+          return L('凭据迁移未完成，请稍后重试。', 'Credentials migration is not complete; try again.')
+        }
         const { api_key } = await ownerRotateAgentKey(owner.api_url, owner.api_key, inbox.address, exec?.signal)
-        // 只回写 api_key：此处的 inbox 是上游调用前的快照，spread 回去会把
-        // 期间已推进的 cursor/marks/watch_* 盖旧（upsert 是 merge 语义）。
-        await upsertWorkspaceInbox(workspace.key, { api_key })
+        // 新 key 覆盖写凭据仓的 project yaml（state.json 本就不存 key）。
+        await writeProjectCredentials(inbox.project_key, { address: inbox.address, api_key, api_url: inbox.api_url }, { overwrite: true })
         return L(
           '已轮换「{title}」({address}) 的 key，新 key 已保存。',
           'Rotated the key for "{title}" ({address}); the new key is saved.',
@@ -550,10 +558,10 @@ export function registerMsg9Tools(ctx: Context): void {
     },
     output: TEXT_OUTPUT,
     async execute(args, exec) {
-      const owner = await getOwner()
+      const owner = await resolveOwner()
       const state = await loadState()
       const workspace = resolveWorkspace(ctx, exec) ?? DEFAULT_WORKSPACE
-      const inbox = state.workspaces[workspace.key]
+      const inbox = await resolveCredentials(workspace.key)
       const inboxCount = Object.keys(state.workspaces).length
 
       const lines = [

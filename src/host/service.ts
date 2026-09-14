@@ -12,25 +12,32 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { ownerCreateAgents, ownerDisableAgent, ownerMe, ownerMoveMail, registerAgent, setForwarding, setSigningKey, type AgentProfile, type RegisteredAgent } from './api.ts'
+import {
+  allocateProjectKey,
+  ensureCredentialsMigrated,
+  readProjectCredentials,
+  resolveCredentials,
+  resolveOwner,
+  saveOwner,
+  writeProjectCredentials,
+  writeSigningSeed,
+} from './credentials.ts'
 import { generateSigningMaterial } from './signing.ts'
 import { L } from './locale.ts'
 import {
   defaultApiUrl,
-  deleteWorkspaceInbox,
-  getOwner,
-  getWorkspaceInbox,
+  loadState,
   replaceWorkspaceInbox,
-  setOwner,
   upsertWorkspaceInbox,
+  type LiveInbox,
   type OwnerState,
-  type WorkspaceInbox,
 } from './store.ts'
 import { deriveAddress, deriveTenantFallback, resolveWorkspace, type CallerAgent, type CurrentWorkspace } from './workspace.ts'
 
 /** A resolved workspace together with its msg9 inbox. */
 export interface InboxContext {
   workspace: CurrentWorkspace
-  inbox: WorkspaceInbox
+  inbox: LiveInbox
   /** True when this call created the inbox. */
   provisioned: boolean
 }
@@ -44,7 +51,7 @@ let ownerProbeFailedAt = 0
 
 /** Effective owner (tenant) and API base for this process. */
 export async function ownerContext(): Promise<{ owner: OwnerState | undefined; apiUrl: string }> {
-  const owner = await getOwner()
+  const owner = await resolveOwner()
   const apiUrl = owner?.api_url || defaultApiUrl()
   // One-time lazy probe: an owner bound before the server learned about tenant
   // slugs has `slug === undefined` in the state file. Ask /owner/me once and
@@ -66,7 +73,7 @@ export async function ownerContext(): Promise<{ owner: OwnerState | undefined; a
         ...(typeof me.mail_domain === 'string' ? { mail_domain: me.mail_domain } : {}),
         address_domain: typeof me.address_domain === 'string' ? me.address_domain : null,
       }
-      await setOwner(probed)
+      await saveOwner(probed)
       ownerProbeFailedAt = 0
       return { owner: probed, apiUrl }
     } catch {
@@ -105,23 +112,30 @@ export function ensureInbox(workspace: CurrentWorkspace, signal?: AbortSignal): 
   ])
 }
 
-async function provision(workspace: CurrentWorkspace): Promise<InboxContext> {
-  let existing = await getWorkspaceInbox(workspace.key)
-  if (!existing?.api_key) {
-    // Key-continuity migration: before the workspace registry was injected
-    // properly, every workspace fell back to a `cwd:<path>` bucket. Move such
-    // an inbox under the registry key instead of provisioning a second one.
-    const legacyKey = `cwd:${workspace.path}`
-    if (legacyKey !== workspace.key) {
-      const legacy = await getWorkspaceInbox(legacyKey)
-      if (legacy?.api_key) {
-        await upsertWorkspaceInbox(workspace.key, legacy)
-        await deleteWorkspaceInbox(legacyKey)
-        existing = legacy
-      }
+/** 已被其他 workspace 占用的 project-key（冲突检测用）。 */
+async function takenProjectKeys(): Promise<Map<string, string>> {
+  const state = await loadState()
+  const taken = new Map<string, string>()
+  for (const inbox of Object.values(state.workspaces)) {
+    if (!inbox.project_key) continue
+    const creds = await readProjectCredentials(inbox.project_key)
+    if (creds) taken.set(inbox.project_key, creds.address)
+  }
+  return taken
+}
+
+async function provision(workspace: CurrentWorkspace, log?: (message: string) => void): Promise<InboxContext> {
+  let existing = await resolveCredentials(workspace.key, { log })
+  if (!existing) {
+    // 还没解析到：可能有未合一的 cwd:<path> bucket（registry 后补的场景）。
+    // ensureCredentialsMigrated 内含 cwd: 合一，跑一次再解析。
+    const state = await loadState()
+    if (Object.keys(state.workspaces).some((key) => key.startsWith('cwd:'))) {
+      await ensureCredentialsMigrated({ log })
+      existing = await resolveCredentials(workspace.key, { log })
     }
   }
-  if (existing?.api_key) return { workspace, inbox: await ensureSigningKey(workspace.key, existing), provisioned: false }
+  if (existing) return { workspace, inbox: await ensureSigningKey(existing, log), provisioned: false }
 
   const { owner, apiUrl } = await ownerContext()
   const profile = workspaceProfile(workspace)
@@ -129,25 +143,32 @@ async function provision(workspace: CurrentWorkspace): Promise<InboxContext> {
     ? await provisionUnderOwner(apiUrl, owner, workspace, profile)
     : await registerAgent(apiUrl, deriveAddress(workspace), undefined, profile)
 
-  const inbox: WorkspaceInbox = {
+  // 身份与密钥落 msg9 统一凭据仓（0600/0700）；state.json 只留热状态 +
+  // project_key 引用，明文 key 与 signing seed 不进 state.json。
+  const projectKey = await allocateProjectKey(workspace, agent.address, await takenProjectKeys(), log ?? (() => {}))
+  await writeProjectCredentials(projectKey, { address: agent.address, api_key: agent.api_key, api_url: apiUrl })
+  await upsertWorkspaceInbox(workspace.key, { title: workspace.title, path: workspace.path, project_key: projectKey })
+  const inbox: LiveInbox = {
+    title: workspace.title,
+    path: workspace.path,
+    project_key: projectKey,
     address: agent.address,
     api_key: agent.api_key,
     api_url: apiUrl,
-    title: workspace.title,
-    path: workspace.path,
   }
-  await upsertWorkspaceInbox(workspace.key, inbox)
-  return { workspace, inbox: await ensureSigningKey(workspace.key, inbox), provisioned: true }
+  return { workspace, inbox: await ensureSigningKey(inbox, log), provisioned: true }
 }
 
 /**
  * Lazily install this inbox's Ed25519 signing key (v1.3 identity): generate a
  * seed, register the public half with msg9 (first-time installs need only
- * API-key auth), persist the seed. Servers without the identity layer skip
+ * API-key auth), persist the seed to the credentials store
+ * (`<project-key>.signing.yaml`). Servers without the identity layer skip
  * quietly — unsigned sends are still accepted (warn mode).
  */
-export async function ensureSigningKey(key: string, inbox: WorkspaceInbox, log?: (message: string) => void): Promise<WorkspaceInbox> {
+export async function ensureSigningKey(inbox: LiveInbox, log?: (message: string) => void): Promise<LiveInbox> {
   if (inbox.signing_seed) return inbox
+  if (!inbox.project_key) return inbox // 凭据迁移未完成：不装签名，下次再试
   const material = generateSigningMaterial()
   try {
     await setSigningKey(inbox.api_url, inbox.api_key, material.publicKey)
@@ -159,9 +180,8 @@ export async function ensureSigningKey(key: string, inbox: WorkspaceInbox, log?:
     log?.(`msg9 signing key install failed for ${inbox.address}: ${(error as Error)?.message ?? String(error)}`)
     return inbox
   }
-  const signed = { ...inbox, signing_seed: material.seed }
-  await upsertWorkspaceInbox(key, signed)
-  return signed
+  await writeSigningSeed(inbox.project_key, material.seed)
+  return { ...inbox, signing_seed: material.seed }
 }
 
 /**
@@ -219,24 +239,26 @@ function workspaceProfile(workspace: CurrentWorkspace): AgentProfile {
  *      re-register it and hijack delivery. If this FAILS the migration aborts
  *      with a clear error and the local state is left untouched — replacing
  *      the state first would silently strand mail in the old mailbox;
- *   3. only then replace the state entry (cursors reset — they belong to the
- *      old inbox's stream), and when the previous tenant's key is supplied:
- *      move the old inbox's history over (same-tenant only — cross-tenant
- *      move-mail is a 403 the server refuses, reported in the note) and
- *      suspend the old agent. The forwarding rule survives the release.
+ *   3. only then switch local state: the new credentials overwrite the
+ *      workspace's project yaml in the credentials store (the old yaml pointed
+ *      at the old inbox) and the state entry is replaced (cursors reset —
+ *      they belong to the old inbox's stream); when the previous tenant's key
+ *      is supplied: move the old inbox's history over (same-tenant only —
+ *      cross-tenant move-mail is a 403 the server refuses, reported in the
+ *      note) and suspend the old agent. The forwarding rule survives the
+ *      release.
  */
 export async function migrateInbox(
   workspace: CurrentWorkspace,
-  oldInbox: WorkspaceInbox,
+  oldInbox: LiveInbox,
   oldOwnerKey?: string,
-): Promise<{ inbox: WorkspaceInbox; oldDisabled: boolean; forwarding: boolean; movedMail: number | null; note?: string }> {
+): Promise<{ inbox: LiveInbox; oldDisabled: boolean; forwarding: boolean; movedMail: number | null; note?: string }> {
   const { owner, apiUrl } = await ownerContext()
   if (!owner?.api_key) {
     throw new Error(L('还没有绑定租户，无法迁移。', 'No tenant is bound; cannot migrate.'))
   }
   const agent = await provisionUnderOwner(apiUrl, owner, workspace, workspaceProfile(workspace))
-  // 签名材料只在内存里备好：转发没设成之前 state 必须仍指向旧信箱，
-  // 所以不能走 ensureSigningKey（它会立刻 upsert 落库）。
+  // 签名材料只在内存里备好：转发没设成之前 state/凭据仓必须仍指向旧信箱。
   let signingSeed: string | undefined
   try {
     const material = generateSigningMaterial()
@@ -245,16 +267,30 @@ export async function migrateInbox(
   } catch {
     /* 服务端没有身份层：跳过，未签名发送仍被接受（warn 模式） */
   }
-  const inbox: WorkspaceInbox = {
-    address: agent.address,
-    api_key: agent.api_key,
-    api_url: apiUrl,
-    title: workspace.title,
-    path: workspace.path,
-    ...(signingSeed ? { signing_seed: signingSeed } : {}),
+
+  /** 新凭据落凭据仓（覆盖该 project 的旧凭据——它指向旧信箱）+ 切换 state。 */
+  const activate = async (): Promise<LiveInbox> => {
+    const entry = (await loadState()).workspaces[workspace.key]
+    const taken = await takenProjectKeys()
+    if (entry?.project_key) taken.delete(entry.project_key) // 自己占的 key 可复用
+    const projectKey = entry?.project_key
+      ?? await allocateProjectKey(workspace, agent.address, taken, () => {})
+    await writeProjectCredentials(projectKey, { address: agent.address, api_key: agent.api_key, api_url: apiUrl }, { overwrite: true })
+    if (signingSeed) await writeSigningSeed(projectKey, signingSeed, { overwrite: true })
+    await replaceWorkspaceInbox(workspace.key, { title: workspace.title, path: workspace.path, project_key: projectKey })
+    return {
+      title: workspace.title,
+      path: workspace.path,
+      project_key: projectKey,
+      address: agent.address,
+      api_key: agent.api_key,
+      api_url: apiUrl,
+      ...(signingSeed ? { signing_seed: signingSeed } : {}),
+    }
   }
+
   if (oldInbox.address === agent.address) {
-    await replaceWorkspaceInbox(workspace.key, inbox)
+    const inbox = await activate()
     return { inbox, oldDisabled: false, forwarding: false, movedMail: null }
   }
 
@@ -268,8 +304,8 @@ export async function migrateInbox(
       { old: oldInbox.address, reason: (error as Error)?.message ?? String(error) },
     ))
   }
-  // 转发已生效，此刻替换本地状态才不会丢信。
-  await replaceWorkspaceInbox(workspace.key, inbox)
+  // 转发已生效，此刻切换本地凭据与状态才不会丢信。
+  const inbox = await activate()
   const forwarding = true
 
   // Step 3: history + release, when the previous tenant's key is around.
