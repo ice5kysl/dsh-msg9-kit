@@ -1289,8 +1289,9 @@ await check('groups archive: the channel view threads letters, folds copies and 
     assert.ok(html.indexOf('Oldest first') < html.indexOf('m9-archive-scroll'), 'counter + order toggle stays pinned above the scroll region')
     assert.ok(html.slice(html.indexOf('m9-archive-scroll')).includes('Message the group'), 'the group info card scrolls WITH the archive content')
     assert.ok(html.slice(html.indexOf('m9-archive-scroll')).indexOf('Message the group') < html.slice(html.indexOf('m9-archive-scroll')).indexOf('m9-letterhead'), 'the group card sits at the top of the scroll region, letters follow')
-    // 卡片宽度约束锚点：maxWidth 封顶，任何卡片不超出右栏可视宽度。
-    assert.ok(html.includes('max-width:92%'), 'letter cards carry the max-width clamp')
+    // 卡片宽度约束锚点：通栏（fit-content 气泡在超宽窗口会留出大片空白，
+    // "我"的信靠右悬浮时尤其明显），任何卡片不超出右栏可视宽度。
+    assert.ok(html.includes('width:100%'), 'letter cards run full-width of the column')
     // 宽表格处理规则随 M9_CSS 注入（表格内部横滚，不撑破卡片）。
     assert.ok(html.includes('.m9-letter-md table'), 'archive tables scroll internally')
     // 默认折叠：只有头行 + 纯文本预览，没有 markdown 正文，也没有「回复」。
@@ -1483,6 +1484,62 @@ await check('inbox detail: opening a letter opens its whole conversation (Gmail 
     const solo = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
     assert.ok(solo.includes('1 in thread'), 'no correlation_id → a conversation of one')
     assert.ok(solo.includes('other body'), 'and it renders expanded (seed = latest)')
+  } finally {
+    threadInbox = false
+  }
+})
+
+await check('inbox list: thread mode groups the list by conversation (toggleable)', async () => {
+  threadInbox = true
+  try {
+    const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+    store.setCwd('/work/a')
+    await store.refreshAll()
+    for (let i = 0; i < 50 && store.getState().messages.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+
+    // 纯函数锚点：分组、组间排序（最新一封倒序）、未读/已处理聚合。
+    const rows = store.getState().messages
+    const threads = client.threadRows(rows)
+    assert.equal(threads.length, 3, '5 messages fold into 3 conversations')
+    assert.deepEqual(threads.map((thread) => thread.key), ['thread-g', 'c3', 'thread-c'], 'threads sorted by their latest message')
+    const tc = threads.find((thread) => thread.key === 'thread-c')
+    assert.equal(tc.total, 2)
+    assert.equal(tc.unread, 1, 'c1 unread + c2 read')
+    assert.equal(tc.allProcessed, false)
+    assert.equal(tc.latest.message_id, 'c2', 'the latest message drives the row')
+    assert.equal(threads.find((thread) => thread.key === 'thread-g').latest.message_id, 'c4b', 'fan-out copies pick the newest copy')
+
+    // 默认 thread 模式：一封线程一行，行内容取自最新一封。
+    assert.equal(store.getState().threadMode, true, 'thread mode is the default')
+    const grouped = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    assert.equal(grouped.match(/<li/g).length, 3, 'one <li> per conversation')
+    assert.equal(grouped.match(/roadmap sync/g).length, 1, 'the thread row shows only the LATEST subject')
+    assert.ok(!grouped.includes('question one'), 'stale bodies of older letters stay hidden')
+    assert.equal(grouped.match(/group note/g).length, 1, 'the two fan-out copies fold into one row')
+    assert.equal(grouped.match(/>2 mails</g).length, 2, 'count chips on the two multi-mail threads')
+    assert.ok(grouped.indexOf('group note') < grouped.indexOf('other topic') && grouped.indexOf('other topic') < grouped.indexOf('re: roadmap sync'), 'rows newest-thread-first')
+    assert.ok(grouped.includes('By thread'), 'the toggle chip is present')
+
+    // 高亮按「组内任一成员」：点开较老的一封，所在线程行仍高亮。
+    store.selectMessage('c1')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const picked = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    const at = picked.indexOf('m9-row active')
+    assert.ok(at > 0, 'exactly one active list row')
+    const activeRow = picked.slice(at, picked.indexOf('</li>', at))
+    assert.ok(activeRow.includes('re: roadmap sync'), 'the active row is found by membership, not by matching the latest id')
+
+    // 切回逐封：每封各占一行，计数徽标消失。
+    store.setThreadMode(false)
+    const flat = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    assert.equal(flat.match(/group note/g).length, 2, 'flat mode lists every message of the thread')
+    assert.ok(!flat.includes('>2 mails<'), 'no count chips in flat mode')
+    store.setThreadMode(true)
+    const regrouped = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+    assert.equal(regrouped.match(/<li/g).length, 3, 'toggling back regroups the list')
   } finally {
     threadInbox = false
   }

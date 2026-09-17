@@ -135,3 +135,48 @@ export function conversationOf(inbox: MessageRow[], outbox: MessageRow[], seed: 
   rows.sort((a, b) => (Date.parse(a.created_at ?? '') || 0) - (Date.parse(b.created_at ?? '') || 0))
   return rows
 }
+
+/** 「会话」摘要：收件箱 thread 模式的一行（同 correlation_id 的一组信）。 */
+export interface ThreadSummary {
+  /** 组键：correlation_id（无 correlation_id 的单封自成一组）。 */
+  key: string
+  /** 组内成员，时间正序。 */
+  messages: MessageRow[]
+  /** 最新一封：行的发件人/主题/预览/时间都取自它。 */
+  latest: MessageRow
+  /** 组内总封数（>1 时行内显示计数徽标）。 */
+  total: number
+  /** 组内未读数（>0 时整行按未读加粗）。 */
+  unread: number
+  /** 全部已处理（人/agent）：决定行首显示绿勾还是圆点。 */
+  allProcessed: boolean
+}
+
+/** 收件箱 thread 模式：按 correlation_id 分组（无则自成一组），组内时间正序、
+ *  组间按最新一封倒序。纯本地聚合，不新发请求；在过滤文件夹（未读/已读/待处理）
+ *  下组里只有服务端筛回来的成员，计数反映"当前列表中该组的成员数"。 */
+export function threadRows(rows: MessageRow[]): ThreadSummary[] {
+  const groups = new Map<string, MessageRow[]>()
+  for (const row of rows) {
+    const key = row.correlation_id || row.message_id
+    const members = groups.get(key)
+    if (members) members.push(row)
+    else groups.set(key, [row])
+  }
+  const threads: ThreadSummary[] = []
+  for (const [key, messages] of groups) {
+    messages.sort((a, b) => (Date.parse(a.created_at ?? '') || 0) - (Date.parse(b.created_at ?? '') || 0))
+    const latest = messages[messages.length - 1]
+    if (!latest) continue // 组按构造非空，只是让索引访问的类型收敛
+    threads.push({
+      key,
+      messages,
+      latest,
+      total: messages.length,
+      unread: messages.reduce((count, row) => (isUnread(row) ? count + 1 : count), 0),
+      allProcessed: messages.every((row) => Boolean(row.processed_by)),
+    })
+  }
+  threads.sort((a, b) => (Date.parse(b.latest.created_at ?? '') || 0) - (Date.parse(a.latest.created_at ?? '') || 0))
+  return threads
+}

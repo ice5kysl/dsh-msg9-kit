@@ -29,7 +29,7 @@ import { Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, Globe, Inbox, Me
 import { highlightCode, highlightReady } from './highlight.ts'
 import { L } from './locale.ts'
 import { selectedWorkspace, type Msg9State, type Msg9Store, type Tab } from './store.ts'
-import { ACTIVE_BG, ACCENT, BG, BORDER, BORDER_STRONG, DIM, FG, M9_CSS } from './theme.ts'
+import { ACTIVE_BG, ACCENT, BG, BORDER, BORDER_STRONG, DIM, FG, M9_CSS, MINE_BG } from './theme.ts'
 import {
   FOLDERS,
   agentLabel,
@@ -45,6 +45,8 @@ import {
   letterIdentity,
   previewOf,
   processedLabel,
+  threadRows,
+  type ThreadSummary,
 } from './view.ts'
 
 /** Props handed to the view: injected store + the standard slot shares. */
@@ -379,6 +381,8 @@ function ListColumn({ state, store }: { state: Msg9State; store: Msg9Store }): J
   const outgoing = state.tab === 'outbox'
   const messages = outgoing ? state.outbox : state.messages
   const total = outgoing ? state.outboxTotal : state.messagesTotal
+  // 收件箱 thread 模式：按会话分组，一封线程占一行（点开仍是整串会话）。
+  const threads = !outgoing && state.threadMode ? threadRows(messages) : undefined
   return (
     <section style={styles.listCol} className="m9-listcol">
       {state.tab === 'inbox' && (
@@ -393,10 +397,20 @@ function ListColumn({ state, store }: { state: Msg9State; store: Msg9Store }): J
               {folderLabel(folder)}
             </button>
           ))}
+          <button
+            type="button"
+            className={state.threadMode ? 'm9-chip active' : 'm9-chip'}
+            style={{ marginLeft: 'auto' }}
+            onClick={() => store.setThreadMode(!state.threadMode)}
+            title={L('按会话分组显示收件箱', 'Group the inbox by conversation')}
+          >
+            {L('按会话', 'By thread')}
+          </button>
         </div>
       )}
       <MessageList
         messages={messages}
+        threads={threads}
         selectedId={state.selectedId}
         empty={outgoing ? L('还没有已发送的消息。', 'Nothing sent yet.') : L('收件箱是空的。', 'The inbox is empty.')}
         loading={outgoing ? state.busy.outbox : state.busy.messages}
@@ -546,6 +560,7 @@ function Empty({ text, actionLabel, onAction }: { text: string; actionLabel?: st
 
 function MessageList({
   messages,
+  threads,
   selectedId,
   empty,
   loading,
@@ -553,14 +568,53 @@ function MessageList({
   outgoing,
 }: {
   messages: MessageRow[]
+  /** 传入时按会话分组渲染（收件箱 thread 模式），一封线程占一行。 */
+  threads?: ThreadSummary[]
   selectedId: string | null
   empty: string
   loading: boolean
   store: Msg9Store
   outgoing?: boolean
 }): JSX.Element {
-  if (messages.length === 0) {
+  if (threads ? threads.length === 0 : messages.length === 0) {
     return <div style={styles.listEmpty}>{loading ? L('加载中…', 'Loading…') : empty}</div>
+  }
+  if (threads) {
+    return (
+      <ul style={styles.list}>
+        {threads.map((thread) => {
+          // 高亮按「选中的是组内任一成员」，而不是只认最新一封。
+          const active = thread.messages.some((row) => row.message_id === selectedId)
+          const unread = thread.unread > 0
+          const latest = thread.latest
+          return (
+            <li key={thread.key}>
+              <button
+                type="button"
+                className={active ? 'm9-row active' : 'm9-row'}
+                onClick={() => store.selectMessage(latest.message_id)}
+              >
+                <div style={styles.rowTop}>
+                  {thread.allProcessed
+                    ? <Check size={11} style={styles.rowProcessed} />
+                    : <span style={unread ? styles.rowUnreadDot : styles.rowDot} />}
+                  <span style={unread ? styles.rowPeerUnread : styles.rowPeer}>{latest.from_address}</span>
+                  {latest.list_address && <span style={styles.groupTag}>{L('组', 'group')}</span>}
+                  {thread.total > 1 && (
+                    <span style={{ ...styles.threadCount, flexShrink: 0 }} title={L('该会话共 {n} 封', '{n} mails in this conversation', { n: thread.total })}>
+                      {L('{n} 封', '{n} mails', { n: thread.total })}
+                    </span>
+                  )}
+                  <span style={styles.rowTime}>{formatTime(latest.created_at)}</span>
+                </div>
+                {latest.subject ? <div style={unread ? styles.rowSubjectUnread : styles.rowSubject}>{latest.subject}</div> : null}
+                <div style={styles.rowPreview}>{previewOf(latest)}</div>
+              </button>
+            </li>
+          )
+        })}
+      </ul>
+    )
   }
   return (
     <ul style={styles.list}>
@@ -646,7 +700,7 @@ function SignatureBadge({ message }: { message: MessageRow }): JSX.Element {
  *  收件箱+发件箱信，无 correlation_id 的单封成会话），按时间正序平铺
  *  （平铺不嵌套——回复树是组频道的形态，这里照 Gmail 惯例）。
  *  较早的信默认折叠成头行（发送者+时间+一行预览），最新一封和当前点开的
- *  默认展开；我发的信右侧高亮，"我问了什么、对方回了什么"一目了然。
+ *  默认展开；我发的信通栏底色高亮，"我问了什么、对方回了什么"一目了然。
  *  调用方按 seed 加 key：换会话时重挂，默认展开状态随之重置。 */
 function ConversationView({ state, store, seed }: { state: Msg9State; store: Msg9Store; seed: MessageRow }): JSX.Element {
   const myAddress = selectedWorkspace(state)?.address ?? null
@@ -1435,7 +1489,7 @@ export function LetterCard({
   copies: number
   /** 回复树深度（0 = 线程根/非树场景）；≥1 的节点在时间线竖线上挂一个节点圆点。 */
   depth?: number
-  /** 当前 workspace 自己发的信：靠右 + 底色（折叠态也能看出）。 */
+  /** 当前 workspace 自己发的信：通栏 + 底色（折叠态也能看出）。 */
   mine: boolean
   /** 卡片级展开（折叠态只有头行 + 预览）。 */
   open: boolean
@@ -1487,6 +1541,9 @@ export function LetterCard({
         <button type="button" className="m9-letterhead" onClick={onToggleOpen} title={open ? L('收起', 'Collapse') : L('展开', 'Expand')}>
           {open ? <ChevronDown size={12} style={styles.tlArrow} /> : <ChevronRight size={12} style={styles.tlArrow} />}
           <span style={styles.letterSender}>{message.from_address}</span>
+          {mine && message.to_address ? (
+            <span style={styles.letterTo} title={L('发给', 'Sent to')}>{`→ ${message.to_address}`}</span>
+          ) : null}
           {mine && (
             <span style={styles.mineTag} title={L('本 workspace 发的信', 'Sent by this workspace')}>{L('我', 'me')}</span>
           )}
@@ -1847,7 +1904,7 @@ const styles: Record<string, CSSProperties> = {
     flexDirection: 'column',
     gap: 8,
   },
-  folderRow: { display: 'flex', gap: 6, flexShrink: 0 },
+  folderRow: { display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', rowGap: 6 },
   detailCol: {
     flex: 1,
     minWidth: 0,
@@ -1950,11 +2007,10 @@ const styles: Record<string, CSSProperties> = {
   threadCount: { fontSize: 10, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '0 7px' },
   letter: {
     position: 'relative',
-    // 卡片永不超出右栏可视宽度：maxWidth 封顶 + minWidth 0 允许 flex 收缩；
-    // 超宽内容（表格/代码块/长串）由信体内部断行或横滚消化（.m9-letter-md）。
-    maxWidth: '92%',
-    width: 'fit-content',
-    alignSelf: 'flex-start',
+    // 通栏卡片：撑满右栏。气泡式 fit-content 在超宽窗口会留出大片空白，
+    // "我"的信靠右悬浮时尤其明显；超宽内容（表格/代码块/长串）由信体
+    // 内部断行或横滚消化（.m9-letter-md），正文另限 70ch 阅读宽度。
+    width: '100%',
     minWidth: 0,
     border: `1px solid ${BORDER}`,
     borderRadius: 10,
@@ -1963,7 +2019,7 @@ const styles: Record<string, CSSProperties> = {
     flexDirection: 'column',
     gap: 4,
   },
-  letterMine: { alignSelf: 'flex-end', background: ACTIVE_BG, borderColor: BORDER_STRONG },
+  letterMine: { background: MINE_BG, borderColor: BORDER },
   // 节点圆点：挂在 treeChildren 的竖线上（border 1px + paddingLeft 18px → 线心约在 -19）。
   tlNode: { position: 'absolute', left: -24, top: 12, width: 10, height: 10, borderRadius: 5, background: BORDER_STRONG },
   tlNodeMine: { background: ACCENT },
@@ -1971,6 +2027,8 @@ const styles: Record<string, CSSProperties> = {
   letterHeadRow: { display: 'flex', alignItems: 'center', gap: 2, minWidth: 0 },
   treeToggle: { flexShrink: 0 },
   letterSender: { fontSize: 11, fontWeight: 600, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  // 自己发的信：只显示 from 的话看到的永远是自己，详情里说不清"发给了谁"。
+  letterTo: { flexShrink: 1, minWidth: 0, fontSize: 11, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   mineTag: { flexShrink: 0, fontSize: 10, color: ACCENT, border: `1px solid ${BORDER_STRONG}`, borderRadius: 999, padding: '0 6px' },
   letterTime: { color: DIM, fontSize: 10, flexShrink: 0, marginLeft: 'auto' },
   letterSubject: {

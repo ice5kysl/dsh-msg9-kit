@@ -60,6 +60,8 @@ export interface Msg9State {
   currentKey: string | null
   tab: Tab
   folder: FolderFilter
+  /** 收件箱列表按会话分组（thread 视图模式；只影响收件箱，发件箱始终逐封）。 */
+  threadMode: boolean
   messages: MessageRow[]
   messagesTotal: number
   unreadCount: number
@@ -122,6 +124,8 @@ export interface Msg9Store {
   setCwd(cwd: string | null): void
   setTab(tab: Tab): void
   setFolder(folder: FolderFilter): void
+  /** 收件箱列表在「按会话分组 / 逐封」之间切换。 */
+  setThreadMode(on: boolean): void
   selectWorkspace(key: string): void
   selectMessage(id: string | null): void
   selectContact(address: string | null): void
@@ -192,6 +196,7 @@ const INITIAL: Msg9State = {
   currentKey: null,
   tab: 'inbox',
   folder: 'all',
+  threadMode: true,
   messages: [],
   messagesTotal: 0,
   unreadCount: 0,
@@ -622,6 +627,9 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     setFolder(folder) {
       set({ folder })
       void refreshInbox()
+    },
+    setThreadMode(on) {
+      set({ threadMode: on })
     },
     selectWorkspace(key) {
       if (key === state.currentKey) return

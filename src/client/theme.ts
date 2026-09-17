@@ -19,8 +19,9 @@ export const BORDER_STRONG = 'var(--dsw-alias-border-l2, rgba(28,35,51,0.20))'
 export const ACCENT = 'var(--dsw-alias-brand-primary, #2d66f7)'
 export const HOVER_BG = 'var(--dsw-alias-interactive-bg-hover, rgba(28,35,51,0.06))'
 export const ACTIVE_BG = 'var(--dsw-specific-sidebar-nav-item-active, rgba(45,102,247,0.12))'
-
-const CHEVRON = `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1l4 4 4-4" stroke="%23787887" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>')`
+/** 「我发出的信」卡片底色：选中态是给导航/行用的 12% 强调色，铺满整张信件卡片太重，
+    这里单独给一档更淡的底色（可用 shell 变量覆盖），并保留 ACCENT 时间线节点做身份区分。 */
+export const MINE_BG = 'var(--dsw-specific-mail-sent-bg, rgba(45,102,247,0.055))'
 
 /** Interactive-state rules for the m9-* classes used across the surfaces. */
 export const M9_CSS = `
@@ -36,7 +37,7 @@ export const M9_CSS = `
 .m9-input, .m9-select, .m9-textarea { width: 100%; box-sizing: border-box; border: 1px solid ${BORDER_STRONG}; border-radius: 8px; background: ${BG}; color: inherit; padding: 6px 9px; font-size: 12.5px; font-family: inherit; line-height: 1.5; }
 .m9-input::placeholder, .m9-textarea::placeholder { color: ${DIM}; opacity: 0.7; }
 .m9-input:focus, .m9-select:focus, .m9-textarea:focus { outline: none; border-color: ${ACCENT}; box-shadow: 0 0 0 3px rgba(45,102,247,0.18); }
-.m9-select { appearance: none; -webkit-appearance: none; padding-right: 26px; background-image: ${CHEVRON}; background-repeat: no-repeat; background-position: right 9px center; cursor: pointer; }
+.m9-select { cursor: pointer; }
 .m9-textarea { resize: vertical; }
 .m9-nav-item { display: flex; align-items: center; gap: 8px; width: 100%; border: none; border-radius: 8px; background: transparent; color: inherit; padding: 7px 9px; font-size: 13px; font-family: inherit; cursor: pointer; text-align: left; }
 .m9-nav-item:hover { background: ${HOVER_BG}; }
