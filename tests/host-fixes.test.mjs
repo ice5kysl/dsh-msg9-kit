@@ -26,6 +26,9 @@ process.env.MSG9KIT_LOCALE = 'en'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-hostfix-'))
 process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
 process.env.MSG9_HOME = join(stateDir, 'msg9-home')
+// These tests exercise the IN-PROCESS watcher: never let the plugin look for
+// (or spawn) the machine-wide daemon.
+process.env.MSG9_WATCH_DAEMON = '0'
 delete process.env.MSG9_OWNER_KEY
 
 const {

@@ -302,6 +302,15 @@ export function resolveAddress(apiUrl: string, address: string, signal?: AbortSi
   return msg9Request(apiUrl, `/api/v1/resolve/${encodeURIComponent(address)}`, { signal })
 }
 
+/**
+ * Mint a one-time WebSocket ticket for `/api/v1/ws` (the daemon's push
+ * channel): the WS upgrade carries it as the second subprotocol token
+ * (`msg9-l0, <ticket>`), keeping the long-lived credential off the wire.
+ */
+export function issueWsTicket(apiUrl: string, apiKey: string, signal?: AbortSignal): Promise<{ ticket: string }> {
+  return msg9Request<{ ticket: string }>(apiUrl, '/api/v1/ws-ticket', { method: 'POST', apiKey, signal })
+}
+
 /** A v1.9 forwarding rule: mail to this address is delivered to `target`. */
 export interface ForwardingRule {
   address?: string

@@ -22,11 +22,14 @@
  *   POST /dsh-msg9/setup                { owner_key, api_url? } — bind this instance to a msg9 tenant
  *   POST /dsh-msg9/contacts             { key, contact, alias?, notes? }
  *   DELETE /dsh-msg9/contacts?key=&address=
+ *   POST /dsh-msg9/deliver              the watcher daemon pushes a coalesced
+ *                                       batch here (x-msg9-daemon-token auth)
  *
  * @module dsh-msg9-kit/http
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { timingSafeEqual } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   addContact,
@@ -47,17 +50,20 @@ import {
   ownerMe,
   resolveAddress,
   sendMessage,
+  type InboxMessage,
 } from './api.ts'
 import { ensureInbox, ensureSigningKey, maskKey, migrateInbox, ownerContext, type InboxContext } from './service.ts'
 import { credentialsMigrated, resolveCredentials, saveOwner } from './credentials.ts'
-import { defaultApiUrl, getNotifyPaused, loadState, setMessageMark, setNotifyPaused, stateFilePath, type LiveInbox, type OwnerState, type State } from './store.ts'
+import { defaultApiUrl, getNotifyPaused, isTenantOwner, loadState, setMessageMark, setNotifyPaused, stateFilePath, type LiveInbox, type OwnerState, type State } from './store.ts'
 import type { OverviewView, WorkspaceView } from '../shared/types.ts'
 import {
   deriveAddress,
+  isValidLocalPart,
   listWorkspaces,
   matchWorkspaceByPath,
   type CurrentWorkspace,
 } from './workspace.ts'
+import type { DaemonDelivery } from './watch.ts'
 
 /** Absolute prefix the browser face calls. */
 export const BRIDGE_PREFIX = '/dsh-msg9'
@@ -88,7 +94,7 @@ export interface BridgeDeps {
   loadState(): Promise<State>
   stateFilePath(): string
   defaultApiUrl(): string
-  ensureInbox(workspace: CurrentWorkspace, signal?: AbortSignal): Promise<InboxContext>
+  ensureInbox(workspace: CurrentWorkspace, signal?: AbortSignal, preferred?: string): Promise<InboxContext>
   listWorkspaces(): CurrentWorkspace[]
   matchWorkspaceByPath(cwd: string | undefined): CurrentWorkspace | undefined
   log(message: string): void
@@ -96,6 +102,16 @@ export interface BridgeDeps {
   resolveCredentials?(key: string): Promise<LiveInbox | undefined>
   /** Optional SSE invalidation bus (clients stop polling /unread when present). */
   events?: BridgeEventBus
+  /**
+   * The watcher daemon's delivery seam (POST /dsh-msg9/deliver). Absent = this
+   * instance has no daemon client; the route then answers 401 to everything.
+   */
+  deliver?: {
+    /** The per-boot token the daemon must present (undefined = not registered). */
+    token(): string | undefined
+    /** Deliver one coalesced batch; throws BridgeError(409) when no live session. */
+    handle(body: DaemonDelivery): Promise<unknown>
+  }
 }
 
 /**
@@ -361,6 +377,13 @@ function isSameOrigin(origin: string, hostHeader: string): boolean {
   }
 }
 
+/** Constant-time token compare for the daemon delivery header. */
+function tokenMatches(expected: string, presented: string): boolean {
+  const a = Buffer.from(expected)
+  const b = Buffer.from(presented)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
 /** Best-effort domain for preview addresses: `api.msg9.io` → `msg9.io`. */
 function addressDomain(apiUrl: string): string {
   try {
@@ -415,14 +438,27 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
   /** Every registered workspace plus everything the state file knows. */
   async function workspaceViews(currentKey: string | undefined, apiUrl: string, owner: OwnerState | undefined): Promise<WorkspaceView[]> {
     const state = await deps.loadState()
-    // Under a tenant subdomain the preview matches provisioning: readable
-    // (hash-less) address on the tenant's domain.
-    const tenantMode = Boolean(owner?.api_key && owner.slug)
+    // Tenant mode needs an owner key AND a tenant domain; under the ORG model
+    // (v1.22) the domain is `address_domain` while the pod reports `slug: ""`,
+    // and a slug-only test silently disabled legacy detection — so no legacy
+    // inbox was ever offered for migration.
+    const tenantMode = Boolean(owner?.api_key && isTenantOwner(owner))
     const mailDomain = owner?.mail_domain || addressDomain(apiUrl)
     // ORG model (v1.22): the pod's real address domain wins when probed.
     const domain = tenantMode ? (owner?.address_domain ?? `${owner!.slug}.${mailDomain}`) : mailDomain
-    const planned = (workspace: CurrentWorkspace): string =>
-      `${tenantMode ? deriveAddress(workspace, { tenant: true }) : deriveAddress(workspace)}@${domain}`
+    // 统一从凭据仓解析（含惰性迁移）：address 与 provisioned 以解析结果为准。
+    const resolvedByKey = new Map<string, LiveInbox>()
+    await Promise.all(Object.keys(state.workspaces).map(async (key) => {
+      const resolved = await resolveVia(deps, key)
+      if (resolved) resolvedByKey.set(key, resolved)
+    }))
+    // A workspace that once asked for a specific address previews that address;
+    // otherwise the readable per-workspace name provisioning tries first.
+    const planned = (workspace: CurrentWorkspace): string => {
+      if (!tenantMode) return `${deriveAddress(workspace)}@${domain}`
+      const preferred = state.workspaces[workspace.key]?.preferred_address
+      return `${preferred ?? deriveAddress(workspace, { tenant: true })}@${domain}`
+    }
     const rows = new Map<string, WorkspaceView>()
 
     for (const workspace of deps.listWorkspaces()) {
@@ -439,12 +475,6 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         current: workspace.key === currentKey,
       })
     }
-    // 统一从凭据仓解析（含惰性迁移）：address 与 provisioned 以解析结果为准。
-    const resolvedByKey = new Map<string, LiveInbox>()
-    await Promise.all(Object.keys(state.workspaces).map(async (key) => {
-      const resolved = await resolveVia(deps, key)
-      if (resolved) resolvedByKey.set(key, resolved)
-    }))
     for (const [key, inbox] of Object.entries(state.workspaces)) {
       const existing = rows.get(key)
       const resolved = resolvedByKey.get(key)
@@ -497,7 +527,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     // A session outside the registry still belongs in the table, unprovisioned:
     // the panel offers "open inbox" for exactly this row.
     if (current && !workspaces.some((row) => row.key === current.key)) {
-      const tenantMode = Boolean(owner?.api_key && owner.slug)
+      const tenantMode = Boolean(owner?.api_key && isTenantOwner(owner))
       const mailDomain = owner?.mail_domain || addressDomain(apiUrl)
       const currentDomain = tenantMode ? (owner?.address_domain ?? `${owner!.slug}.${mailDomain}`) : mailDomain
       workspaces.unshift({
@@ -576,6 +606,31 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       if (!res.writableEnded) controller.abort()
     })
     const signal = controller.signal
+
+    // The watcher daemon's push channel: loopback (the generic trust gate)
+    // plus the per-boot deliver token the daemon learned at /register. 409
+    // means "no live session" and the daemon parks the batch for redelivery.
+    if (method === 'POST' && path === `${BRIDGE_PREFIX}/deliver`) {
+      const presented = req.headers['x-msg9-daemon-token']
+      const expected = deps.deliver?.token()
+      if (!deps.deliver || !expected || typeof presented !== 'string' || !tokenMatches(expected, presented)) {
+        throw new BridgeError(401, 'bad-daemon-token', 'a valid daemon delivery token is required')
+      }
+      const body = await readJsonBody(req)
+      const projectKey = str(body.project_key)
+      const messages = Array.isArray(body.messages) ? (body.messages as InboxMessage[]) : undefined
+      const mode = body.mode === 'followup' || body.mode === 'inject' ? body.mode : undefined
+      if (!projectKey || !messages || !mode) {
+        throw new BridgeError(400, 'invalid-delivery', 'fields "project_key", "messages" and "mode" (followup|inject) are required')
+      }
+      return ok(res, await deps.deliver.handle({
+        inbox: str(body.inbox) ?? '',
+        project_key: projectKey,
+        messages,
+        mode,
+        ...(body.downgraded === true ? { downgraded: true } : {}),
+      }))
+    }
 
     if (method === 'GET' && path === `${BRIDGE_PREFIX}/overview`) return ok(res, await overview(url))
 
@@ -906,7 +961,11 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       if (!existing) throw new BridgeError(404, 'unknown-workspace', `no inbox is registered as "${key}"`)
       const workspace = deps.listWorkspaces().find((row) => row.key === key)
         ?? { key, title: existing.title, path: existing.path }
-      const result = await migrateInbox(workspace, existing, str(body.old_owner_key))
+      const preferred = str(body.preferred_address)
+      if (preferred && !isValidLocalPart(preferred)) {
+        throw new BridgeError(400, 'invalid-address', `"${preferred}" is not a valid msg9 local part (3-30 chars, a-z0-9-_ inside)`)
+      }
+      const result = await migrateInbox(workspace, existing, str(body.old_owner_key), preferred || undefined)
       invalidateUnreadCache()
       deps.log(`migrated ${key}: ${existing.address} -> ${result.inbox.address}`)
       deps.events?.emit('migrate')
@@ -932,9 +991,14 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         ?? (key && known ? { key, title: known.title, path: known.path } : undefined)
         ?? deps.matchWorkspaceByPath(cwd)
       if (!workspace) throw new BridgeError(400, 'missing-workspace', 'field "key" (workspace) or "cwd" is required')
+      const preferred = str(body.preferred_address)
+      if (preferred && !isValidLocalPart(preferred)) {
+        throw new BridgeError(400, 'invalid-address', `"${preferred}" is not a valid msg9 local part (3-30 chars, a-z0-9-_ inside)`)
+      }
       const { inbox, provisioned } = await deps.ensureInbox(
         title ? { ...workspace, title } : workspace,
         signal,
+        preferred || undefined,
       )
       if (provisioned) invalidateUnreadCache()
       return ok(res, { key: workspace.key, address: inbox.address, provisioned })

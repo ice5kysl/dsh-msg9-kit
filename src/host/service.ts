@@ -26,13 +26,14 @@ import { generateSigningMaterial } from './signing.ts'
 import { L } from './locale.ts'
 import {
   defaultApiUrl,
+  isTenantOwner,
   loadState,
   replaceWorkspaceInbox,
   upsertWorkspaceInbox,
   type LiveInbox,
   type OwnerState,
 } from './store.ts'
-import { deriveAddress, deriveTenantFallback, resolveWorkspace, type CallerAgent, type CurrentWorkspace } from './workspace.ts'
+import { deriveAddress, resolveWorkspace, tenantAddressCandidates, type CallerAgent, type CurrentWorkspace } from './workspace.ts'
 
 /** A resolved workspace together with its msg9 inbox. */
 export interface InboxContext {
@@ -61,7 +62,9 @@ export async function ownerContext(): Promise<{ owner: OwnerState | undefined; a
   // so previews/legacy-detection/display track the pod's real domain.
   if (
     owner?.api_key
-    && (owner.slug === undefined || owner.address_domain === undefined)
+    // `''` is the ORG model's "pod, no slug" answer — keep probing it so a
+    // server that later reports a real slug gets picked up.
+    && (owner.slug === undefined || owner.slug === '' || owner.address_domain === undefined)
     && !process.env.MSG9_OWNER_KEY
     && Date.now() - ownerProbeFailedAt >= OWNER_PROBE_RETRY_MS
   ) {
@@ -93,13 +96,13 @@ const provisioning = new Map<string, Promise<InboxContext>>()
  * when an owner key is configured (no IP rate limit, tenant managed),
  * otherwise by public self-registration.
  */
-export function ensureInbox(workspace: CurrentWorkspace, signal?: AbortSignal): Promise<InboxContext> {
+export function ensureInbox(workspace: CurrentWorkspace, signal?: AbortSignal, preferred?: string): Promise<InboxContext> {
   const pending = provisioning.get(workspace.key)
   if (pending) return pending
   // The shared task must not carry any single caller's signal: the first
   // caller disconnecting would otherwise abort provisioning for every waiter.
   // Outbound calls inside rely on the API client's own timeout instead.
-  const task = provision(workspace).finally(() => provisioning.delete(workspace.key))
+  const task = provision(workspace, undefined, preferred).finally(() => provisioning.delete(workspace.key))
   provisioning.set(workspace.key, task)
   if (!signal) return task
   if (signal.aborted) return Promise.reject(signal.reason)
@@ -124,7 +127,7 @@ async function takenProjectKeys(): Promise<Map<string, string>> {
   return taken
 }
 
-async function provision(workspace: CurrentWorkspace, log?: (message: string) => void): Promise<InboxContext> {
+async function provision(workspace: CurrentWorkspace, log?: (message: string) => void, preferred?: string | null): Promise<InboxContext> {
   let existing = await resolveCredentials(workspace.key, { log })
   if (!existing) {
     // 还没解析到：可能有未合一的 cwd:<path> bucket（registry 后补的场景）。
@@ -139,15 +142,23 @@ async function provision(workspace: CurrentWorkspace, log?: (message: string) =>
 
   const { owner, apiUrl } = await ownerContext()
   const profile = workspaceProfile(workspace)
+  // A preference set earlier still applies to a fresh inbox, so re-opening a
+  // workspace keeps the address its user asked for.
+  const preferredAddress = preferred ?? (await loadState()).workspaces[workspace.key]?.preferred_address
   const agent: RegisteredAgent = owner?.api_key
-    ? await provisionUnderOwner(apiUrl, owner, workspace, profile)
+    ? await provisionUnderOwner(apiUrl, owner, workspace, profile, preferredAddress)
     : await registerAgent(apiUrl, deriveAddress(workspace), undefined, profile)
 
   // 身份与密钥落 msg9 统一凭据仓（0600/0700）；state.json 只留热状态 +
   // project_key 引用，明文 key 与 signing seed 不进 state.json。
   const projectKey = await allocateProjectKey(workspace, agent.address, await takenProjectKeys(), log ?? (() => {}))
   await writeProjectCredentials(projectKey, { address: agent.address, api_key: agent.api_key, api_url: apiUrl })
-  await upsertWorkspaceInbox(workspace.key, { title: workspace.title, path: workspace.path, project_key: projectKey })
+  await upsertWorkspaceInbox(workspace.key, {
+    title: workspace.title,
+    path: workspace.path,
+    project_key: projectKey,
+    ...(preferredAddress ? { preferred_address: preferredAddress } : {}),
+  })
   const inbox: LiveInbox = {
     title: workspace.title,
     path: workspace.path,
@@ -189,9 +200,16 @@ export async function ensureSigningKey(inbox: LiveInbox, log?: (message: string)
  * uniqueness is scoped to the tenant, so try the readable address first and
  * fall back to the hashed form only on a conflict (server code 40900).
  */
-async function provisionUnderOwner(apiUrl: string, owner: OwnerState, workspace: CurrentWorkspace, profile: AgentProfile): Promise<RegisteredAgent> {
-  const candidates = owner.slug
-    ? [...new Set([deriveAddress(workspace, { tenant: true }), deriveTenantFallback(workspace)])]
+async function provisionUnderOwner(
+  apiUrl: string,
+  owner: OwnerState,
+  workspace: CurrentWorkspace,
+  profile: AgentProfile,
+  preferred?: string | null,
+): Promise<RegisteredAgent> {
+  // Tenant mode = owner key + a tenant domain (ORG era: `address_domain`).
+  const candidates = isTenantOwner(owner)
+    ? tenantAddressCandidates(workspace, preferred)
     : [deriveAddress(workspace)]
   let lastAddress = candidates[0]!
   let lastReason = 'no agent returned'
@@ -252,12 +270,13 @@ export async function migrateInbox(
   workspace: CurrentWorkspace,
   oldInbox: LiveInbox,
   oldOwnerKey?: string,
+  preferred?: string,
 ): Promise<{ inbox: LiveInbox; oldDisabled: boolean; forwarding: boolean; movedMail: number | null; note?: string }> {
   const { owner, apiUrl } = await ownerContext()
   if (!owner?.api_key) {
     throw new Error(L('还没有绑定租户，无法迁移。', 'No tenant is bound; cannot migrate.'))
   }
-  const agent = await provisionUnderOwner(apiUrl, owner, workspace, workspaceProfile(workspace))
+  const agent = await provisionUnderOwner(apiUrl, owner, workspace, workspaceProfile(workspace), preferred)
   // 签名材料只在内存里备好：转发没设成之前 state/凭据仓必须仍指向旧信箱。
   let signingSeed: string | undefined
   try {
@@ -277,7 +296,12 @@ export async function migrateInbox(
       ?? await allocateProjectKey(workspace, agent.address, taken, () => {})
     await writeProjectCredentials(projectKey, { address: agent.address, api_key: agent.api_key, api_url: apiUrl }, { overwrite: true })
     if (signingSeed) await writeSigningSeed(projectKey, signingSeed, { overwrite: true })
-    await replaceWorkspaceInbox(workspace.key, { title: workspace.title, path: workspace.path, project_key: projectKey })
+    await replaceWorkspaceInbox(workspace.key, {
+      title: workspace.title,
+      path: workspace.path,
+      project_key: projectKey,
+      ...(preferred ? { preferred_address: preferred } : {}),
+    })
     return {
       title: workspace.title,
       path: workspace.path,

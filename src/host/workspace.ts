@@ -190,3 +190,23 @@ export function deriveTenantFallback(workspace: CurrentWorkspace): string {
   const slug = slugify(workspace.title) || slugify(basename(workspace.path)) || 'ws'
   return `${slug}-${shortHash(workspace.key)}`.slice(0, 30).replace(/[^a-z0-9]+$/, '')
 }
+
+/**
+ * Local parts provisioning tries under a tenant, in order: an explicit
+ * preference first (a user naming their own inbox, e.g. `dsh@<tenant-domain>`),
+ * then the readable per-workspace name, then the hashed fallback. The server
+ * answers a taken name with code 40900 and the caller walks on, so the list
+ * doubles as the honest preview of the outcome.
+ */
+export function tenantAddressCandidates(workspace: CurrentWorkspace, preferred?: string | null): string[] {
+  return [...new Set([
+    ...(preferred ? [preferred] : []),
+    deriveAddress(workspace, { tenant: true }),
+    deriveTenantFallback(workspace),
+  ])]
+}
+
+/** msg9 local-part rules: 3–30 chars, lowercase alphanumerics, `-`/`_` inside. */
+export function isValidLocalPart(value: string): boolean {
+  return /^[a-z0-9][a-z0-9_-]{1,28}[a-z0-9]$/.test(value)
+}

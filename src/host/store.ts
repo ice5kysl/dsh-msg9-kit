@@ -63,9 +63,25 @@ export interface OwnerState extends StoredOwnerState {
   api_key: string
 }
 
+/**
+ * Tenant mode: an owner key that also pins a tenant domain.
+ *
+ * The ORG model (v1.22) moved the tenant domain into `address_domain` and makes
+ * pods answer `slug: ""`, so a truthiness test on `slug` alone reads a fully
+ * bound org tenant as "no tenant at all".
+ */
+export function isTenantOwner(owner: { slug?: string | null; address_domain?: string | null } | undefined): boolean {
+  return Boolean(owner && (owner.slug || owner.address_domain))
+}
+
 export interface WorkspaceInbox {
   /** msg9 统一凭据仓里的 project-key（`~/.msg9/projects/dsh/<key>.yaml`）。 */
   project_key?: string
+  /**
+   * 用户指定的地址 local part（如 `dsh` → `dsh@<租户域>`）：开通/迁移时优先尝试，
+   * 并存下来让预览与后续重开保持一致。
+   */
+  preferred_address?: string
   /** 凭据迁入 ~/.msg9 的时间。 */
   migrated_at?: string
   title: string

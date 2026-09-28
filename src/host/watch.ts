@@ -36,7 +36,10 @@ export interface WatchMessage {
   role: 'user'
   id: string
   content: { type: 'text'; text: string }[]
-  source: { kind: 'plugin'; plugin: string; form: 'notice'; summary: string }
+  /** v4 producer-owned source: dsh's persistence layer refuses the retired
+   *  `kind: 'plugin'` wrapper — the producer kind is `plugin:<name>`, exactly
+   *  what dsh's own v3→v4 migrator generates for this source. */
+  source: { kind: 'plugin:msg9-kit'; form: 'notice'; summary: string }
 }
 
 export interface WatchDeps {
@@ -67,7 +70,7 @@ export function pluginNotice(uuid: string, text: string, summary: string): Watch
     role: 'user',
     id: uuid,
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'msg9-kit', form: 'notice', summary: truncate(summary, 120) },
+    source: { kind: 'plugin:msg9-kit', form: 'notice', summary: truncate(summary, 120) },
   }
 }
 
@@ -442,4 +445,79 @@ async function deliverBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbo
     agent.inject(message)
     deps.log(`watch: wake budget spent for ${agent.id}/${inbox.address}; injected ${actionable.length} mail(s) as context`)
   }
+}
+
+// ------------------------------------------------------------- daemon delivery
+
+/** A batch the watcher daemon pushes to POST /dsh-msg9/deliver (the wire shape
+ *  of the daemon's DeliverBody — mirrored here because daemon/engine.ts already
+ *  imports THIS module, so the type cannot flow the other way). */
+export interface DaemonDelivery {
+  inbox: string
+  project_key: string
+  messages: InboxMessage[]
+  mode: 'followup' | 'inject'
+  /** The daemon's storm budget was spent: this batch is context-only. */
+  downgraded?: boolean
+}
+
+/** The last-mile dependencies of a daemon delivery (a subset of WatchDeps). */
+export interface DaemonDeliverDeps {
+  /** The workspace's live agent, if any (same semantics as WatchDeps.resolveAgent). */
+  resolveAgent(workspace: { key: string; inbox: LiveInbox }): WatchAgent | undefined | Promise<WatchAgent | undefined>
+  /** Sticky-target lookup: is this session still alive? */
+  resolveAgentById?(id: string): WatchAgent | undefined
+  /** Persist the sticky delivery target (watch.ts's own setWatchState). */
+  setWatchState(key: string, patch: { last_wake_agent_id?: string }): Promise<void>
+  uuid(): string
+  log(message: string): void
+}
+
+/**
+ * The LAST MILE of a daemon-coalesced batch: resolve the workspace's live
+ * session and push the notice. The daemon already did the cursor work, the
+ * unprocessed reconcile, the coalescing window and the storm budget — the
+ * plugin must NOT re-budget here (a second budget would double-count wakes
+ * the daemon already paid for). `mode` is honored verbatim: 'followup' wakes,
+ * 'inject' is context-only; a `downgraded` batch carries a visible trace in
+ * the notice so a silent budget overrun is never invisible to the agent.
+ *
+ * Returns false when no live session exists: the daemon turns that (HTTP 409)
+ * into a pending-queue entry and redelivers on the next register/heartbeat.
+ */
+export async function deliverDaemonBatch(
+  deps: DaemonDeliverDeps,
+  key: string,
+  inbox: LiveInbox,
+  body: DaemonDelivery,
+): Promise<boolean> {
+  const messages = body.messages.filter((message) => message && typeof message.message_id === 'string')
+  if (messages.length === 0) return true
+
+  // Sticky target, same rule as deliverBatch: notices keep going to the session
+  // they went to last time while it stays alive.
+  let agent: WatchAgent | undefined
+  if (inbox.last_wake_agent_id && deps.resolveAgentById) {
+    agent = deps.resolveAgentById(inbox.last_wake_agent_id)
+  }
+  if (!agent) {
+    agent = await deps.resolveAgent({ key, inbox })
+    if (agent) await deps.setWatchState(key, { last_wake_agent_id: agent.id })
+  }
+  if (!agent) return false
+
+  const address = body.inbox || inbox.address
+  const rendered = renderMailNotice(address, messages)
+  const text = body.downgraded
+    ? `${rendered.text}\n（本批为降级投递：唤醒预算已用尽，仅注入上下文，不会主动唤醒会话。 / downgraded delivery: the wake budget was spent, so this batch is context-only.）`
+    : rendered.text
+  const message = pluginNotice(deps.uuid(), text, rendered.summary)
+  if (body.mode === 'followup') {
+    agent.followup(message)
+    deps.log(`watch: daemon delivered ${messages.length} mail(s) for ${address} to ${agent.id} (followup)`)
+  } else {
+    agent.inject(message)
+    deps.log(`watch: daemon delivered ${messages.length} mail(s) for ${address} to ${agent.id} (inject${body.downgraded ? ', downgraded' : ''})`)
+  }
+  return true
 }

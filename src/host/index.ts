@@ -22,21 +22,25 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { listInbox, streamInbox } from './api.ts'
 import { registerMsg9Commands } from './commands.ts'
-import { resolveCredentials } from './credentials.ts'
-import { BRIDGE_PREFIX, createMsg9Bridge, defaultBridgeDeps, computeUnread, createBridgeEventBus } from './http.ts'
+import { deriveProjectKey, resolveCredentials } from './credentials.ts'
+import { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, computeUnread, createBridgeEventBus } from './http.ts'
 import { L } from './locale.ts'
 import { loadState, setWatchState, getNotifyPaused, type LiveInbox } from './store.ts'
 import { registerMsg9Tools } from './tools.ts'
 import { matchWorkspaceByPath, setWorkspaceRegistry, type WorkspaceRegistryLike } from './workspace.ts'
+import { createDaemonClient, type DaemonClient } from './daemonclient.ts'
+import type { WorkspaceRow } from './daemon/engine.ts'
 import {
   StreamUnsupportedError,
   WakeBudget,
   createNonReentrant,
   createWatchRuntime,
   defaultSleep,
+  deliverDaemonBatch,
   pluginNotice,
   pollOnce,
   streamInboxLoop,
+  type DaemonDelivery,
   type StreamWatchDeps,
   type WatchAgent,
   type WatchDeps,
@@ -48,7 +52,7 @@ export const inject = ['tools', 'commands', 'sessions'] as const
 // Testable seams: the browser bridge, the shared inbox service and the watch
 // logic are part of the package's public surface, so they can be driven
 // without a cordis host.
-export { BRIDGE_PREFIX, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, invalidateUnreadCache, createBridgeEventBus } from './http.ts'
+export { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, invalidateUnreadCache, createBridgeEventBus } from './http.ts'
 export { ensureInbox, migrateInbox, ownerContext, resolveInbox } from './service.ts'
 export {
   credentialsMigrated,
@@ -66,7 +70,26 @@ export {
 } from './credentials.ts'
 export { listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
 export { loadState, stateFilePath, upsertWorkspaceInbox, withStateLock } from './store.ts'
-export { WakeBudget, createNonReentrant, createWatchRuntime, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
+export { WakeBudget, createNonReentrant, createWatchRuntime, deliverDaemonBatch, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
+// The watcher daemon's public surface (bin entry + integration tests).
+export { DAEMON_PROTOCOL, createDaemon, runDaemon } from './daemon/main.ts'
+export { createEngine, createRegistry, defaultEngineConfig, DeliverHttpError, wsUrlFor } from './daemon/engine.ts'
+export type { DeliverBody, Engine, EngineConfig, EngineDeps, Registry, WorkspaceRow } from './daemon/engine.ts'
+export {
+  backoffMs,
+  computeFlushAt,
+  daemonHome,
+  isStalePidFile,
+  knownMessageIds,
+  mergeDeliveredIds,
+  openDaemonStore,
+  readDaemonInfo,
+  removeDaemonInfo,
+  writeDaemonInfo,
+} from './daemon/state.ts'
+export { connectWebSocket, encodeFrame, FrameParser, OPCODES, WsConnection, WsError } from './daemon/wsclient.ts'
+export { enumerateIdentities } from './daemon/identity.ts'
+export { createDaemonClient, daemonInstanceId } from './daemonclient.ts'
 
 /** The slice of `@deepseek-ai/dsh-host-webserver` this plugin uses. */
 interface WebServerLike {
@@ -75,6 +98,8 @@ interface WebServerLike {
     path: string
     handler: (req: unknown, res: unknown) => void | Promise<void>
   }): () => void
+  /** The listening port (undefined until the server listens — read lazily). */
+  readonly port?: number
 }
 
 /** The slices of the agent/session services the watcher consumes. */
@@ -118,10 +143,27 @@ export function apply(ctx: Context): void {
   const events = createBridgeEventBus()
   const bridgeDeps = defaultBridgeDeps(ctx)
   bridgeDeps.events = events
+
+  // The watcher daemon's delivery seam: the token and the handler are filled
+  // in by startWatcher once (and if) the agents service arrives — before that
+  // every /dsh-msg9/deliver call fails the token check (401).
+  const daemonDelivery: { token?: string; handle?: (body: DaemonDelivery) => Promise<unknown> } = {}
+  bridgeDeps.deliver = {
+    token: () => daemonDelivery.token,
+    handle: async (body) => {
+      if (!daemonDelivery.handle) {
+        throw new BridgeError(409, 'no-live-session', 'this instance has no session service yet')
+      }
+      return daemonDelivery.handle(body)
+    },
+  }
+
+  let webServerRef: WebServerLike | undefined
   const bridge = createMsg9Bridge(bridgeDeps)
   ctx.inject(['webServer'], (child) => {
     const server = (child as unknown as { webServer?: WebServerLike }).webServer
     if (!server) return
+    webServerRef = server
     child.effect(() => server.register({
       kind: 'prefix',
       path: BRIDGE_PREFIX,
@@ -207,8 +249,17 @@ export function apply(ctx: Context): void {
     // The registry arrives through its own inject above; read it lazily so
     // either wiring order works. (Reading child.workspaceRegistry HERE would
     // throw: it is not in this inject's dependency list.)
-    startWatcher(child, agents, () => registry, (message) => log.info(message), events, reconcileUnread)
-    log.info(`msg9 new-mail watcher started (every ${WATCH_POLL_MS / 1000}s, budget-capped wakeups)`)
+    startWatcher(
+      child,
+      agents,
+      () => registry,
+      (message) => log.info(message),
+      events,
+      reconcileUnread,
+      () => webServerRef?.port ?? 0,
+      daemonDelivery,
+    )
+    log.info(`msg9 new-mail watcher started (daemon-first, in-process fallback every ${WATCH_POLL_MS / 1000}s)`)
   })
 }
 
@@ -220,6 +271,8 @@ function startWatcher(
   log: (message: string) => void,
   events: { emit(event: string): void },
   reconcileUnread: () => Promise<void>,
+  getPort: () => number,
+  daemonDelivery: { token?: string; handle?: (body: DaemonDelivery) => Promise<unknown> },
 ): void {
   const rt = createWatchRuntime()
 
@@ -265,6 +318,40 @@ function startWatcher(
     uuid: () => randomUUID(),
     now: () => Date.now(),
     log,
+  }
+
+  // The daemon's delivery lands here (bridge route POST /dsh-msg9/deliver):
+  // project_key → workspace inbox, then watch.ts's last mile into the live
+  // session. A 404/409 answer tells the daemon to park the batch.
+  daemonDelivery.handle = async (body) => {
+    let key: string | undefined
+    let inbox: LiveInbox | undefined
+    const state = await deps.loadState()
+    for (const [candidate, row] of Object.entries(state.workspaces)) {
+      const resolved = await resolveCredentials(candidate, { log })
+      const projectKey = row.project_key
+        ?? await deriveProjectKey({ title: row.title, path: row.path }).catch(() => undefined)
+      if (projectKey === body.project_key || (resolved && resolved.address === body.inbox)) {
+        key = candidate
+        inbox = resolved
+        if (projectKey === body.project_key) break
+      }
+    }
+    if (!key || !inbox) {
+      throw new BridgeError(404, 'unknown-project', `no workspace of this instance serves ${body.project_key}`)
+    }
+    const delivered = await deliverDaemonBatch({
+      resolveAgent: (workspace) => deps.resolveAgent(workspace),
+      resolveAgentById: deps.resolveAgentById,
+      setWatchState,
+      uuid: () => randomUUID(),
+      log,
+    }, key, inbox, body)
+    if (!delivered) {
+      throw new BridgeError(409, 'no-live-session', `no live session for ${body.project_key}; the daemon will retry`)
+    }
+    deps.onEvent?.('mail')
+    return { delivered: body.messages.length, mode: body.mode }
   }
 
   if (process.env.MSG9_WATCH !== '0') {
@@ -324,17 +411,66 @@ function startWatcher(
         }
       }
 
-      if (streamUnsupported) {
-        startPolling()
-      } else {
-        void reconcile()
-        reconcileTimer = setInterval(() => void reconcile(), 60_000)
+      const startInProcessWatcher = (): void => {
+        if (streamUnsupported) {
+          startPolling()
+        } else {
+          void reconcile()
+          reconcileTimer = setInterval(() => void reconcile(), 60_000)
+        }
       }
+
+      // Daemon-first: the machine-wide watcher daemon owns the push channel
+      // when it is reachable (it also owns cursors/coalescing/budgets), and
+      // this instance then only answers /dsh-msg9/deliver. When the daemon
+      // cannot be booted or refuses the registration, fall back to the
+      // in-process watcher — never run both (double wake-ups, split cursors).
+      let daemonClient: DaemonClient | undefined
+      let disposed = false
+      if (process.env.MSG9_WATCH_DAEMON !== '0') {
+        daemonClient = createDaemonClient({
+          getPort,
+          getWorkspaces: async () => {
+            const state = await loadState()
+            const rows: WorkspaceRow[] = []
+            for (const [key, row] of Object.entries(state.workspaces)) {
+              const projectKey = row.project_key
+                ?? await deriveProjectKey({ title: row.title, path: row.path }).catch(() => key)
+              rows.push({ project_key: projectKey, key, title: row.title, path: row.path })
+            }
+            return rows
+          },
+          log,
+        })
+        daemonDelivery.token = daemonClient.deliverToken
+      }
+
+      void (async () => {
+        const connected = daemonClient ? await daemonClient.start() : false
+        if (disposed) {
+          if (connected) await daemonClient?.stop()
+          return
+        }
+        if (connected) {
+          log('msg9 watcher daemon connected; this instance is a delivery target only')
+        } else {
+          if (daemonClient) log('msg9 watcher daemon unavailable; falling back to the in-process watcher')
+          daemonClient = undefined
+          daemonDelivery.token = undefined
+          startInProcessWatcher()
+        }
+      })()
+
       return () => {
+        disposed = true
         master.abort()
         stopLoops()
         if (pollTimer) clearInterval(pollTimer)
         if (reconcileTimer) clearInterval(reconcileTimer)
+        if (daemonClient) {
+          daemonDelivery.token = undefined
+          void daemonClient.stop()
+        }
       }
     }, 'msg9-kit: mail watcher')
   }

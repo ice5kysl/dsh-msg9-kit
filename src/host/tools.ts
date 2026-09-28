@@ -192,7 +192,7 @@ export function registerMsg9Tools(ctx: Context): void {
       'The list shows a ~140-char preview per message; pass full:true (or call msg9_message for one id) ' +
       'when a letter is longer than the preview.',
     parameters: {
-      folder: { type: 'string', description: 'all | unread | read (default: all).' },
+      folder: { type: 'string', description: 'all | unprocessed | unread | read (default: all). `unprocessed` is the server-side open list and ignores the cursor.' },
       limit: { type: 'integer', description: 'Max messages to return (default 20, max 100).' },
       since: { type: 'string', description: 'Explicit opaque cursor to read from; does not advance the saved cursor.' },
       advance: { type: 'boolean', description: 'Force cursor advancement even with an explicit since.' },
@@ -236,7 +236,25 @@ export function registerMsg9Tools(ctx: Context): void {
 
         const limit = Math.max(1, Math.min(args.limit ?? 20, 100))
         const explicit = args.since
-        const since = explicit ?? inbox.cursor
+        // `unprocessed` is the server's own "still open" view and must NOT be
+        // narrowed by the read cursor: a letter pulled once and never closed
+        // would otherwise vanish from the agent's sight forever.
+        const unprocessed = args.folder === 'unprocessed'
+        const since = explicit ?? (unprocessed ? undefined : inbox.cursor)
+
+        if (unprocessed && !explicit) {
+          const page = await listInbox(inbox.api_url, inbox.api_key, { folder: 'unprocessed', limit }, exec?.signal)
+          const open = page.messages ?? []
+          return `${banner}${provisionNote}\n${formatMessages(
+            open,
+            page.unread_count ?? 0,
+            await autoReadNote(open, L(
+              '未处理视图：不受游标影响，闭环（回复或标为已处理）后才会消失。',
+              'Unprocessed view — not narrowed by the cursor; a letter stays until it is closed.',
+            )),
+            { full: args.full, bodyLimit: args.body_limit },
+          )}`
+        }
 
         if (since) {
           const page = await listInbox(inbox.api_url, inbox.api_key, { folder: args.folder, limit, since }, exec?.signal)

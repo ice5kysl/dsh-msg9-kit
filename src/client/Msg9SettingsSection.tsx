@@ -164,7 +164,9 @@ export function PendingChips({ titles }: { titles: string[] }): JSX.Element {
 function MigrationCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element | null {
   const [oldKey, setOldKey] = useState('')
   const legacyRows = state.workspaces.filter((row) => row.provisioned && row.legacy)
-  if (!state.owner?.slug || legacyRows.length === 0) return null
+  // ORG pods report no slug; the tenant domain lives in `address_domain`, so
+  // gating on slug alone hid this card exactly when it was needed.
+  if (!(state.owner?.address_domain || state.owner?.slug) || legacyRows.length === 0) return null
 
   return (
     <section style={styles.card}>

@@ -438,8 +438,11 @@ await check('renderMailNotice and helpers', () => {
 
   const notice = pluginNotice('id-1', 'text', 's')
   assert.equal(notice.role, 'user')
-  assert.equal(notice.source.kind, 'plugin')
-  assert.equal(notice.source.plugin, 'msg9-kit')
+  // v4 producer-owned source kind — matches dsh's v3→v4 migrator output for
+  // the retired { kind: 'plugin', plugin: 'msg9-kit' } wrapper; 'plugin' and
+  // '' are the only rejected kinds.
+  assert.equal(notice.source.kind, 'plugin:msg9-kit')
+  assert.equal('plugin' in notice.source, false)
 
   assert.deepEqual(unseenMessages([mail('a'), mail('b'), mail('c')], 'b').map((m) => m.message_id), ['a'])
   assert.deepEqual(unseenMessages([mail('a')], undefined).length, 1)

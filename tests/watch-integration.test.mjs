@@ -18,6 +18,9 @@ import { join } from 'node:path'
 
 process.env.MSG9KIT_LOCALE = 'en'
 process.env.MSG9_WATCH_MS = '1000'
+// This test exercises the IN-PROCESS watcher: never let the plugin look for
+// (or spawn) the machine-wide daemon.
+process.env.MSG9_WATCH_DAEMON = '0'
 // The batch window must fit the 1.8s assertion windows below.
 process.env.MSG9_WATCH_BATCH_MS = '200'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-watchit-'))
@@ -134,7 +137,7 @@ await check('a mail arriving after the baseline wakes the live agent', async () 
   assert.equal(inbox.watch_last_message_id, 'm-new')
   assert.equal(delivered.followup.length, 1, 'agent woken with a followup')
   assert.match(delivered.followup[0].content[0].text, /boss@msg9\.io/)
-  assert.equal(delivered.followup[0].source.plugin, 'msg9-kit')
+  assert.equal(delivered.followup[0].source.kind, 'plugin:msg9-kit', 'v4 producer-owned source kind (dsh persists it)')
 })
 
 server.close()
