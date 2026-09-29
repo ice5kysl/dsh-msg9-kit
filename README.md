@@ -22,6 +22,10 @@ The browser never sees a msg9 key: the panel calls `/dsh-msg9/*` on the local
 dsh web server, which performs the msg9 requests with the keys in the plugin's
 state file.
 
+## Compatibility
+
+- **dsh ≥ 0.1.7** — fully supported since **v0.4.7**: mail notices are injected with the v4 producer-owned source kind (`plugin:msg9-kit`) — the retired `kind:"plugin"` wrapper crashed the running turn under 0.1.7's persistence validation. The Messages panel resolves the session cwd from the `sessionId` slot prop (0.1.7 removed `current` from the session list state; the legacy field remains as a fallback for older hosts).
+
 ## Entry points
 
 | Where | What happens |

@@ -57,6 +57,8 @@ export interface Msg9PanelProps {
   onBack?: () => void
   /** Current session list state; the view follows the selected session. */
   useSessions?: (selector: (state: SessionListLike) => unknown) => unknown
+  /** Current session identity (0.1.7 session-scoped standard prop). */
+  sessionId?: string
 }
 
 interface SessionListLike {
@@ -131,14 +133,18 @@ function useRootHeightSync(): (node: HTMLDivElement | null) => void {
   }, [])
 }
 
-/** Read the selected session's directory out of the standard slot share. */
+/** Read the selected session's directory out of the standard slot shares.
+ *  0.1.7 hands the current session to session-scoped slots as the `sessionId`
+ *  prop (the list state no longer carries `current`); older hosts kept it in
+ *  the list state — prefer the prop, fall back to the legacy field. */
 function useSessionCwd(props: Msg9PanelProps): string | undefined {
+  const scopedId = typeof props.sessionId === 'string' && props.sessionId ? props.sessionId : undefined
   const selector = props.useSessions
   const read = useCallback((state: SessionListLike): unknown => {
-    const current = state?.current
-    if (!current) return undefined
-    return state?.byId?.[current]?.cwd
-  }, [])
+    const id = scopedId ?? state?.current
+    if (!id) return undefined
+    return state?.byId?.[id]?.cwd
+  }, [scopedId])
   // `useSessions` is itself a hook when the host provides one: keep the call
   // unconditional in shape (no early return above it) so hook order stays
   // stable; the host keeps this prop stable for the panel's lifetime.

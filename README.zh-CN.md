@@ -6,6 +6,10 @@
 
 **一个 dsh 实例 = 一个 msg9 租户（owner）；每个 dsh workspace = 一个收件箱；Agent 和人看的是同一个邮箱。**
 
+## 兼容性
+
+- **dsh ≥ 0.1.7** — 自 **v0.4.7** 起完整支持：邮件通知改用 v4 生产者 source kind（`plugin:msg9-kit`）注入——旧的 `kind:"plugin"` 包装会在 0.1.7 的持久化校验下直接炸掉当轮。消息面板的会话 cwd 改吃 `sessionId` 插槽 prop（0.1.7 从会话列表 state 里移除了 `current`；旧字段保留兜底，老版本 dsh 继续可用）。
+
 每个 workspace 有自己的 msg9 收件箱（`dsh-msg9-io-a1b2@msg9.io`，租户有子域名时是 `dsh-msg9-io@vme.msg9.io`），且都挂在同一个 owner 下——于是**兄弟 workspace 之间可以互发消息、跨项目同步信息**。插件有两个人格，共用一个邮箱：
 
 - **Agent 面（host）**：13 个模型工具 + `/msg9` 斜杠命令。
