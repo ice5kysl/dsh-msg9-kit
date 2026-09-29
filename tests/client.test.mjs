@@ -680,6 +680,29 @@ await check('store: loads overview, inbox, outbox and contacts through the bridg
   assert.equal(store.getState() === state, true)
 })
 
+await check('store: currentUnread is the current workspace count, not the account-wide total', async () => {
+  const store = client.createMsg9Store({
+    bridge: client.createBridge({ fetch: bridgeFetch() }),
+    pollMs: 10 ** 9,
+  })
+  store.setCwd('/work/a')
+  await store.refreshAll()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const state = store.getState()
+  // The fixture provisions more than one inbox with an equal per-inbox count,
+  // so the aggregate is strictly larger than any single workspace's number.
+  assert.ok(Object.keys(state.unreadByKey).length > 1, 'fixture has several inboxes')
+  assert.equal(client.currentUnread(state), state.unreadByKey[state.currentKey])
+  assert.notEqual(client.currentUnread(state), state.unreadTotal)
+  assert.ok(client.currentUnread(state) < state.unreadTotal, 'badge must not show the sum')
+
+  // No workspace selected yet → nothing to count.
+  assert.equal(client.currentUnread({ ...state, currentKey: null }), 0)
+  // A workspace with no unread reported → 0, never undefined/NaN.
+  assert.equal(client.currentUnread({ ...state, unreadByKey: {} }), 0)
+})
+
 await check('store: send, mark-read, contacts and provision move the real data', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
   store.setCwd('/work/a')

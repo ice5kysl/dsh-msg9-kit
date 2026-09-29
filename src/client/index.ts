@@ -26,7 +26,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { Msg9Panel } from './Msg9Panel.tsx'
 import { Msg9SettingsSection } from './Msg9SettingsSection.tsx'
 import { L } from './locale.ts'
-import { getMsg9Store } from './store.ts'
+import { getMsg9Store, currentUnread } from './store.ts'
 import { badgeText } from './view.ts'
 
 export const name = 'msg9-kit'
@@ -46,7 +46,7 @@ export { PendingChips } from './Msg9SettingsSection.tsx'
 export { filterRecipients, threadRows } from './view.ts'
 export { createBridge } from './api.ts'
 export { highlightReady, highlightCode } from './highlight.ts'
-export { createMsg9Store, getMsg9Store, selectedWorkspace } from './store.ts'
+export { createMsg9Store, getMsg9Store, selectedWorkspace, currentUnread } from './store.ts'
 
 /** Minimal service faces this plugin consumes (typed locally at the boundary). */
 interface SlotsLike {
@@ -78,12 +78,15 @@ export function apply(raw: Context): void {
       id: MSG9_VIEW_ID,
       order: 30,
       label: () => {
-        const badge = badgeText(store.getState().unreadTotal)
-        const base = badge
-          ? L('消息（{n}）', 'Messages ({n})', { n: store.getState().unreadTotal })
-          : L('消息', 'Messages')
+        const state = store.getState()
+        // The badge counts THIS workspace's inbox only. `unreadTotal` is the
+        // account-wide sum across every provisioned inbox, so using it here
+        // showed an unrelated number (e.g. 58 for one open tab).
+        const n = currentUnread(state)
+        const badge = badgeText(n)
+        const base = badge ? L('消息（{n}）', 'Messages ({n})', { n }) : L('消息', 'Messages')
         // The mute state must be visible without opening the tab.
-        return store.getState().notifyPaused ? `${base}‖` : base
+        return state.notifyPaused ? `${base}‖` : base
       },
       inject: () => ({ store }),
     },

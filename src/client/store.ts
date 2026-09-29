@@ -956,6 +956,19 @@ export function selectedWorkspace(state: Msg9State): WorkspaceView | undefined {
   return state.workspaces.find((row) => row.key === state.currentKey)
 }
 
+/**
+ * Unread count for the CURRENT workspace's inbox.
+ *
+ * `state.unreadTotal` is the account-wide sum over every provisioned inbox
+ * (the host aggregates all of `state.workspaces`), so it is the wrong number
+ * for the「消息」tab badge — that badge belongs to the workspace the session is
+ * in. Fall back to 0 when no workspace is selected yet.
+ */
+export function currentUnread(state: Msg9State): number {
+  if (!state.currentKey) return 0
+  return state.unreadByKey[state.currentKey] ?? 0
+}
+
 /** Overview rows the panel offers, current one first (already sorted by host). */
 export function workspaceOptions(state: Msg9State): WorkspaceView[] {
   return state.workspaces
