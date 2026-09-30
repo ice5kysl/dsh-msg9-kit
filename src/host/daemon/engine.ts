@@ -287,13 +287,24 @@ class InboxRunner {
           ws.destroy()
           return
         }
+        // Arm the close-waiter BEFORE anything that can await. A close landing
+        // during the catch-up window used to be a no-op (`wsWaiter` was still
+        // undefined when `releaseWs()` ran), and this loop then awaited a
+        // promise nobody would ever resolve: a PERMANENT, silent hang while
+        // `/healthz` kept answering 200 (msg9 PO field report 2026-09-30 — 90
+        // minutes of a dead doorbell, caught only by an external sweep).
+        const closed = new Promise<void>((resolve) => {
+          this.wsWaiter = resolve
+        })
         this.attachWs(ws)
         failures = 0
         // WS is at-least-once and NEVER replays: catch up from the cursor.
         await this.fetchNew('catch-up')
-        await new Promise<void>((resolve) => {
-          this.wsWaiter = resolve
-        })
+        if (this.abort.signal.aborted || this.stopped) return
+        // Released while catching up (close, error, or the watchdog firing):
+        // the waiter is already resolved — go reconnect instead of parking.
+        if (this.ws !== ws) continue
+        await closed
       } catch (error) {
         if (this.abort.signal.aborted || this.stopped) return
         failures += 1
@@ -331,7 +342,17 @@ class InboxRunner {
       this.log(`msg9 daemon: ws error for ${this.projectKey}: ${error.message}`)
       ws.destroy()
     }
-    ws.onclose = () => {
+    ws.onclose = (code, reason) => {
+      // Always say so: an unlogged close is why the hang above stayed invisible
+      // for 90 minutes (the only log line was onerror).
+      this.log(`msg9 daemon: ws closed for ${this.projectKey} (${code}${reason ? ` ${reason}` : ''}) — reconnecting`)
+      this.releaseWs()
+    }
+    // The socket can die between wsConnect() and this very line; in that case
+    // the close event has already fired with no handler attached, so reconcile
+    // it here (idempotent: releaseWs on a released connection is a no-op).
+    if (ws.isClosed) {
+      this.log(`msg9 daemon: ws for ${this.projectKey} was already closed before attach — retrying`)
       this.releaseWs()
     }
     if (this.watchdog) clearInterval(this.watchdog)

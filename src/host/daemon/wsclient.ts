@@ -161,6 +161,15 @@ export class WsConnection {
   lastFrameAt = Date.now()
   /** The subprotocol the server accepted, when it answered one. */
   readonly protocol: string | undefined
+  /**
+   * Whether the socket has already closed. The engine needs this to close a
+   * window its `onclose` handler cannot see: a socket that dies between
+   * `wsConnect()` and the handler being installed has already fired (and
+   * swallowed) its close event, so nothing would ever wake the loop.
+   */
+  get isClosed(): boolean {
+    return this.closed
+  }
 
   private readonly socket: Socket
   private readonly parser = new FrameParser()

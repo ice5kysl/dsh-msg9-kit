@@ -27,6 +27,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { closeSync, mkdirSync, openSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -161,8 +162,20 @@ export function createDaemonClient(deps: DaemonClientDeps): DaemonClient {
       deps.spawnDaemon(binPath)
       return
     }
+    // Logs must land somewhere. The daemon used to spawn with `stdio: 'ignore'`,
+    // so every console line (including the only evidence of a dead doorbell)
+    // went to /dev/null: the msg9 PO's field report could not be diagnosed from
+    // our side at all — the 90-minute hang was invisible until an external sweep
+    // noticed the spool had stopped growing. Append to daemon.log instead.
+    const logPath = join(home, 'daemon.log')
     try {
-      spawn(process.execPath, [binPath], { detached: true, stdio: 'ignore' }).unref()
+      mkdirSync(home, { recursive: true })
+      const logFd = openSync(logPath, 'a')
+      try {
+        spawn(process.execPath, [binPath], { detached: true, stdio: ['ignore', logFd, logFd] }).unref()
+      } finally {
+        closeSync(logFd)
+      }
     } catch (error) {
       log(`msg9 daemon: spawn failed: ${(error as Error)?.message ?? String(error)}`)
     }

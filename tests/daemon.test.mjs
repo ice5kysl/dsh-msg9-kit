@@ -10,6 +10,7 @@
 
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
@@ -314,6 +315,80 @@ await check('engine: notify_paused tracks silently (cursor advances, nothing del
 
 // ---------------------------------------------------------------- wsclient
 
+await check('engine: close DURING catch-up still reconnects（丢唤醒竞态，外部巡检实测形态）', async () => {
+  // 真故障形态：服务端在 catch-up 窗口内关连接（重启/发布）。旧实现把 waiter 挂在
+  // catch-up **之后**，于是 releaseWs() 里的 waiter?.() 是空操作，循环永久 await
+  // 一个没人 resolve 的 Promise —— 进程活着、/healthz 照旧 200、门铃永久哑掉。
+  //
+  // 旧测试从未演练这个窗口（fake listInbox 瞬间返回，close 永远落在停驻之后）。
+  // 这里让**每一次**取信都慢 200ms（thenable 页面 + 任意游标的 Proxy），把
+  // attach → waiter 之间的窗口撑开，再于窗口内关连接。
+  let connects = 0
+  let wsRef
+  const logs = []
+  const slow = () => {
+    // 注意：thenable 必须 resolve 到一个**另一个**普通对象 —— 拿自己 resolve 会让
+    // promise 自解析、永不 settle（我第一次就是这么写坏的，白查了半天）。
+    const value = { messages: [], next_cursor: 'C1', has_more: false }
+    return { ...value, then(resolve) { setTimeout(() => resolve(value), 200) } }
+  }
+  const { engine, registry, instance } = await makeEngine({
+    bootstrapPage: slow(),
+    sincePages: new Proxy({}, { get: () => async () => slow() }),
+    extraConfig: { reconnectBaseMs: 20, reconnectMaxMs: 40, wsWatchdogMs: 600_000, safetyNetMs: 600_000 },
+    logs,
+    wsConnect: async () => {
+      connects += 1
+      const ws = fakeWs()
+      ws.isClosed = false
+      wsRef = ws
+      if (connects === 1) setTimeout(() => ws.onclose?.(1006, 'server restart'), 40)
+      return ws
+    },
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    // ★ 旧实现下 connects 会永久停在 1（waiter 空挂）
+    await waitFor(() => connects >= 2, 4000)
+    assert.ok(connects >= 2, `catch-up 期间断连必须重连，实际只连了 ${connects} 次`)
+    assert.ok(
+      logs.some((line) => /ws closed for pk-1/.test(line)),
+      '断连必须留下日志（旧实现只有 onerror 记日志，静默失效因此 90 分钟无人知）',
+    )
+  } finally {
+    await engine.stop()
+  }
+})
+
+await check('engine: a socket that died BEFORE attach is reconciled instead of parked', async () => {
+  // wsConnect() 与本引擎挂 handler 之间那一瞬也能死：close 事件早已烧过（当时还没
+  // handler），引擎拿不到任何回调 —— 所以必须主动问一次 isClosed。
+  let connects = 0
+  const logs = []
+  const { engine, registry, instance } = await makeEngine({
+    bootstrapPage: { messages: [], next_cursor: 'C1', has_more: false },
+    sincePages: { C1: { messages: [], next_cursor: 'C1', has_more: false } },
+    extraConfig: { reconnectBaseMs: 20, reconnectMaxMs: 40, wsWatchdogMs: 600_000, safetyNetMs: 600_000 },
+    logs,
+    wsConnect: async () => {
+      connects += 1
+      const ws = fakeWs()
+      ws.isClosed = connects === 1 // 第一条"出生即死"
+      return ws
+    },
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    await waitFor(() => connects >= 2, 4000)
+    assert.ok(connects >= 2, `出生即死的连接必须被对账并重连，实际只连了 ${connects} 次`)
+    assert.ok(logs.some((line) => /already closed before attach/.test(line)), '这条对账要留痕')
+  } finally {
+    await engine.stop()
+  }
+})
+
 await check('engine: WS「连着但不发帧」（活进程·死连接）→ 看门狗判死并重连', async () => {
   // 这是真实故障形态：服务端重启后 socket 还"开着"，但再也不推任何东西。
   // 若没有看门狗，进程会**一直活着、一声不响**——信照样进账本（真相源是 inbox），
@@ -594,6 +669,27 @@ await check('daemonclient: registers against a live daemon, re-registers after u
     await client.stop()
     await daemon.close()
   }
+})
+
+await check('daemonclient: 真实 spawn 必须留下 daemon.log（否则日志进 /dev/null，静默失效无从追查）', async () => {
+  const home = await tempHome()
+  const client = createDaemonClient({
+    home,
+    getPort: () => 0,
+    getWorkspaces: async () => [],
+    dshHome: () => '/tmp/dsh-test-home',
+    log: () => {},
+    heartbeatMs: 60_000,
+    bootTimeoutMs: 100,
+    // 真 spawn（不注入 spawnDaemon）：指向一个不存在的脚本，node 立刻退出 ——
+    // 我们要断言的只是「日志文件被创建了」，而不是守护进程起来了。
+    binPath: join(home, 'does-not-exist.mjs'),
+  })
+  await client.start().catch(() => {})
+  assert.ok(
+    existsSync(join(home, 'daemon.log')),
+    'spawn 之后必须留下 daemon.log —— 这是 msg9 PO 那次 90 分钟静默卡死唯一的追查线索',
+  )
 })
 
 await check('daemonclient: spawns the daemon when none is running and waits for it', async () => {
