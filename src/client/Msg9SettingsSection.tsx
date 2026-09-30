@@ -248,6 +248,23 @@ export function canRemoveRecord(row: Msg9State['workspaces'][number]): boolean {
   )
 }
 
+/**
+ * Agent 段是否合规：**就是 harness 名，或 harness 名 + 可读后缀**
+ * （`dsh` / `dsh-2` / `dsh-dev` 都算；`diansuan@` / `jev@` 不算）。
+ *
+ * ⚠️ 这条规则**同时**被 `groupOf()`（分组）和行内告警用。
+ * 抽成函数是因为我第一版把两处各写了一遍、条件还不一样 ——
+ * 结果同一行**既被判为"规范的"、又显示 ⚠ 告警**（自相矛盾，dump 渲染时抓到）。
+ * 一条规则只能有一个实现。
+ */
+export function agentPartCompliant(address: string | null, expectedAgent: string | undefined): boolean {
+  if (!expectedAgent || !address) return true
+  const at = address.indexOf('@')
+  if (at < 0) return true
+  const local = address.slice(0, at)
+  return local === expectedAgent || local.startsWith(`${expectedAgent}-`)
+}
+
 export type GroupId = 'missing' | 'problem' | 'noncompliant' | 'unopened' | 'ok'
 
 export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
@@ -267,11 +284,7 @@ export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
   //    所以 `dsh` / `dsh-2` / `dsh-dev` 都算规范；`diansuan@` / `jev@` / `vme@`
   //    这种**拿 workspace 名当 Agent 名**的才是旧规则的产物。
   //    之前只查了 Pod 段，是**半条判据** —— 这里补齐另一半。
-  const expectedAgent = row.pod.expected_agent
-  if (expectedAgent && row.address) {
-    const local = row.address.slice(0, row.address.indexOf('@'))
-    if (local !== expectedAgent && !local.startsWith(`${expectedAgent}-`)) return 'noncompliant'
-  }
+  if (!agentPartCompliant(row.address, row.pod.expected_agent)) return 'noncompliant'
   return 'ok'
 }
 
@@ -424,6 +437,25 @@ function WorkspaceRow({
             ) : (
               <span style={styles.dim}>{L('（尚无 Pod）', '(no pod yet)')}</span>
             )}
+            {/* 告警**贴在它所属的那一层**（主人 2026-09-30：一行的告警堆了 6 行，
+                而且三段说的是同一件事）。说明压进悬停提示，不再占版面。 */}
+            {pod?.suggested_label && (
+              <span
+                style={styles.warn}
+                title={L(
+                  '这个 workspace 的信箱没开在自己的 Pod 里。应有的 Pod 是「{pod}」：{why}',
+                  'This inbox is not in its own pod. Expected pod: "{pod}" — {why}',
+                  {
+                    pod: pod.suggested_label,
+                    why: pod.suggested_exists
+                      ? L('该 Pod 已存在，可能就是它该去的地方', 'that pod exists — likely where it belongs')
+                      : L('该 Pod 尚未创建', 'that pod does not exist yet'),
+                  },
+                )}
+              >
+                {L('⚠ 应为「{pod}」', '⚠ expected "{pod}"', { pod: pod.suggested_label })}
+              </span>
+            )}
           </div>
           <div style={styles.lineRight}>
             {pod && pod.state === 'ready' && <span style={styles.pillOk}>{stateText}</span>}
@@ -453,6 +485,34 @@ function WorkspaceRow({
               <span style={styles.path}>{row.path}</span>
             </>
           )}
+          {row.health?.pathMissing && (
+            <span
+              style={styles.warn}
+              title={row.address
+                ? L(
+                    '仓库搬走了。信箱还在收信，但它挂在了已经不存在的工作区上。',
+                    'The repo moved. The inbox still receives mail, but it is attached to a workspace that no longer exists.',
+                  )
+                : L(
+                    '这是 dsh 注册表里的一条失效工作区，请到 dsh 中清理。',
+                    'A stale workspace in the dsh registry — clean it up in dsh.',
+                  )}
+            >
+              {L('⚠ 目录已不存在', '⚠ directory is gone')}
+            </span>
+          )}
+          {row.health?.stalePath && (
+            <span
+              style={styles.dim}
+              title={L(
+                'msg9 记录里的目录是旧路径：{old}。工作区现在在 {now}，以它为准。',
+                'The msg9 record holds an old path: {old}. The workspace is now at {now}; that one wins.',
+                { old: row.health.stalePath, now: row.health.registryPath ?? '' },
+              )}
+            >
+              {L('旧路径', 'old path')}
+            </span>
+          )}
         </div>
 
         {/* 行 3：Agent 信箱 —— 未读挂本行右端（它是**本信箱**的，不是 Pod 合计） */}
@@ -465,6 +525,32 @@ function WorkspaceRow({
               {row.address
                 ? <code style={styles.code}>{row.address}</code>
                 : <span style={styles.dim}>{L('（未开通）', '(not open)')}</span>}
+              {pod?.expected_agent && !agentPartCompliant(row.address, pod.expected_agent) && (
+                <span
+                  style={styles.warn}
+                  title={L(
+                    'Agent 段应当是 harness 名「{want}」。规范地址 = harness 名 @ 项目 Pod；'
+                    + '一个项目里有多个 dsh 时，可以加 dsh-2 / dsh-dev 这类**可读**后缀。',
+                    'The agent part should be the harness name "{want}". Compliant = harness name @ project pod; '
+                    + 'with several dsh inboxes in one project, readable suffixes like dsh-2 / dsh-dev are fine.',
+                    { want: pod.expected_agent },
+                  )}
+                >
+                  {L('⚠ 应为「{want}」', '⚠ expected "{want}"', { want: pod.expected_agent })}
+                </span>
+              )}
+              {row.health?.duplicateOf && (
+                <span
+                  style={styles.warn}
+                  title={L(
+                    '这条地址 {address} 有两条记录在管，收起一条才不会互相打架。',
+                    'Two records manage {address}; keeping one avoids them fighting over it.',
+                    { address: row.health.duplicateOf },
+                  )}
+                >
+                  {L('⚠ 地址重复', '⚠ duplicate address')}
+                </span>
+              )}
             </div>
             <div style={styles.lineRight}>
               {unread > 0 && (
@@ -483,77 +569,9 @@ function WorkspaceRow({
           </div>
         )}
 
-        {/* 健康判断：僵尸 / 重复。**从地址看不出来，所以必须标出来。** */}
-        {row.health?.pathMissing && (
-          <div style={styles.rowMeta}>
-            <span style={styles.warn}>{L('⚠ 目录已不存在', '⚠ directory is gone')}</span>
-            <span style={styles.dim}>
-              {row.address
-                ? L(
-                    '（仓库搬走了。信箱还在收信，但它挂在了已经不存在的工作区上）',
-                    '(the repo moved. The inbox still receives mail, but it is attached to a workspace that no longer exists)',
-                  )
-                : L(
-                    '（这是 dsh 注册表里的一条失效工作区，请到 dsh 中清理）',
-                    '(a stale workspace in the dsh registry — clean it up in dsh)',
-                  )}
-            </span>
-          </div>
-        )}
-        {/* 两处记录对"目录在哪"说法不一致：以注册表为准，但把旧记录摆出来。
-            这不是故障（工作区照常可用），所以是提示而非报警。 */}
-        {row.health?.stalePath && (
-          <div style={styles.rowMeta}>
-            <span style={styles.dim}>
-              {L('msg9 记录里的目录是旧路径', 'the msg9 record holds an old path')}
-            </span>
-            <code style={styles.code}>{row.health.stalePath}</code>
-            <span style={styles.dim}>
-              {L('（工作区现在在 {now}，以它为准）', '(the workspace is now at {now}; that one wins)', {
-                now: row.health.registryPath ?? '',
-              })}
-            </span>
-          </div>
-        )}
-        {row.health?.duplicateOf && (
-          <div style={styles.rowMeta}>
-            <span style={styles.warn}>{L('⚠ 与另一条记录共用同一地址', '⚠ shares an address with another record')}</span>
-            <code style={styles.code}>{row.health.duplicateOf}</code>
-          </div>
-        )}
-        {/* 没开在自己的 pod 里 —— 这是"不合规"的具体原因，逐行说清楚。
-            两种情形分开讲：
-              · 名字有语义、pod 也已存在 ⇒ 很可能就是该迁过去的地方（最强信号）
-              · 名字本身取不出合法 pod 名（纯 ASCII 限制）⇒ 需要人工指定
-            注意措辞：这违反的是**本工作区约定**（项目即 pod），
-            规范里它只是推荐用法 —— 不把约定说成规范。 */}
-        {/* Agent 段不是 harness 名（规范地址的另一半）。 */}
-        {pod?.expected_agent && row.address
-          && row.address.slice(0, row.address.indexOf('@')) !== pod.expected_agent && (
-          <div style={styles.rowMeta}>
-            <span style={styles.warn}>
-              {L('⚠ Agent 名不是 harness 名（应为「{want}」或「{want}-后缀」）', '⚠ the agent part is not the harness name (expected "{want}" or "{want}-suffix")', { want: pod.expected_agent })}
-            </span>
-            <span style={styles.dim}>
-              {L('（规范地址 = harness 名 @ 项目 Pod；多个 dsh 可加 dsh-2 / dsh-dev 这类可读后缀）', '(compliant = harness name @ project pod; extra dsh inboxes may use readable suffixes like dsh-2 / dsh-dev)')}
-            </span>
-          </div>
-        )}
-        {pod?.suggested_label && (
-          <div style={styles.rowMeta}>
-            <span style={styles.warn}>
-              {L('⚠ 没开在自己的 Pod 里（应为「{pod}」）', '⚠ not in its own pod (expected "{pod}")', { pod: pod.suggested_label })}
-            </span>
-            <span style={styles.dim}>
-              {!pod.suggested_meaningful
-                ? L('（该名字取不出合法的 Pod 名，需人工指定）', '(name cannot yield a valid pod label; set it manually)')
-                : pod.suggested_exists
-                  ? L('（该 Pod 已存在，可能就是它该去的地方）', '(that pod already exists — likely where it belongs)')
-                  : L('（该 Pod 尚未创建）', '(that pod does not exist yet)')}
-            </span>
-          </div>
-        )}
-
+        {/* 告警已全部内联到各自那一层（Pod / 工作区 / Agent）——
+            原先在这里堆 3 个 ⚠ + 3 段括号说明共 6 行，而三段说的其实是同一件事：
+            "这个信箱开错地方了"。说明移进悬停提示，版面只留结论。 */}
         {relink.open && (
           <div style={styles.confirmBox}>
             <div style={styles.rowTitle}>
