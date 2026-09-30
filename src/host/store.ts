@@ -382,6 +382,42 @@ export async function deleteWorkspaceInbox(key: string): Promise<void> {
   })
 }
 
+/**
+ * 把一个信箱记录**整体**从旧 workspace 键搬到新键（同一条记录，内容不变）。
+ *
+ * 场景：工作区 a 开在目录 a1（已有信箱），后来 a1 被移到 a2。dsh 的工作区身份
+ * 是**规范化路径**（见 @deepseek-ai/dsh-workspace），所以 a2 会是一条**新 id**，
+ * 而旧 id 连同它的死路径永远留在注册表里 —— a1 那条再也没有对应的活工作区。
+ * 于是信箱记录"挂在了已经不存在的工作区上"。
+ *
+ * 这里做的就是把记录**改挂到新 id**：地址、key、游标、监听基线、已读标记全部
+ * 跟着这条记录走，**不碰凭据文件、不碰远端、不碰 dsh 的注册表**。
+ *
+ * ⚠️ 必须**单次写**完成"复制 + 删除"：拆成两次（先 upsert 再 delete）的话，
+ *    中间进程崩掉就会出现"记录重复"或"记录丢失"。
+ */
+export async function relinkWorkspaceInbox(
+  fromKey: string,
+  toKey: string,
+  patch: Partial<WorkspaceInbox> = {},
+): Promise<WorkspaceInbox | undefined> {
+  return enqueueWrite(async () => {
+    const state = await loadState()
+    const source = state.workspaces[fromKey]
+    if (!source) return undefined
+    // 目标已有记录 ⇒ **绝不覆盖**（覆盖等于悄悄挤掉另一个信箱）。
+    // 调用方应先返回 409；这里再兜一层，防止绕过端点的调用丢数据。
+    if (state.workspaces[toKey]) {
+      throw new Error(`workspace "${toKey}" already has an inbox record`)
+    }
+    const moved = { ...source, ...patch }
+    state.workspaces[toKey] = moved
+    delete state.workspaces[fromKey]
+    await saveState(state)
+    return moved
+  })
+}
+
 /** Replace an inbox wholesale (migration): cursor fields must not survive. */
 export async function replaceWorkspaceInbox(key: string, inbox: WorkspaceInbox): Promise<void> {
   return enqueueWrite(async () => {

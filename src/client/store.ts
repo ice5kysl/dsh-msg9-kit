@@ -21,6 +21,7 @@ import type {
   OrgView,
   OwnerView,
   PeerRow,
+  RelinkTarget,
   WorkspaceView,
 } from '../shared/types.ts'
 import { createBridge, errorText, type BridgeClient, type BridgeOptions } from './api.ts'
@@ -201,6 +202,10 @@ export interface Msg9Store {
    * 服务端会再判一次"是否为该地址的唯一持有者"，不安全就拒绝。
    */
   removeWorkspace(key: string): Promise<void>
+  /** 重挂的候选目标（只读，点「挂到…」时才拉）。 */
+  relinkTargets(key: string): Promise<RelinkTarget[]>
+  /** 把这条信箱记录重挂到 `toKey` 那个工作区（纯本地；成功后刷新）。 */
+  relinkWorkspace(fromKey: string, toKey: string): Promise<boolean>
   /** Skip binding for now. */
   dismissSetup(): void
 }
@@ -1009,6 +1014,35 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     /**
      * 移除一条本地记录。**不做乐观更新** —— 等服务端确认（它可能因"唯一持有者"拒绝）。
      */
+    /**
+     * 重挂：把信箱记录改挂到另一个工作区。
+     *
+     * 为什么要有这个动作：dsh 的工作区身份是规范化路径，目录一搬就是新工作区，
+     * 旧 id 连同死路径永远留在注册表里 —— 信箱记录于是挂在不存在的工作区上。
+     * 重挂**只改 msg9-kit 自己的 state 键**：地址、key、游标、监听基线、已读标记
+     * 全都跟着走；凭据文件、远端信箱、dsh 注册表一概不动。
+     *
+     * 成功返回 true（界面据此收起选择器）；失败返回 false 并留 notice。
+     */
+    async relinkWorkspace(fromKey, toKey) {
+      try {
+        const result = await bridge.relinkWorkspace({ from_key: fromKey, to_key: toKey })
+        notice('ok', L(
+          '已把 {address} 挂到「{title}」（{path}）。只改了本地记录，远端与凭据都没动。',
+          'Relinked {address} to "{title}" ({path}). Local record only — remote and credentials untouched.',
+          { address: result.address ?? '', title: toKey, path: result.path },
+        ))
+        await refreshAll()
+        return true
+      } catch (error) {
+        notice('error', errorText(error))
+        return false
+      }
+    },
+    async relinkTargets(key) {
+      const result = await bridge.relinkTargets({ key })
+      return result.targets
+    },
     async removeWorkspace(key) {
       try {
         const result = await bridge.removeWorkspace({ key })

@@ -156,6 +156,23 @@ export interface OrgView {
   max_pods?: number | null
 }
 
+/**
+ * 重挂（把信箱记录改挂到另一个工作区）的候选目标。
+ *
+ * 背景：dsh 的工作区身份是**规范化路径**，目录一搬就是一条新工作区，旧 id 连同
+ * 死路径留在注册表里 —— 信箱记录会"挂在不存在的工作区上"。重挂只改 msg9-kit
+ * 自己的记录，不碰远端/凭据/dsh 注册表。
+ */
+export interface RelinkTarget {
+  key: string
+  title: string
+  path: string
+  /** 标题与源工作区完全相同（搬家最常见的对应关系，排最前）。 */
+  same_title: boolean
+  /** 目录名与源工作区相同（次一级信号）。 */
+  same_dir: boolean
+}
+
 /** One message, as msg9 returns it (inbox and outbox share the shape). */
 export interface MessageRow {
   id?: string

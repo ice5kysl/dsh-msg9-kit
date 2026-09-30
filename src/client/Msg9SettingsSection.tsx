@@ -16,6 +16,7 @@ import { Mail } from './icons.tsx'
 import { L } from './locale.ts'
 import { SetupView } from './Msg9Panel.tsx'
 import type { Msg9State, Msg9Store } from './store.ts'
+import type { RelinkTarget } from '../shared/types.ts'
 import { ACCENT, BORDER, DIM, FG, M9_CSS } from './theme.ts'
 import { badgeText } from './view.ts'
 
@@ -315,6 +316,11 @@ function WorkspaceRow({
   const opening = state.opening[row.key] ?? { busy: false, error: null }
   const [editLabel, setEditLabel] = useState<string | null>(null)
   const [confirmRemove, setConfirmRemove] = useState(false)
+  // 重挂：候选目标是懒加载的（点「挂到…」才去要，避免每次 overview 都算一遍）
+  const [relink, setRelink] = useState<{ open: boolean; targets: RelinkTarget[] | null; pick: string; error: string | null }>(
+    { open: false, targets: null, pick: '', error: null },
+  )
+  const [relinking, setRelinking] = useState(false)
 
   const stateText = !pod || pod.state === 'unconfigured'
     ? L('未配置 ORG', 'No ORG')
@@ -377,7 +383,15 @@ function WorkspaceRow({
           <div style={styles.rowMeta}>
             <span style={styles.warn}>{L('⚠ 目录已不存在', '⚠ directory is gone')}</span>
             <span style={styles.dim}>
-              {L('（仓库搬走了，这条记录是残留）', '(the repo moved; this record is a leftover)')}
+              {row.address
+                ? L(
+                    '（仓库搬走了。信箱还在收信，但它挂在了已经不存在的工作区上）',
+                    '(the repo moved. The inbox still receives mail, but it is attached to a workspace that no longer exists)',
+                  )
+                : L(
+                    '（这是 dsh 注册表里的一条失效工作区，请到 dsh 中清理）',
+                    '(a stale workspace in the dsh registry — clean it up in dsh)',
+                  )}
             </span>
           </div>
         )}
@@ -420,6 +434,81 @@ function WorkspaceRow({
                   ? L('（该 Pod 已存在，可能就是它该去的地方）', '(that pod already exists — likely where it belongs)')
                   : L('（该 Pod 尚未创建）', '(that pod does not exist yet)')}
             </span>
+          </div>
+        )}
+
+        {relink.open && (
+          <div style={styles.confirmBox}>
+            <div style={styles.rowTitle}>
+              {L('把这条信箱挂到哪个工作区？', 'Relink this inbox to which workspace?')}
+            </div>
+            <div style={styles.dim}>
+              {L(
+                '只改本地记录：地址、密钥、游标、监听基线、已读标记全部跟着走。远端信箱、凭据文件、dsh 的工作区注册表都不动。',
+                'Local record only: address, key, cursor, watch baseline and read marks all move with it. The remote inbox, credential files and the dsh registry are untouched.',
+              )}
+            </div>
+            {relink.error && <span style={styles.warn}>{relink.error}</span>}
+            {relink.targets === null
+              ? <span style={styles.dim}>{L('正在读取工作区列表…', 'Loading workspaces…')}</span>
+              : relink.targets.length === 0
+                ? (
+                  <span style={styles.dim}>
+                    {L(
+                      '没有可挂的目标：注册表里没有"目录存在、且还没有信箱"的工作区。请先在 dsh 里打开搬走后的目录（登记成工作区）。',
+                      'No eligible target: no registry workspace with an existing directory and no inbox yet. First open the moved directory in dsh.',
+                    )}
+                  </span>
+                )
+                : (
+                  <>
+                    <select
+                      className="m9-input"
+                      style={styles.slugInput}
+                      value={relink.pick}
+                      onChange={(event) => setRelink((prev) => ({ ...prev, pick: event.target.value }))}
+                    >
+                      <option value="">{L('选择要挂到的工作区…', 'Pick a workspace…')}</option>
+                      {relink.targets.map((target) => (
+                        <option key={target.key} value={target.key}>
+                          {target.same_title ? '★ ' : (target.same_dir ? '· ' : '')}
+                          {target.title} — {target.path}
+                        </option>
+                      ))}
+                    </select>
+                    <div style={styles.rowMeta}>
+                      <span style={styles.dim}>
+                        {L('★ = 标题相同，· = 目录名相同', '★ same title, · same directory name')}
+                      </span>
+                    </div>
+                  </>
+                )}
+            <div style={styles.rowMeta}>
+              <button
+                type="button"
+                className="m9-btn m9-btn-primary"
+                style={styles.smallBtn}
+                disabled={!relink.pick || relinking}
+                onClick={() => {
+                  if (!relink.pick) return
+                  setRelinking(true)
+                  void store.relinkWorkspace(row.key, relink.pick).then((done) => {
+                    setRelinking(false)
+                    if (done) setRelink({ open: false, targets: null, pick: '', error: null })
+                  })
+                }}
+              >
+                {relinking ? L('挂接中…', 'Relinking…') : L('挂到', 'Relink')}
+              </button>
+              <button
+                type="button"
+                className="m9-btn"
+                style={styles.smallBtn}
+                onClick={() => setRelink({ open: false, targets: null, pick: '', error: null })}
+              >
+                {L('取消', 'Cancel')}
+              </button>
+            </div>
           </div>
         )}
 
@@ -478,6 +567,27 @@ function WorkspaceRow({
               {opening.busy ? L('开通中…', 'Opening…') : L('开通', 'Open pod')}
             </button>
           </>
+        )}
+        {/* 重挂：只在"目录没了、但信箱还在"时出现 —— 这正是"文件夹搬走了"的形态。
+            其余情况不给（避免把好端端的信箱挂走）。 */}
+        {row.health?.pathMissing && row.address && !relink.open && (
+          <button
+            type="button"
+            className="m9-btn"
+            style={styles.smallBtn}
+            title={L(
+              '把这个信箱挂到搬走后的那个工作区（只改本地记录）',
+              'Attach this inbox to the moved workspace (local record only)',
+            )}
+            onClick={() => {
+              setRelink({ open: true, targets: null, pick: '', error: null })
+              void store.relinkTargets(row.key)
+                .then((targets) => setRelink((prev) => ({ ...prev, targets })))
+                .catch((error: unknown) => setRelink((prev) => ({ ...prev, targets: [], error: String(error) })))
+            }}
+          >
+            {L('挂到…', 'Relink…')}
+          </button>
         )}
         {/* 人工移除：**只在判断为安全时出现**，且永不触碰远端信箱 */}
         {row.health?.removable && (row.health.pathMissing || row.health.duplicateOf) && (

@@ -58,7 +58,7 @@ import {
 import { L } from './locale.ts'
 import { derivePodLabel, ensureInbox, ensureSigningKey, isMeaningfulPodLabel, maskKey, migrateInbox, openPod, ownerContext, podState, type InboxContext } from './service.ts'
 import { credentialsMigrated, readOrgKey, removeProjectCredentials, resolveCredentials, saveOwner, writeOrgKey } from './credentials.ts'
-import { defaultApiUrl, deleteWorkspaceInbox, getNotifyPaused, isTenantOwner, loadState, saveState, setMessageMark, setNotifyPaused, stateFilePath, withStateLock, type LiveInbox, type OwnerState, type State } from './store.ts'
+import { defaultApiUrl, deleteWorkspaceInbox, getNotifyPaused, relinkWorkspaceInbox, isTenantOwner, loadState, saveState, setMessageMark, setNotifyPaused, stateFilePath, withStateLock, type LiveInbox, type OwnerState, type State } from './store.ts'
 import type { OverviewView, PodStateView, WorkspaceHealth, WorkspaceView } from '../shared/types.ts'
 import type { OrgInfo } from './api.ts'
 import {
@@ -1394,6 +1394,113 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         removed_files: removedFiles,
         // 明确回给界面：远端什么都没动
         remote_untouched: true,
+      })
+    }
+
+    /**
+     * 重挂的候选目标（只读）。
+     *
+     * 只列**目录存在、且还没有 msg9 记录**的工作区 —— 有记录的目标一律排除，
+     * 因为重挂不允许覆盖（那会悄悄挤掉另一个信箱）。
+     * 排序：标题完全相同的最前（改名/搬家时最常见的对应关系），其次目录名相同，
+     * 其余按标题字母序。
+     */
+    if (method === 'GET' && path === `${BRIDGE_PREFIX}/relink-targets`) {
+      const url3 = new URL(req.url ?? '/', 'http://localhost')
+      const fromKey = url3.searchParams.get('key') ?? ''
+      const state = await deps.loadState()
+      const source = state.workspaces[fromKey]
+      if (!source) throw new BridgeError(404, 'unknown-workspace', `no workspace record is registered as "${fromKey}"`)
+      const sourceBase = (source.path || '').split('/').filter(Boolean).pop() ?? ''
+      const targets = deps.listWorkspaces()
+        .filter((workspace) => workspace.key !== fromKey)
+        .filter((workspace) => !state.workspaces[workspace.key]) // 目标必须还没有信箱
+        .filter((workspace) => Boolean(workspace.path) && existsSync(workspace.path))
+        .map((workspace) => ({
+          key: workspace.key,
+          title: workspace.title,
+          path: workspace.path,
+          same_title: workspace.title === source.title,
+          same_dir: (workspace.path.split('/').filter(Boolean).pop() ?? '') === sourceBase,
+        }))
+        .sort((a, b) => {
+          if (a.same_title !== b.same_title) return a.same_title ? -1 : 1
+          if (a.same_dir !== b.same_dir) return a.same_dir ? -1 : 1
+          return a.title.localeCompare(b.title)
+        })
+      return ok(res, { from_key: fromKey, targets })
+    }
+
+    /**
+     * 把信箱记录重挂到另一个工作区（**纯本地动作**）。
+     *
+     * 背景：dsh 的工作区身份是规范化路径，目录一搬就是一条新工作区；旧 id 连同
+     * 死路径永远留在注册表里，于是信箱记录挂在了不存在的工作区上。
+     * 这里只改 msg9-kit 自己的 `state.json` 键，**不碰凭据文件、不碰远端、
+     * 不碰 dsh 的注册表**（那是 dsh 内核的存储单元，插件不该代改）。
+     */
+    if (method === 'POST' && path === `${BRIDGE_PREFIX}/relink-workspace`) {
+      const body = await readJsonBody(req)
+      const fromKey = str(body.from_key)
+      const toKey = str(body.to_key)
+      if (!fromKey || !toKey) {
+        throw new BridgeError(400, 'missing-key', 'fields "from_key" and "to_key" are required')
+      }
+      if (fromKey === toKey) {
+        throw new BridgeError(400, 'same-workspace', 'from_key and to_key must differ')
+      }
+      const state = await deps.loadState()
+      const source = state.workspaces[fromKey]
+      if (!source) {
+        throw new BridgeError(404, 'unknown-workspace', `no workspace record is registered as "${fromKey}"`)
+      }
+      // 护栏①：目标已有记录 ⇒ 拒绝，绝不覆盖（否则会挤掉另一个信箱）
+      if (state.workspaces[toKey]) {
+        throw new BridgeError(409, 'target-taken', L(
+          '目标工作区 "{to}" 已经有信箱记录了，重挂会覆盖它；已拒绝。',
+          'workspace "{to}" already has an inbox record; relinking would overwrite it.',
+          { to: toKey },
+        ))
+      }
+      const target = deps.listWorkspaces().find((workspace) => workspace.key === toKey)
+      // 护栏②：目标必须是 dsh 注册表里真实存在的工作区
+      if (!target) {
+        throw new BridgeError(400, 'unknown-target', L(
+          '"{to}" 不在 dsh 的工作区注册表里；已拒绝。',
+          '"{to}" is not a registered dsh workspace.',
+          { to: toKey },
+        ))
+      }
+      // 护栏③：目标目录必须真的存在（挂到一个也不存在的目录上毫无意义）
+      if (!existsSync(target.path)) {
+        throw new BridgeError(409, 'target-path-missing', L(
+          '目标工作区的目录 {path} 已不存在；已拒绝。',
+          'the target workspace directory {path} does not exist.',
+          { path: target.path },
+        ))
+      }
+      // 护栏④：源目录还在 ⇒ 不需要重挂。这条专门防止"把好端端的信箱挂走"。
+      const sourcePathMissing = Boolean(source.path) && !existsSync(source.path)
+      if (!sourcePathMissing) {
+        throw new BridgeError(409, 'source-alive', L(
+          '源工作区的目录（{path}）仍然存在，不需要重挂；已拒绝。',
+          'the source workspace directory ({path}) still exists; nothing to relink.',
+          { path: source.path },
+        ))
+      }
+      const moved = await relinkWorkspaceInbox(fromKey, toKey, { path: target.path })
+      invalidateUnreadCache()
+      const movedAddress = (await resolveVia(deps, toKey))?.address ?? null
+      deps.log(`msg9: relinked inbox record ${fromKey} -> ${toKey} (local only)`)
+      return ok(res, {
+        from_key: fromKey,
+        to_key: toKey,
+        address: movedAddress,
+        project_key: moved?.project_key ?? null,
+        path: target.path,
+        // 明确回给界面：远端与凭据都没动
+        remote_untouched: true,
+        credentials_untouched: true,
       })
     }
 

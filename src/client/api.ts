@@ -18,6 +18,7 @@ import type {
   MessagesView,
   MigrateResult,
   OutboxView,
+  RelinkTarget,
   OverviewView,
   OwnerView,
   PeerRow,
@@ -137,6 +138,24 @@ export interface BridgeClient {
     signal?: AbortSignal,
   ): Promise<{ key: string; address: string | null; removed_files: string[]; remote_untouched: boolean }>
   resolve(address: string, signal?: AbortSignal): Promise<{ record: Record<string, unknown> }>
+  /** 重挂的候选目标（只读）：目录存在、且还没有信箱记录的工作区。 */
+  relinkTargets(
+    input: { key: string },
+    signal?: AbortSignal,
+  ): Promise<{ from_key: string; targets: RelinkTarget[] }>
+  /** 把信箱记录重挂到另一个工作区（纯本地；不碰远端、不碰凭据、不碰 dsh 注册表）。 */
+  relinkWorkspace(
+    input: { from_key: string; to_key: string },
+    signal?: AbortSignal,
+  ): Promise<{
+    from_key: string
+    to_key: string
+    address: string | null
+    project_key: string | null
+    path: string
+    remote_untouched: boolean
+    credentials_untouched: boolean
+  }>
 }
 
 export interface BridgeOptions {
@@ -279,6 +298,19 @@ export function createBridge(options: BridgeOptions = {}): BridgeClient {
       removed_files: string[]
       remote_untouched: boolean
     }>('/remove-workspace', { method: 'POST', body: input, signal }),
+    relinkTargets: (input, signal) => request<{ from_key: string; targets: RelinkTarget[] }>(
+      `/relink-targets${query({ key: input.key })}`,
+      { signal },
+    ),
+    relinkWorkspace: (input, signal) => request<{
+      from_key: string
+      to_key: string
+      address: string | null
+      project_key: string | null
+      path: string
+      remote_untouched: boolean
+      credentials_untouched: boolean
+    }>('/relink-workspace', { method: 'POST', body: input, signal }),
     openPod: (input, signal) => request<{
       key: string
       state: string
