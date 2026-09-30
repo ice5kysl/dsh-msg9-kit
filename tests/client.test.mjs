@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
@@ -31,7 +31,10 @@ const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-client-'))
 // 所以这里把 /work/* 换成本次运行的真实临时目录（保持测试真实性，不是放宽断言）。
 const workRoot = join(stateDir, 'work')
 const W = Object.fromEntries(
-  ['a', 'b', 'c', 'd', 't', 'taken'].map((name) => [name, join(workRoot, name)]),
+  // delta / echo / theta：P1「项目即 pod」那几条新用例的 workspace。
+  // 它们不在假 registry 里（走 `cwd:` bucket），所以不会影响
+  // 「overview 只列 4 个 workspace」那类断言；各自一个 pod、互不干扰。
+  ['a', 'b', 'c', 'd', 't', 'taken', 'delta', 'echo', 'theta'].map((name) => [name, join(workRoot, name)]),
 )
 for (const dir of Object.values(W)) await mkdir(dir, { recursive: true })
 
@@ -46,9 +49,64 @@ const { renderToStaticMarkup } = require_('react-dom/server')
 
 // ---------------------------------------------------------------- fake msg9
 
-const seen = { send: [], read: [], readBy: [], processed: [], contactAdd: [], contactRemove: [], ownerAgents: 0, register: 0, inboxLimit: [], provisioned: [], provisionProfiles: [], directory: [], forwarding: [], moveMail: [], signingKeys: [] }
-/** 假服务端认为"已被占用"的本地部分，由各用例显式设置（见上）。 */
-let conflictLocals = new Set()
+const seen = { send: [], read: [], readBy: [], processed: [], contactAdd: [], contactRemove: [], ownerAgents: 0, register: 0, inboxLimit: [], provisioned: [], provisionProfiles: [], directory: [], forwarding: [], moveMail: [], signingKeys: [], ownerAgentAuth: [] }
+
+/**
+ * 假 msg9 的**身份表**：token → 这个 token 在服务端上是谁。
+ *
+ * 🔴 为什么必须有它（2026-09-30 真事故的核心）：
+ * `POST /owner/agents` **只收 local part**，agent 落在哪个域完全由 **key 的域** 决定。
+ * 旧夹具没有这张表 —— 域是"看 token 长什么样"猜的，而且冲突集是**全局**的，
+ * 于是"拿 dsh pod 的 key 去开别的 pod 的 workspace"在测试里竟然能成功；
+ * 生产上则被服务端拒成 40900，还被报成"dsh/dsh-2/dsh-3/dsh-4 都被占用"这种
+ * 与真实原因（用错 key）毫无关系的文案。
+ *
+ *   domain: 该 key 建 agent 时落在哪个域（扁平租户 ⇒ `msg9.io`）
+ *   me:     `GET /owner/me` 的应答。**扁平租户没有 `address_domain`**（它没有 pod 段），
+ *           pod key 才有，且首段就是它的 pod label —— `podKeyProbe()` 的判据
+ *（旧夹具只给 `slug` / `mail_domain`，于是这个判据永远判不出来）。
+ */
+const identities = new Map([
+  // 扁平租户：设置页「绑定 owner key」用
+  ['msg9_tk_ui_1234567890', { domain: 'msg9.io', me: { id: 'own_ui', name: 'dsh-ui', mail_domain: 'msg9.io', quota: { max_agents: 50 } } }],
+  // 带 slug 的老租户（升级后的服务端形态）：域 = `<slug>.<mail_domain>`
+  ['msg9_tk_slug_1234567890', { domain: 'vme.msg9.io', me: { id: 'own_sl', name: 'slugged', slug: 'vme', mail_domain: 'msg9.io', address_domain: 'vme.msg9.io', quota: { max_agents: 50 } } }],
+])
+
+/**
+ * 把一把 pod key 落到规范位置 `tenants/<pod>-<org>.key`，并在身份表里登记它的域。
+ *
+ * 这就是"夹具改成新模型"的入口：**每个被测 workspace 备好它自己 pod 的 key**
+ * （旧夹具只在 `state.owner.api_key` 放了一把 key —— 那是"单 pod 模型"，
+ *  新模型下目标 pod 没有 key 就必须明确报错，而不是拿别的 pod 的 key 顶上）。
+ */
+async function seedPodKey(podLabel, key, domain = `${podLabel}.ice.msg9.io`) {
+  // 身份表里已经有这个 token 的**不覆盖**：`/owner/me` 必须按它的**真实**身份
+  // 作答，否则 `podKeyProbe()` 的判据就是假的（一把 key 只能有一个域）。
+  if (!identities.has(key)) {
+    identities.set(key, {
+      domain,
+      me: { id: `own_${podLabel}`, name: podLabel, slug: '', mail_domain: 'msg9.io', address_domain: domain, quota: { max_agents: 50 } },
+    })
+  }
+  await mkdir(join(process.env.MSG9_HOME, 'tenants'), { recursive: true })
+  await writeFile(join(process.env.MSG9_HOME, 'tenants', `${podLabel}-ice.key`), `${key}\n`, { mode: 0o600 })
+}
+
+/**
+ * 每个域**已占用**的 local part —— 真实服务端就是这样判重的。
+ *
+ * 旧夹具只有一个全局 `conflictLocals`：它把「`dsh` 在 dsh pod 里被占」
+ * 变成「`dsh` 在任何 pod 里都被占」，正好把"用错 key"的全部症状抹平了。
+ */
+const occupied = new Map()
+function occupy(domain, locals) {
+  const set = occupied.get(domain) ?? new Set()
+  for (const local of locals) set.add(local)
+  occupied.set(domain, set)
+}
+function clearOccupied() { occupied.clear() }
+function isOccupied(domain, local) { return (occupied.get(domain) ?? new Set()).has(local) }
 const ownerAgents = [{ id: 'oa_a', agent_address: 'dsh-alpha-1a2b@msg9.io', profile: { display_name: 'alpha', description: 'alpha workspace inbox', capabilities: ['code-review'] } }]
 
 const inbox = [
@@ -241,13 +299,12 @@ const server = createServer(async (req, res) => {
     return reply(res, 200, { code: 0, data: { status: 'ok' } })
   }
   if (req.method === 'GET' && path === '/api/v1/owner/me') {
-    const auth = req.headers.authorization || ''
-    // A tenant with a subdomain slug (post-upgrade server shape).
-    if (auth === 'Bearer msg9_tk_slug_1234567890') {
-      return reply(res, 200, { code: 0, data: { id: 'own_sl', name: 'slugged', slug: 'vme', mail_domain: 'msg9.io', quota: { max_agents: 50 } } })
-    }
-    if (auth !== 'Bearer msg9_tk_ui_1234567890') return reply(res, 401, { code: 40100, message: 'invalid owner key' })
-    return reply(res, 200, { code: 0, data: { id: 'own_ui', name: 'dsh-ui', quota: { max_agents: 50 } } })
+    // 按 token 忠实作答：**pod key 必须给出它的 `address_domain`**
+    //（旧夹具只给 `slug` / `mail_domain`，于是 `keyManagesPod()` 判不了 pod ——
+    //  这正是"用错 pod 的 key"能溜过测试的第二个原因）。
+    const identity = identities.get((req.headers.authorization || '').replace(/^Bearer\s+/, ''))
+    if (!identity) return reply(res, 401, { code: 40100, message: 'invalid owner key' })
+    return reply(res, 200, { code: 0, data: identity.me })
   }
   if (req.method === 'GET' && path === '/api/v1/owner/agents') {
     seen.ownerAgents += 1
@@ -277,20 +334,25 @@ const server = createServer(async (req, res) => {
   }
   if (req.method === 'POST' && path === '/api/v1/owner/agents') {
     const body = await readBody(req)
-    seen.provisioned.push(body.addresses[0])
+    const key = (req.headers.authorization || '').replace(/^Bearer\s+/, '')
+    const local = body.addresses[0]
+    seen.ownerAgentAuth.push(key)
+    seen.provisioned.push(local)
     seen.provisionProfiles.push(body.profile ?? null)
-    // 冲突集**由各用例显式设置**（`conflictLocals`），不靠隐式顺序 ——
-    // 规范改成"本地部分 = harness 名"之后，本地部分不再随 workspace 名变，
-    // 硬编码某个字面量既不真实也会让用例互相影响。
-    if (conflictLocals.has(body.addresses[0])) {
-      return reply(res, 200, { code: 0, data: { created: [], errors: [{ address: `${body.addresses[0]}@vme.msg9.io`, code: 40900, message: 'address already taken' }] } })
+    const identity = identities.get(key)
+    if (!identity) return reply(res, 401, { code: 40100, message: 'invalid owner key' })
+    // 🔴 地址落在哪个域 = **key 的域**。local part 只是这个域里的一个名字。
+    //    「dsh 在 dsh pod 里被占」不等于「dsh 在 gamma pod 里被占」——
+    //    旧夹具的全局冲突集 + 猜出来的域，把这条真实规则整个丢了。
+    const domain = identity.domain
+    if (isOccupied(domain, local)) {
+      return reply(res, 200, { code: 0, data: { created: [], errors: [{ address: `${local}@${domain}`, code: 40900, message: 'address already taken' }] } })
     }
-    // The slugged tenant mints addresses on its own domain.
-    const domain = req.headers.authorization === 'Bearer msg9_tk_slug_1234567890' ? 'vme.msg9.io' : 'msg9.io'
-    const address = `${body.addresses[0]}@${domain}`
+    occupy(domain, [local])
+    const address = `${local}@${domain}`
     seen.ownerAgents += 1
     ownerAgents.push({ id: 'oa_new', agent_address: address, ...(body.profile ? { profile: body.profile } : {}) })
-    return reply(res, 200, { code: 0, data: { created: [{ address, api_key: `msg9_sk_prov_${body.addresses[0]}` }], errors: [] } })
+    return reply(res, 200, { code: 0, data: { created: [{ address, api_key: `msg9_sk_prov_${local}` }], errors: [] } })
   }
   if (req.method === 'POST' && /^\/api\/v1\/owner\/agents\/.+\/disable$/.test(path)) {
     seen.disabled = seen.disabled ?? []
@@ -322,15 +384,45 @@ process.env.MSG9_API_URL = apiUrl
 // Pre-provisioned tenant: an owner plus two workspace inboxes. Workspace C has
 // no inbox yet, so the panel's "open inbox" path has something to do.
 await writeFile(process.env.MSG9_STATE_FILE, `${JSON.stringify({
-  owner: { api_key: 'msg9_tk_smoketest0123456789', api_url: apiUrl, id: 'own_1', name: 'dsh' },
+  // `slug` / `address_domain` 显式为 null（而不是缺省）= 「探测过一次，服务端说这是
+  // 扁平租户」。`ownerContext()` 只对 `undefined` 补探测，所以这钉住了扁平形态：
+  // overview 的预览地址、legacy 判定都按它算。key 本体在凭据仓
+  //（`tenants/vme-ice.key`）—— 元数据与 key 是两件事，规范要求**两件都成立**。
+  owner: { api_key: 'msg9_tk_smoketest0123456789', api_url: apiUrl, id: 'own_1', name: 'dsh', mail_domain: 'msg9.io', slug: null, address_domain: null },
   // ORG 绑定（主人 2026-09-30 的形态）：设置页第 ② 步读的就是它。
   // 只放元数据，**key 本体在凭据仓**（state.json 从不存明文 key）。
-  org: { label: 'ice', id: 'org_1', name: 'ICE', api_url: apiUrl, verified_at: '2026-09-30T00:00:00.000Z' },
+  org: {
+    label: 'ice', id: 'org_1', name: 'ICE', api_url: apiUrl, verified_at: '2026-09-30T00:00:00.000Z',
+    // 本实例**自己的** pod：`knownTenantKeyName()` 靠它把本实例的 key 精确定位到
+    // `tenants/<pod_label>-<org>.key`（此处 = `tenants/vme-ice.key`）——
+    // 多把 pod key 并存时，这正是规范说的"不替调用方猜"。
+    // 它**只**管本实例自己：`provision()` 不再拿它当所有 workspace 的默认 pod，
+    // 那正是本次修掉的那个 bug（见文件末尾 P1-1 / P1-2）。
+    pod_label: 'vme',
+    // 下面这几个 workspace 属于 pod `vme`：人工指定 pod 是规范允许的覆盖口。
+    // `ws-a` 的信箱是旧的扁平地址，迁移时按它"应有的 pod"重新开通。
+    pod_labels: {
+      'ws-a': 'vme',
+      [`cwd:${W.t}`]: 'vme',
+      [`cwd:${W.taken}`]: 'vme',
+    },
+  },
   workspaces: {
     'ws-a': { address: 'dsh-alpha-1a2b@msg9.io', api_key: 'msg9_sk_a', api_url: apiUrl, title: 'alpha', path: W.a, cursor: 'C1' },
     'ws-b': { address: 'dsh-beta-3c4d@msg9.io', api_key: 'msg9_sk_b', api_url: apiUrl, title: 'beta', path: W.b },
   },
 }, null, 2)}\n`)
+
+// pod key 按**新模型**落盘：每个被测 workspace 备好**它自己 pod** 的 key，
+// 而不是像旧夹具那样只在 `state.owner.api_key` 放一把（那是"单 pod 模型"）。
+// 新模型下 `provision()` 用**目标 pod 的 key** 建 agent，拿不到就明确报错。
+//
+// 本实例自己的 pod：`vme`（key 落在 `tenants/vme-ice.key`，正是上面 pod_label
+// 指的位置）。它的域是 `vme.msg9.io` —— 带 slug 的老租户升级成 pod 后的形态；
+// tenant-mode / migrate 那几条用例钉的就是这个域（夹具沿用旧租户域，不带 org 段）。
+await seedPodKey('vme', 'msg9_tk_smoketest0123456789', 'vme.msg9.io')
+// 被测 workspace ws-c 的项目 pod：`gamma` —— 新模型要求的正是这一把 key。
+await seedPodKey('gamma', 'msg9_tk_gamma_ice', 'gamma.ice.msg9.io')
 
 // ------------------------------------------------------------- fake dsh host
 
@@ -360,6 +452,9 @@ const {
   createBridgeEventBus,
   readProjectCredentials,
   harnessAgentName,
+  // P1「项目即 pod」的用例要用：直接验 writeTenantKey 的"不静默覆盖"闸
+  msg9Home,
+  writeTenantKey,
 } = await import('../lib/index.js')
 
 const bridge = createMsg9Bridge(defaultBridgeDeps(host))
@@ -559,7 +654,10 @@ await check('bridge: provision opens the inbox of a workspace that has none', as
   const before = seen.ownerAgents
   const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.c, title: 'gamma' } })
   assert.equal(payload.data.key, 'ws-c')
-  assert.ok(payload.data.address.startsWith('dsh-gamma-'), payload.data.address)
+  // 规范地址 = `<harness 名>@<项目 Pod>.<org>.<base>`（2026-09-30 定案）。
+  // ws-c 的项目 pod 是 `gamma`（由标题/目录名推导），它的 key 是 tenants/gamma-ice.key，
+  // 于是落地地址是 `dsh@gamma.ice.msg9.io` —— **不再是**旧的 `dsh-gamma-<hash4>@…`。
+  assert.equal(payload.data.address, 'dsh@gamma.ice.msg9.io', payload.data.address)
   assert.equal(payload.data.provisioned, true)
   assert.equal(seen.ownerAgents, before + 1)
   // Provisioning writes the yellow-pages profile for the new inbox.
@@ -750,7 +848,7 @@ await check('store: send, mark-read, contacts and provision move the real data',
 
   store.selectWorkspace('ws-c')
   await store.provision()
-  assert.ok(store.getState().notice.text.includes('dsh-gamma-'), store.getState().notice.text)
+  assert.ok(store.getState().notice.text.includes('dsh@gamma.ice.msg9.io'), store.getState().notice.text)
   assert.equal(store.getState().workspaces.find((row) => row.key === 'ws-c').provisioned, true)
 })
 await check('store: failed sends surface a notice and keep the draft', async () => {
@@ -1144,7 +1242,7 @@ await check('settings section renders the service intro, ORG binding and its ope
   assert.ok(html.includes('Ready'), html)
   assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'first inbox listed')
   assert.ok(html.includes('dsh-beta-3c4d@msg9.io'), 'second inbox listed')
-  assert.ok(html.includes('dsh-gamma-'), 'newly opened inbox listed too')
+  assert.ok(html.includes('dsh@gamma.ice.msg9.io'), 'newly opened inbox listed too')
   // 三层分明：workspace / Pod / Agent（主人 2026-09-30 的 UI 要求）
   assert.ok(html.includes('Pod'), '显示 Pod 层')
   assert.ok(html.includes('Agent'), '显示 Agent 层')
@@ -1926,7 +2024,9 @@ await check('tenant mode: 撞名时退到【可读后缀】dsh-2，不再用带�
   // 主人 2026-09-30：「如果有多个 dsh，后续可以加 dsh-1、dsh-2 或者 dsh-dev、dsh-fe 这样」
   // ⇒ 撞名要能兜底，但兜出来的必须是**一眼能读**的名字。
   // 旧实现退化成 <workspace-slug>-<hash4>（dsh-jev-8221 / dsh-ws-04fe）—— 已废弃。
-  conflictLocals = new Set(['dsh'])
+  // 真实服务端按**域**判重：`dsh` 在 vme 域里已被上一条用例占掉。
+  // （旧夹具有一个全局冲突集，正好抹掉"按域判重"这半个模型。）
+  occupy('vme.msg9.io', ['dsh'])
   const before = seen.provisioned.length
   const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.taken, title: 'taken' } })
   assert.equal(payload.data.provisioned, true)
@@ -1934,7 +2034,7 @@ await check('tenant mode: 撞名时退到【可读后缀】dsh-2，不再用带�
   assert.deepEqual(attempts, ['dsh', 'dsh-2'], '一个冲突，一次重试；后缀是可读编号')
   assert.equal(payload.data.address, 'dsh-2@vme.msg9.io')
   assert.doesNotMatch(payload.data.address, /-[0-9a-f]{4}@/, '不得再出现哈希后缀')
-  conflictLocals = new Set()
+  clearOccupied()
 })
 
 await check('settings section groups workspaces and offers NO one-click migrate', async () => {
@@ -2008,6 +2108,110 @@ await check('tenant migration: legacy inbox is re-provisioned and the old one su
   // Overview is clean again.
   const after = await call(`${BRIDGE_PREFIX}/overview`)
   assert.equal(after.payload.data.workspaces.find((r) => r.key === 'ws-a').legacy, false)
+})
+
+// ------------------------------------- P1「项目即 pod」：修复的回归（2026-09-30）
+
+/**
+ * 2026-09-30 那次真事故的护栏。事故原话形状：
+ *   给一个 **project pod 不是 dsh** 的 workspace 点「开通」⇒ 报
+ *   「本项目下『dsh』『dsh-2』『dsh-3』『dsh-4』都已被占用，自动编号用完了」。
+ * 真原因有两个，各配一条用例（每一条都**可证伪**：把对应的修复拆掉就红）：
+ *   ① `provision()` 拿**本实例自己**的 pod key 去给别的项目的 workspace 开信箱；
+ *   ② `readTenantKeyForPod()` 在目标 pod 没有 key 时**跨 pod 回退**，
+ *      并且把回退来的错 key 静默写进目标 pod 的规范位置。
+ * 另外两条是配套的闸：`podKeyProbe` 的"用前验证"、`writeTenantKey` 的"不静默覆盖"。
+ */
+
+await check('P1-1：开通用的是【目标 pod 自己的】租户 key，不是本实例的', async () => {
+  // 判据有两半，缺一不可：
+  //   ① 服务端在 POST /owner/agents 上收到的必须是**目标 pod** 的 token；
+  //   ② 落地地址的域必须是**目标 pod** 的域。
+  // 旧实现两半都错：它拿本实例的 key 去建，于是服务端在**本实例的 pod** 里判重，
+  // 撞出一串 40900 —— 那串"编号用完了"的文案就是从这里来的。
+  await seedPodKey('delta', 'msg9_tk_delta_ice', 'delta.ice.msg9.io')
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, {
+    method: 'POST',
+    body: { cwd: W.delta, title: 'delta' },
+  })
+  assert.equal(payload.ok, true, JSON.stringify(payload))
+  assert.equal(payload.data.provisioned, true)
+  assert.equal(payload.data.address, 'dsh@delta.ice.msg9.io', '地址落在目标 pod 的域里')
+  assert.equal(seen.ownerAgentAuth.at(-1), 'msg9_tk_delta_ice', '用的是目标 pod 的 token')
+  assert.notEqual(seen.ownerAgentAuth.at(-1), 'msg9_tk_smoketest0123456789', '绝不是本实例的 token')
+})
+
+await check('P1-2：目标 pod 没有本地 key ⇒ 明确报错，且【一次建 agent 请求都不发】', async () => {
+  // 防的是"跨 pod 回退"：目标 pod 没有 key 时拿本实例的 key 顶上 ⇒
+  //   · 上游那条"本地没有它的 pod key"的守卫**永远不触发**；
+  //   · 用错身份撞出来的报错与真实原因完全无关（就是那个"编号用完了"）；
+  //   · 调用方还会把这把错 key 写进目标 pod 的规范位置（静默覆盖）。
+  // `echo` 目录存在、有语义，但本地就是没有它的 pod key。
+  seen.provisioned.length = 0 // 本条只看这一次调用发出了什么
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, {
+    method: 'POST',
+    body: { cwd: W.echo, title: 'echo' },
+  })
+  assert.equal(payload.ok, false, '必须失败，而不是"换一把 key 试试"')
+  assert.match(payload.error.message, /No local tenant key for pod "echo"/, payload.error.message)
+  assert.equal(seen.provisioned.length, 0, '不该发出任何 POST /owner/agents')
+})
+
+await check('P1-3：域不属于目标 pod 的 key 不被采用（用前验证）', async () => {
+  // 本地规范位置里躺着**别的 pod** 的 key —— 这正是"跨 pod 回退写错"的后果。
+  // 用前必须验证（`GET /owner/me` 的 address_domain 首段 = pod label）：
+  //   ① 错 key 被跳过；② 回退到下一个候选（`tenants/<pod>.key`）并成功；
+  //   ③ 错的那把**绝不**出现在 POST /owner/agents 上。
+  // 反过来说：不验证就会拿它去建 agent ⇒ 又在错的 pod 里建了一个身份。
+  const dir = join(msg9Home(), 'tenants')
+  await mkdir(dir, { recursive: true })
+  // ① 规范位置：一把 `address_domain` 属于 `dsh` 的 key（放错 pod 了）
+  identities.set('msg9_tk_theta_wrong', {
+    domain: 'dsh.ice.msg9.io',
+    me: { id: 'own_dsh_stray', name: 'dsh', slug: '', mail_domain: 'msg9.io', address_domain: 'dsh.ice.msg9.io', quota: { max_agents: 50 } },
+  })
+  await writeFile(join(dir, 'theta-ice.key'), 'msg9_tk_theta_wrong\n')
+  // ② 旧位置：一把真正属于 `theta` 的 key
+  identities.set('msg9_tk_theta_right', {
+    domain: 'theta.ice.msg9.io',
+    me: { id: 'own_theta', name: 'theta', slug: '', mail_domain: 'msg9.io', address_domain: 'theta.ice.msg9.io', quota: { max_agents: 50 } },
+  })
+  await writeFile(join(dir, 'theta.key'), 'msg9_tk_theta_right\n')
+
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, {
+    method: 'POST',
+    body: { cwd: W.theta, title: 'theta' },
+  })
+  assert.equal(payload.ok, true, JSON.stringify(payload))
+  assert.equal(payload.data.address, 'dsh@theta.ice.msg9.io', '用了真正属于 theta 的那把 key')
+  assert.equal(seen.ownerAgentAuth.at(-1), 'msg9_tk_theta_right')
+  assert.ok(!seen.ownerAgentAuth.includes('msg9_tk_theta_wrong'), '错 pod 的 key 一次都没被拿去建 agent')
+})
+
+await check('P1-4：写 pod key 覆盖旧值必须先留 .bak（绝不静默覆盖）', async () => {
+  // 防的是 DEF-001 同族（本机已复发 2 次）：一次写盘把某个 pod 真正的 key
+  // 覆盖掉、且**不留痕迹**，之后每次读都"自信地"拿到错的 ——
+  // 表现成"开通失败"却指不出原因。这一条直接盯 writeTenantKey 的实现。
+  const dir = join(msg9Home(), 'tenants')
+  await mkdir(dir, { recursive: true })
+  const path = join(dir, 'zeta-ice.key')
+  await writeFile(path, 'msg9_tk_zeta_old\n')
+
+  const written = await writeTenantKey('msg9_tk_zeta_new', { podLabel: 'zeta', orgLabel: 'ice' })
+  assert.equal(written.path, path, '按规范写 <pod>-<org>.key')
+  assert.ok(written.backedUp, '覆盖前必须留一份备份')
+  assert.equal(await readFile(written.backedUp, 'utf8'), 'msg9_tk_zeta_old\n', '备份内容 = 被覆盖掉的旧值')
+  assert.equal(await readFile(path, 'utf8'), 'msg9_tk_zeta_new\n', '新值已落盘')
+
+  const countBackups = async () => (await readdir(dir)).filter((name) => name.startsWith('zeta-ice.key.bak-'))
+  assert.equal((await countBackups()).length, 1, '只留一份')
+  // 内容相同 ⇒ 不算覆盖，不再堆备份（否则每次重开都留一份垃圾）
+  await writeTenantKey('msg9_tk_zeta_new', { podLabel: 'zeta', orgLabel: 'ice' })
+  assert.equal((await countBackups()).length, 1, '同值重写不备份')
+
+  // 清理：别把 zeta 留在 tenants/ 里影响"多把 key 时不替调用方猜"那类判据
+  for (const name of await countBackups()) await rm(join(dir, name), { force: true })
+  await rm(path, { force: true })
 })
 
 // ------------------------------------------------ stylesheet ownership (T-16)

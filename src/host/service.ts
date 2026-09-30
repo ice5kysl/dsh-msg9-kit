@@ -149,6 +149,45 @@ async function takenProjectKeys(): Promise<Map<string, string>> {
   return taken
 }
 
+/**
+ * 「给这个 workspace 建 agent，该用哪把 pod key？」
+ *
+ * `provision()` 与 `migrateInbox()` **必须共用这一处**。
+ *
+ * ⚠️ 教训（2026-09-30）：`migrateInbox()` 一度自己拿 `ownerContext()` 的 key
+ * （= **本实例自己**那个 pod 的）去建 agent，于是**同一个缺陷在迁移路径上又活了一遍** ——
+ * `provision` 修好了、迁移没修，而迁移的用例恰好因为夹具把"本实例 pod"设成被测 pod 而通过。
+ * **通过 ≠ 用对了 key。** 所以这段逻辑只能有一份实现。
+ *
+ * 拿不到目标 pod 的 key ⇒ 抛明确可操作的错，**绝不退回实例的 key**。
+ */
+async function ownerForWorkspace(
+  workspace: CurrentWorkspace,
+  owner: OwnerState | undefined,
+  apiUrl: string,
+  orgLabel: string | undefined,
+): Promise<OwnerState | undefined> {
+  if (!orgLabel || !owner?.api_key) return owner
+  const targetPod = await podLabelFor(workspace)
+  const podKey = await readTenantKeyForPod(targetPod, orgLabel, apiUrl)
+  if (!podKey) {
+    throw new Error(L(
+      '本地没有 Pod「{pod}」的租户 key，无法在该 Pod 下开通信箱。'
+      + '先点该行的「开通」按提示取得 pod key（该 Pod 已存在时，需要提供它自己的租户 key），再重试。',
+      'No local tenant key for pod "{pod}", so no inbox can be created under it.',
+      { pod: targetPod },
+    ))
+  }
+  // 把**目标 pod 的真实域**写进 owner：`isTenantOwner()` 只看 `slug || address_domain`，
+  // 若实例 owner 是 flat 的（两者皆空），不补这一手就会掉进 flat 命名分支，
+  // 产出 `dsh-<slug>-<hash4>` 那种认不出来的地址。
+  return {
+    ...owner,
+    api_key: podKey.key,
+    ...(podKey.domain ? { address_domain: podKey.domain, slug: '' } : {}),
+  }
+}
+
 async function provision(
   workspace: CurrentWorkspace,
   log?: (message: string) => void,
@@ -171,7 +210,9 @@ async function provision(
   const profile = workspaceProfile(workspace)
   // A preference set earlier still applies to a fresh inbox, so re-opening a
   // workspace keeps the address its user asked for.
-  const preferredAddress = preferred ?? (await loadState()).workspaces[workspace.key]?.preferred_address
+  const stateForProvision = await loadState()
+  const orgLabel = stateForProvision.org?.label
+  const preferredAddress = preferred ?? stateForProvision.workspaces[workspace.key]?.preferred_address
 
   // ---------------------------------------------------------------- 显式开启
   //
@@ -193,8 +234,12 @@ async function provision(
     )
   }
 
-  const agent: RegisteredAgent = owner?.api_key
-    ? await provisionUnderOwner(apiUrl, owner, workspace, profile, preferredAddress)
+  // ★ 地址的 pod 必须与 key 的 pod 一致（2026-09-30 事故）。逻辑集中在
+  //   `ownerForWorkspace()` —— `migrateInbox` 共用同一份，见那里的注释。
+  const ownerForKey = await ownerForWorkspace(workspace, owner, apiUrl, orgLabel)
+
+  const agent: RegisteredAgent = ownerForKey?.api_key
+    ? await provisionUnderOwner(apiUrl, ownerForKey, workspace, profile, preferredAddress)
     : await registerAgent(apiUrl, deriveAddress(workspace), undefined, profile)
 
   // 身份与密钥落 msg9 统一凭据仓（0600/0700）；state.json 只留热状态 +
@@ -338,7 +383,10 @@ export async function migrateInbox(
   if (!owner?.api_key) {
     throw new Error(L('还没有绑定租户，无法迁移。', 'No tenant is bound; cannot migrate.'))
   }
-  const agent = await provisionUnderOwner(apiUrl, owner, workspace, workspaceProfile(workspace), preferred)
+  const stateForMigrate = await loadState()
+  // 上面的守卫已保证 owner 有 key ⇒ `?? owner` 只补类型收窄（helper 在无 ORG 时原样返回）
+  const ownerForKey = (await ownerForWorkspace(workspace, owner, apiUrl, stateForMigrate.org?.label)) ?? owner
+  const agent = await provisionUnderOwner(apiUrl, ownerForKey, workspace, workspaceProfile(workspace), preferred)
   // 签名材料只在内存里备好：转发没设成之前 state/凭据仓必须仍指向旧信箱。
   let signingSeed: string | undefined
   try {
@@ -480,6 +528,26 @@ function podSlugify(text: string): string {
 }
 
 /**
+ * 某个 workspace 该用哪个 pod。
+ *
+ * ⚠️ `openPod` 与 `provision` **必须共用这一处推导**：前者负责"建/取这个 pod 的
+ * key"，后者负责"用那个 key 去建 agent"。两处一旦分叉，就会出现
+ * **地址的 pod 与 key 的 pod 不一致** —— 服务端拒绝，而错误文案会指到一个
+ * 完全无关的方向（2026-09-30 事故：报成"自动编号用完了"）。
+ *
+ * 注意这里**没有** `state.org.pod_label`（实例级）这一层兜底：
+ * 那是"本实例自己"的 pod，只该用于 `resolveOwner()`；
+ * 拿它当所有 workspace 的默认 pod，会让每个项目都往同一个 pod 里开信箱
+ * —— 正是"9 个身份堆进 msg9.ice.msg9.io"那类事故的成因。
+ */
+async function podLabelFor(workspace: CurrentWorkspace, explicit?: string | null): Promise<string> {
+  const state = await loadState()
+  return explicit
+    ?? state.org?.pod_labels?.[workspace.key]
+    ?? derivePodLabel(workspace)
+}
+
+/**
  * 推导本 workspace 的 pod label。
  *
  * 规范 §4：「pod label = 小写短名（≤20 字符为宜），可读优先于缩写」；
@@ -542,10 +610,7 @@ export async function openPod(
   const apiUrl = state.org?.api_url ?? defaultApiUrl()
   // pod label 的优先级：调用方显式指定 > 该 workspace 的人工覆盖 > ORG 默认 > 推导。
   // "人工覆盖"就是主人要的那条口子：「免得自动生成的 pod slug 很乱」。
-  const label = options?.podLabel
-    ?? state.org?.pod_labels?.[workspace.key]
-    ?? state.org?.pod_label
-    ?? derivePodLabel(workspace)
+  const label = await podLabelFor(workspace, options?.podLabel)
 
   // ② 只读探测：pod 是否已在 ORG 下存在
   let pods: OrgPodRow[]
@@ -568,7 +633,7 @@ export async function openPod(
   if (existingPod) {
     // ③ 复用：但需要它的 pod key。pod key 服务端只在创建时给一次，
     //    所以先看本地有没有；没有则明确报错，**绝不静默重建一个已存在的 pod**。
-    podKey = (await readTenantKeyForPod(label, orgLabel)) ?? undefined
+    podKey = (await readTenantKeyForPod(label, orgLabel, apiUrl))?.key
     if (!podKey) {
       throw new Error(L(
         'Pod「{pod}」已存在于 ORG「{org}」下（已有 {agents} 个 agent），但本地没有它的 pod key。'
@@ -615,16 +680,77 @@ export async function openPod(
   }
 }
 
-/** 读某个 pod 的 key（`tenants/<pod>-<org>.key`，按规范命名）。 */
-async function readTenantKeyForPod(podLabel: string, orgLabel?: string): Promise<string | null> {
-  if (orgLabel) {
+/**
+ * 读**指定 pod** 的租户 key（与 `readTenantKeyWithSource` 的区别：后者只认
+ * "本实例自己"的 pod）。
+ *
+ * 优先级：
+ *   ① `tenants/<pod>-<org>.key`  规范位置
+ *   ② `tenants/<pod>.key`        旧模型（文件名就是 pod 名）—— MuM 的真 key 就在这
+ *   ③ **仅当 `pod === 本实例自己的 pod`** 时，才允许通用解析（同一个 pod，语义正确）
+ *   ④ 都没有 ⇒ `null`
+ *
+ * ⚠️ **绝不跨 pod 回退**。旧实现在 ①② 都失败时直接 `readTenantKeyWithSource()`，
+ * 于是"目标 pod 没有 key"变成了"拿本实例自己的 key 顶上"：
+ *   - 上游那条"本地没有它的 pod key"的守卫**永远不触发**；
+ *   - 调用方还会把这把错 key **写进规范位置**（`writeTenantKey`），
+ *     把该 pod 真正的 key 覆盖掉，之后每次读都自信地拿到错的。
+ * 宁可返回 `null` 让**清晰**的错误触发，也不要拿错身份去撞出一个指错方向的报错。
+ */
+async function readTenantKeyForPod(
+  podLabel: string,
+  orgLabel?: string,
+  apiUrl?: string,
+): Promise<{ key: string; source: string; domain?: string } | null> {
+  const candidates = [
+    ...(orgLabel ? [`${podLabel}-${orgLabel}.key`] : []),
+    `${podLabel}.key`,
+  ]
+  for (const name of candidates) {
+    let key: string | undefined
     try {
-      const key = (await readFile(join(msg9Home(), 'tenants', `${podLabel}-${orgLabel}.key`), 'utf8')).trim()
-      if (key) return key
-    } catch { /* 落到通用解析 */ }
+      key = (await readFile(join(msg9Home(), 'tenants', name), 'utf8')).trim() || undefined
+    } catch { continue }
+    if (!key) continue
+    // 用前验证：这把 key 真的管这个 pod 吗？（只读；判不了就不据此否决）
+    const probe = apiUrl ? await podKeyProbe(apiUrl, key, podLabel) : { manages: null as boolean | null }
+    if (probe.manages === false) continue
+    return { key, source: `tenants/${name}`, ...(probe.domain ? { domain: probe.domain } : {}) }
   }
-  const resolved = await readTenantKeyWithSource().catch(() => undefined)
-  return resolved?.key ?? null
+  // 只有"本实例自己的 pod"才允许走通用解析
+  const state = await loadState()
+  const mine = state.org?.pod_label ?? state.owner?.pod_label
+  if (mine && mine === podLabel) {
+    const resolved = await readTenantKeyWithSource().catch(() => undefined)
+    if (resolved) return { key: resolved.key, source: resolved.source }
+  }
+  return null
+}
+
+/**
+ * 这把 key 是不是**这个 pod** 的？
+ *
+ * 判据：`GET /owner/me` 给出的 `address_domain` 首段是否等于 pod label
+ * （比"看它管着哪些 agent"可靠 —— **空 pod 一个 agent 都没有**，那种情况下
+ * 后者永远判不出来）。
+ *
+ * 返回 `null` = **判不了**（服务端没给域 / 网络或权限问题）⇒ 调用方不应据此否决，
+ * 让后续步骤去报真正的错误。
+ */
+async function podKeyProbe(
+  apiUrl: string,
+  key: string,
+  podLabel: string,
+): Promise<{ manages: boolean | null; domain?: string }> {
+  try {
+    const me = await ownerMe(apiUrl, key)
+    const domain = typeof me.address_domain === 'string' ? me.address_domain
+      : typeof me.mail_domain === 'string' ? me.mail_domain : undefined
+    if (!domain) return { manages: null }
+    return { manages: domain.split('.')[0] === podLabel, domain }
+  } catch {
+    return { manages: null }
+  }
 }
 
 /** Display/format helpers shared with the browser face. */

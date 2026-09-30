@@ -147,15 +147,24 @@ check('P0-b ★：未配置 pod key 时开通被拒（不会静默注册）', as
 
   // ② 旧的公开自助注册必须只在显式允许时才可达 —— 否则静默降级会复活。
   //    守卫写在三元条件的【判断处】（`!owner?.api_key && !allowSelfRegister`），
-  //    所以要连同那一小段作用域一起看，而不是只看 registerAgent 那一行。
+  //    所以要连同它所在的作用域一起看，而不是只看 registerAgent 那一行。
+  //
+  //    ⚠️ 这里**不数固定行数**：守卫和调用之间隔着「地址的 pod 必须与 key 的
+  //    pod 一致」那段注释和 ORG 分支，注释一长窗口就假红（2026-09-30 真发生）。
+  //    改成按**同一个函数体**取窗口，并直接钉住守卫的写法本身 ——
+  //    比"窗口里有 allowSelfRegister 字样"更严：守卫被删/被改都会红。
   const lines = serviceSource.split('\n')
   const selfRegisterIndex = lines.findIndex((line) => line.includes('await registerAgent'))
   assert.ok(selfRegisterIndex >= 0, 'registerAgent 调用应当仍在（作为显式路径）')
-  const guardWindow = lines.slice(Math.max(0, selfRegisterIndex - 14), selfRegisterIndex + 1).join('\n')
+  const scopeStart = lines.findLastIndex(
+    (line, index) => index < selfRegisterIndex && line.includes('async function provision('),
+  )
+  assert.ok(scopeStart >= 0, 'registerAgent 应当仍在 provision() 里')
+  const guardWindow = lines.slice(scopeStart, selfRegisterIndex + 1).join('\n')
   assert.match(
     guardWindow,
-    /allowSelfRegister/,
-    'registerAgent 必须在 allowSelfRegister 守卫的作用域内，否则静默降级会复活',
+    /if \(!owner\?\.api_key && !allowSelfRegister\)/,
+    'registerAgent 必须在 `!allowSelfRegister` 守卫的同一函数体内，否则静默降级会复活',
   )
 })
 

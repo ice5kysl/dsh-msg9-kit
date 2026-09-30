@@ -433,14 +433,32 @@ export async function readTenantKey(): Promise<string | undefined> {
  * 写 pod 租户 key。按规范写到 `tenants/<pod>-<org>.key`；
  * 信息不足时退回旧路径（`dsh.key`）以保持存量兼容。
  */
-export async function writeTenantKey(key: string, scope?: { podLabel?: string; orgLabel?: string }): Promise<void> {
+export async function writeTenantKey(
+  key: string,
+  scope?: { podLabel?: string; orgLabel?: string },
+): Promise<{ path: string; backedUp?: string }> {
   await ensureDir(tenantsDir())
   const name = scope?.podLabel && scope?.orgLabel
     ? `${sanitizeKey(scope.podLabel)}-${sanitizeKey(scope.orgLabel)}.key`
     : 'dsh.key'
   const path = join(tenantsDir(), name)
+  // ⚠️ 不许**静默**覆盖：目标已存在且内容不同时，先留一份带时间戳的备份再写。
+  //
+  // 为什么（2026-09-30 事故）：`openPod` 的跨 pod 回退曾把 **dsh pod 的 key**
+  // 写进 `tenants/mum-ice.key` —— 覆盖了该 pod 真正的 key，而且**不留任何痕迹**，
+  // 之后每次读都"自信地"拿到那把错 key，表现成"开通失败"却指不出原因。
+  // 这是 DEF-001「静默覆盖全机身份」的同族（已复发 2 次），所以这里加一道闸。
+  let backedUp: string | undefined
+  const previous = await readFile(path, 'utf8').catch(() => undefined)
+  if (previous !== undefined && previous.trim() && previous.trim() !== key.trim()) {
+    const candidate = `${path}.bak-${Date.now()}`
+    await writeFile(candidate, previous, { mode: 0o600 })
+      .then(() => { backedUp = candidate })
+      .catch(() => { backedUp = undefined })
+  }
   await writeFile(path, `${key}\n`, { mode: 0o600 })
   await chmod(path, 0o600).catch(() => {})
+  return { path, ...(backedUp ? { backedUp } : {}) }
 }
 
 // ------------------------------------------------------------------ ORG key
