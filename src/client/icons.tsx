@@ -8,12 +8,14 @@
 
 import {
   ArrowRight,
+  AtSign,
   Bell,
   BellOff,
   Check,
   ChevronDown,
   ChevronRight,
   Copy,
+  FolderOpen,
   Globe,
   Inbox,
   Mail,
@@ -29,4 +31,4 @@ import {
   X,
 } from 'lucide-react'
 
-export { ArrowRight, Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, Globe, Inbox, Mail, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X }
+export { ArrowRight, AtSign, Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, FolderOpen, Globe, Inbox, Mail, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X }

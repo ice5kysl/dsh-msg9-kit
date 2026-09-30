@@ -12,7 +12,7 @@
  */
 
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
-import { Mail } from './icons.tsx'
+import { AtSign, FolderOpen } from './icons.tsx'
 import { L } from './locale.ts'
 import { SetupView } from './Msg9Panel.tsx'
 import type { Msg9State, Msg9Store } from './store.ts'
@@ -330,51 +330,77 @@ function WorkspaceRow({
 
   return (
     <li style={styles.row}>
-      <Mail size={14} style={styles.rowIcon} />
+      {/* 不再有行首的邮箱图标：每一行都是信箱，它什么也没说明，
+          只是把每行都往右推。图标改为贴在有信息量的地方（目录 / Agent）。 */}
       <div style={styles.rowText}>
-        {/* 行 1：只有「workspace · Pod · 域」。
-            状态与用量挪到右侧做成两个 pill —— 原先挤在这一行里，
-            四个不同性质的值连成一句，读起来是一团。 */}
-        <div style={styles.lineRow}>
-          <span style={styles.rowTitle}>{row.title}</span>
-          {pod && (
-            <>
-              <span style={styles.dot}>·</span>
-              <span style={styles.dim}>{L('Pod', 'Pod')}</span>
-              <code style={styles.code}>{pod.pod_label}</code>
-              {pod.domain && (
-                <>
-                  <span style={styles.dot}>·</span>
-                  <code style={styles.code}>{pod.domain}</code>
-                </>
-              )}
-            </>
-          )}
-        </div>
-
-        {/* 行 2：目录 */}
-        <div style={styles.path}>{row.path}</div>
-
-        {/* 行 3：Agent 信箱 + 未读。未读是**本信箱**的，不是 Pod 合计。 */}
-        {(row.address || unread > 0) && (
+        {/* 行 1：左 = workspace · Pod · 域；右 = 状态 / 用量 pill。
+            两者放在同一个 flex 行里 ⇒ pill 与**行 1 基线对齐**（此前它们挂在
+            整个行的垂直居中处，看起来像浮在第 1、2 行之间）。 */}
+        <div style={styles.lineBetween}>
           <div style={styles.lineRow}>
-            <span style={styles.layerTag}>{L('Agent', 'Agent')}</span>
-            {row.address
-              ? <code style={styles.code}>{row.address}</code>
-              : <span style={styles.dim}>{L('（未开通）', '(not open)')}</span>}
-            {unread > 0 && (
-              // 气泡：本信箱的未读数（悬停说明，因为上方的用量是 Pod 级的）
-              <span
-                style={styles.unreadBubble}
-                title={L(
-                  '{address} 这个信箱有 {n} 封未读',
-                  '{address} has {n} unread',
-                  { address: row.address ?? '', n: unread },
+            <span style={styles.rowTitle}>{row.title}</span>
+            {pod && (
+              <>
+                <span style={styles.dot}>·</span>
+                <span style={styles.dim}>{L('Pod', 'Pod')}</span>
+                <code style={styles.code}>{pod.pod_label}</code>
+                {pod.domain && (
+                  <>
+                    <span style={styles.dot}>·</span>
+                    <code style={styles.code}>{pod.domain}</code>
+                  </>
                 )}
+              </>
+            )}
+          </div>
+          <div style={styles.lineRight}>
+            {pod && pod.state === 'ready' && <span style={styles.pillOk}>{stateText}</span>}
+            {pod && pod.state === 'unconfigured' && <span style={styles.pillWarn}>{stateText}</span>}
+            {pod && pod.state === 'ready' && (
+              <span
+                style={styles.pillDim}
+                title={L('该 Pod 下已开通的信箱数 / 上限', 'inboxes in this pod / limit')}
               >
-                {badgeText(unread)}
+                {pod.agents === null || pod.agents === undefined
+                  ? L('用量未知', 'usage —')
+                  : L('{n} / {max} 信箱', '{n} / {max} inboxes', { n: pod.agents, max: pod.max_agents ?? '—' })}
               </span>
             )}
+          </div>
+        </div>
+
+        {/* 行 2：目录（前面加个文件夹图标，标明这一行是路径） */}
+        <div style={styles.lineRow}>
+          <FolderOpen size={12} style={styles.inlineIcon} />
+          <span style={styles.path}>{row.path}</span>
+        </div>
+
+        {/* 行 3：Agent 信箱（前面加个 @ 图标）+ 未读靠右。
+            未读是**本信箱**的（不是 Pod 合计），所以它挂在这一行、贴右边缘，
+            与上面 pill 的右边缘对齐。 */}
+        {(row.address || unread > 0) && (
+          <div style={styles.lineBetween}>
+            <div style={styles.lineRow}>
+              <AtSign size={12} style={styles.inlineIcon} />
+              <span style={styles.layerTag}>{L('Agent', 'Agent')}</span>
+              {row.address
+                ? <code style={styles.code}>{row.address}</code>
+                : <span style={styles.dim}>{L('（未开通）', '(not open)')}</span>}
+            </div>
+            <div style={styles.lineRight}>
+              {unread > 0 && (
+                <span
+                  style={styles.unreadBubble}
+                  title={L(
+                    '{address} 这个信箱有 {n} 封未读',
+                    '{address} has {n} unread',
+                    { address: row.address ?? '', n: unread },
+                  )}
+                >
+                  {badgeText(unread)}
+                </span>
+              )}
+            </div>
           </div>
         )}
 
@@ -529,21 +555,6 @@ function WorkspaceRow({
         )}
       </div>
       <div style={styles.rowStats}>
-        {/* 状态 pill：只在"已开通"或"未配置 ORG"时显示。
-            pod_closed 不显示 —— 右边的「开通」按钮已经说明了。 */}
-        {pod && pod.state === 'ready' && <span style={styles.pillOk}>{stateText}</span>}
-        {pod && pod.state === 'unconfigured' && <span style={styles.pillWarn}>{stateText}</span>}
-        {/* 用量 pill：Pod 级的（该 Pod 下已开信箱数 / 上限），与 Agent 行的未读气泡层级不同 */}
-        {pod && pod.state === 'ready' && (
-          <span
-            style={styles.pillDim}
-            title={L('该 Pod 下已开通的信箱数 / 上限', 'inboxes in this pod / limit')}
-          >
-            {pod.agents === null || pod.agents === undefined
-              ? L('用量未知', 'usage —')
-              : L('{n} / {max} 信箱', '{n} / {max} inboxes', { n: pod.agents, max: pod.max_agents ?? '—' })}
-          </span>
-        )}
         {opening.error && <span style={styles.warn}>{L('开通失败', 'Failed')}</span>}
         {!row.provisioned && (
           <>
@@ -691,7 +702,8 @@ const styles: Record<string, CSSProperties> = {
   list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column' },
   row: {
     display: 'flex',
-    alignItems: 'center',
+    // 顶部对齐：右侧按钮与**行 1** 对齐，而不是浮在三行文字的垂直中间
+    alignItems: 'flex-start',
     // ⚠️ 必须允许换行：展开的「移除确认」是这一行的第 4 个子项，
     //    不换行时它会和 rowText 抢宽度，把中文挤成"一字一行"（实测过的样式事故）。
     flexWrap: 'wrap',
@@ -699,11 +711,23 @@ const styles: Record<string, CSSProperties> = {
     padding: '9px 0',
     borderTop: `1px solid ${BORDER}`,
   },
-  rowIcon: { flexShrink: 0, color: DIM },
+  // 行内小图标（目录 / Agent 前的标识）：跟着文字视觉居中
+  inlineIcon: { flexShrink: 0, color: DIM, alignSelf: 'center' },
   // flexBasis 给个下限：窄面板时让右侧按钮换行，而不是把文字压到逐字换行/被裁掉
   rowText: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: '1 1 240px' },
   // 紧凑行：把「workspace · Pod · 域 · 状态 · 用量」排在同一行内（可换行）
   lineRow: { display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+  // 「左内容 ……… 右内容」同一行两端对齐：pill / 未读气泡据此贴右边缘，
+  // 并与该行基线对齐（不再挂在整块文字的垂直居中处）
+  lineBetween: {
+    display: 'flex',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: 10,
+    flexWrap: 'wrap',
+    minWidth: 0,
+  },
+  lineRight: { display: 'flex', alignItems: 'baseline', gap: 6, marginLeft: 'auto', flexShrink: 0 },
   // 未读气泡：本信箱的未读，做成实心小圆泡跟在 Agent 地址后面
   unreadBubble: {
     display: 'inline-flex',
