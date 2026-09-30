@@ -549,6 +549,31 @@ msg9 侧 2026-09-30 报了他们自己的一个 P0：**"条件清理"接口会�
 而不是"**看起来**没人用"。同族：本仓"绝不跨 pod 回退"、"用前验证 key 归属" ——
 **别用"看起来合理"的兜底掩盖语义不明。**
 
+### 13.3.4 ✅ 已执行（2026-09-30 23:3x）—— 7 步全部走完，每步附可复核判据
+
+| 步 | 结果 | 判据 |
+|---|---|---|
+| 0 | ✅ 登记 + 开通 | 新记录：`dsh@jev.ice.msg9.io`，pod=`jev`，path=`Documents/OPC/Jev` |
+| 1 | ✅ 建新信箱 | `GET /owner/agents`（jev pod key）→ `dsh@jev.ice.msg9.io`（created 23:36:37）|
+| 2 | ✅ 恢复旧 agent 的 key | 见下「两条值得记」① |
+| 3 | ✅ 搬 2 封 | 先 `dry_run` 证「正好 2 封、全在 `inbox/unread`」，再实搬 `moved=2`；新信箱确实出现这 2 封且**仍是 unread** |
+| 4 | ✅ 转发 | 规则 `dsh-jev-8221@whymyphone… → dsh@jev.ice.msg9.io`；**用真发一封实测**（`/send` 直接返回 `forwarded_from`/`forwarded_to`，且信进了新信箱）|
+| 5 | ✅ 停用旧 agent | `{"status":"suspended"}` |
+| 6 | ✅ 删误建的 | `{"status":"released"}`；**dsh pod 11 → 10**，jev pod 仍 1 个（没碰新的）|
+| 7 | ✅ 本地 | 新记录正确；旧记录**早在更早的清理里就已移除**（它属那 4 个「凭据文件已丢失」的记录之一）|
+
+**两条值得记的（都是这次踩出来的）**：
+
+1. **`POST /owner/agents/:addr/keys` 要请求体**（返回 `400 invalid request body`）。
+   给"key 已丢失"的 agent 恢复，用 **`rotate-key` 更省事**：只要 owner（pod）key，一步拿到新 key。
+   （代价：旧 key 立即失效 —— 本例旧 key 本来就丢了，无副作用。）
+2. **停用即失去 agent key 的全部接口** —— 包括**读转发规则**：停用后 `GET /agent/forwarding`
+   返回 `40100 agent has been suspended`。
+   ⇒ **"转发到底生没生效"在停用后无法用 API 自证，只能真发一封。**
+   ⇒ 这次是先设转发、后停用，停用后再真发一封验证 ⇒ **规则未受停用影响，链路通**。
+   ⇒ **教训**：这类"停用后失去观测手段"的操作，**验证要在失去观测手段之前做完**，
+      或者在事后用**端到端**（真发一封）而不是 API 来验。
+
 ### 13.4 本次已落地的界面改动
 
 * 卡片标题：`msg9.io` → **「消息信箱 - msg9.io」**（主人要求让人知道这是哪一页）
