@@ -143,12 +143,14 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
         <>
           <div style={styles.dim}>
             {L(
-              // 删掉原先的第二句「每个项目对应一个 Pod，Pod 里放各 harness 的信箱」：
-              // 它与本页「规范的 / 不规范的」判据（pod 名 = workspace 名）说法相反，
-              // 同一页里两处互相矛盾。ORG 卡的职责只是"这把 key 怎么来"，
-              // 不该在这里替 Pod 归属下定义（那是下面那张表要讲的事）。
-              '在 msg9.io 的 Account 页创建一个 ORG，复制它的 key（msg9_ok_…，只显示一次）粘到这里。',
-              'Create an ORG on the msg9.io Account page and paste its key (msg9_ok_…, shown once) here.',
+              // ⚠️ 这句话我 2026-09-30 曾以"与本页判据矛盾"为由删掉，**删错了**：
+              // 它描述的正是规范形式（主人确认：规范的地址是 `dsh@jev.ice.msg9.io`
+              // —— Agent 名是 **harness 名**，Pod 名是**项目名**）。
+              // 当时误判为矛盾，是因为下面的「规范的/不规范的」判据拿 **workspace 名**
+              // 推导"应有的 Pod"；而这句话说的是 **项目**。二者在"一个 workspace
+              // 就是一个项目"时重合（本机正是如此），但概念不同。已恢复原文。
+              '在 msg9.io 的 Account 页创建一个 ORG，复制它的 key（msg9_ok_…，只显示一次）粘到这里。每个项目对应一个 Pod，Pod 里放各 harness 的信箱。',
+              'Create an ORG on the msg9.io Account page and paste its key (msg9_ok_…, shown once) here. One project = one pod, and each harness gets an inbox inside it.',
             )}
           </div>
           <form
