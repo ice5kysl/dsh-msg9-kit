@@ -413,3 +413,91 @@ official ORG key（org_RK9z2VyOuIZ7）        → ORG「official」
 | `accepted` ≠ 送达 | 语义已明确 | 工具层措辞 + `message_id` 回查 |
 | 账本 + 门铃契约（DM-7/8/9） | 已定稿 | §6 |
 | daemon scope 锁（对方第 3 项预警） | **与我方核实一致：确实是全机一把** | §6 ③ |
+
+---
+
+## §13 地址规范改造 + Jev 归位（主人 2026-09-30 定案）
+
+### 13.1 已确认的命名规则
+
+**规范地址 = `<harness 名>@<项目 Pod>.<org>.<base>`**
+
+| 段 | 含义 | 例（Jev 项目） |
+|---|---|---|
+| Agent 段 | **harness 名**（固定，不带项目后缀） | `dsh` |
+| Pod 段 | **项目名** | `jev` |
+
+**harness 名映射**（主人 2026-09-30 明确）：
+
+| harness | agent 名 |
+|---|---|
+| dsh | `dsh` |
+| kimi | `kimi` |
+| claude | **`cc`**（不是 `claude`） |
+
+⇒ 同一个项目 Pod 里每个 harness 一个信箱：`dsh@jev.ice` · `kimi@jev.ice` · `cc@jev.ice`。
+
+**平台侧已经在按这个模型运行**（实证）：`~/.msg9/spool/` 里 `dsh@dsh.ice.…jsonl` 与
+`kimi@dsh.ice.…jsonl` 并存 —— 同一个 pod 两个 harness。
+
+### 13.2 代码现状：推导方向是反的（13 条不规范的根因）
+
+`src/host/workspace.ts` `deriveAddress()`：
+
+```
+租户/子域模式（tenant: true）： <workspace-slug>@<pod>   → jev@dsh.ice    ← 反的
+扁平模式（无 pod）：            dsh-<slug>-<hash4>@msg9.io
+```
+
+本地部分放的是 **workspace 名**，不是 harness 名。
+（那 6 条规范的，是因为当时**手工给了** `preferred_address: dsh`，不是默认行为。）
+
+**待改**：
+1. 租户模式本地部分固定为 **harness 名**；扁平模式保持不变（无 pod 承载项目，必须靠本地部分区分）
+2. 抽出 harness 名常量（现硬编码在 `dsh-` 前缀里）并暴露给面板 ——
+   否则「规范的/不规范的」判据只查 Pod 段，是**半条判据**
+3. 判据补齐：**规范 = Agent 段 == harness 名 且 Pod 段 == 应有 Pod**
+
+**⏳ 待主人定**：同一项目 Pod 里已有 `dsh` 信箱时，再开第二个 workspace 怎么办？
+- (A) 提示已归属哪个 workspace，让人选「共用 / 换 pod」（**推荐**）
+- (B) 自动加后缀 `dsh-2@…`
+
+推荐 (A) 的理由：**旧代码的"自动加后缀"正是 `dsh-jev-8221` / `dsh-ws-04fe` 这些丑名字的来源**
+—— 与其静默降级，不如明确说"这里撞了，你选"。
+
+### 13.3 Jev 归位（主人 2026-09-30 批准「迁移」）
+
+现状（两个信箱都不规范）：
+
+| 地址 | 问题 | 有无历史 |
+|---|---|---|
+| `dsh-jev-8221@whymyphone.ice.msg9.io` | Pod 错（不是它的项目）+ Agent 段错 | 有（但主人说"应该还没正式启用"） |
+| `jev@dsh.ice.msg9.io` | Pod 错 + Agent 段错（`jev` 是 workspace 名不是 harness 名） | 无（**误建**） |
+| **目标** `dsh@jev.ice.msg9.io` | ✅ 已确认**空着**，`jev` pod 已存在（0 个信箱） | — |
+
+**只读探测已证**：`whymyphone-ice.key` 能列出旧 agent 的 key（`code=0`）
+⇒ 规格 §6 那条路走得通：`POST /owner/agents/:address/keys` 可为旧地址**签发新凭据**。
+
+**步骤**（依规格 `address-format.md` §6 的迁移配方）：
+
+| # | 动作 | 端点 / 手段 | key |
+|---|---|---|---|
+| 0 | **前置：把 `Documents/OPC/Jev` 在 dsh 里登记成工作区** | 主人操作（我不代改 dsh 注册表） | — |
+| 1 | 建 `dsh@jev.ice.msg9.io` | `POST /owner/agents` | jev pod key |
+| 2 | 给旧 agent 签一把新 key（否则搬不了信） | `POST /owner/agents/:address/keys` | whymyphone pod key |
+| 3 | 搬历史 | `POST /owner/agents/:address/move-mail` | pod key |
+| 4 | 老地址设转发（漏网来信进新信箱） | `PUT /agent/forwarding` | 旧 agent key（第 2 步所得） |
+| 5 | `disable` 旧 agent（消息全保留） | `POST /agent/disable` | 旧 agent key |
+| 6 | 删掉误建的 `jev@dsh.ice.msg9.io` | `DELETE /owner/agents/<local>` | jev pod key |
+| 7 | 本地：记录挂到新工作区 + 写新凭据；移除旧记录 | 本插件 | — |
+
+**两个未验证点（动手前先验）**：
+1. **搬信是否接受跨 pod**：规格写「目标须同租户 / 同 ORG / 同账户」，旧在 `whymyphone` pod、
+   新在 `jev` pod —— 是"同 ORG 但不同 pod"，**三个条件是"且"还是"或"没验**。
+   **退路**：不搬信、只设转发（旧信留旧信箱，新信自动进新信箱）。
+2. **旧信箱实际有几封**：第 2 步拿到 key 后**先数一遍**再决定要不要搬。
+
+### 13.4 本次已落地的界面改动
+
+* 卡片标题：`msg9.io` → **「消息信箱 - msg9.io」**（主人要求让人知道这是哪一页）
+* 地址形状的解释：压成 workspace 清单标题旁的 **「?」悬停提示**（不再占正文，也不恢复整段）

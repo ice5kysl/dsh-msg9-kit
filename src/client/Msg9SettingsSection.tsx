@@ -43,7 +43,8 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
 
       {/* ① 介绍 + 注册/登录引导（主人 2026-09-30 定的三步结构之首） */}
       <section style={styles.card}>
-        <div style={styles.cardTitle}>msg9.io</div>
+        {/* 主人 2026-09-30：标题要让人一眼知道这是哪一页（设置 → 消息信箱） */}
+        <div style={styles.cardTitle}>{L('消息信箱 - msg9.io', 'Messages - msg9.io')}</div>
         {/* 主人 2026-09-30 再次改写：三句太啰嗦，压成一句，
             并把它要表达的价值说清（项目内 / 跨项目 / 跨机器 · 不依赖人类 ·
             消息驱动 · 自主推进）。措辞沿用主人原文，只补齐中英混排的空格。 */}
@@ -289,8 +290,19 @@ function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store })
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   return (
     <section style={styles.card}>
-      <div style={styles.cardTitle}>
-        {L('② Workspace 与 Pod（{n}）', '② Workspaces & pods ({n})', { n: state.workspaces.length })}
+      <div style={styles.cardTitleRow}>
+        <span style={styles.cardTitle}>
+          {L('② Workspace 与 Pod（{n}）', '② Workspaces & pods ({n})', { n: state.workspaces.length })}
+        </span>
+        {/* 地址形状的解释压成一个「?」的悬停提示（主人 2026-09-30）：
+            下面「规范的 / 不规范的」分组正是按 Pod 段判的，但整段解释太占地方。 */}
+        <span
+          style={styles.helpDot}
+          title={L(
+            '地址形如 dsh@dsh.ice.msg9.io：@ 前是 Agent（harness）名，后面依次是它所属的【项目 Pod】、ORG 与平台域名。「规范的」= Agent 段是自己的 harness 名、且 Pod 段就是自己的项目。',
+            'An address looks like dsh@dsh.ice.msg9.io: before the @ is the agent (harness) name, then its project pod, its org and the platform domain. "Compliant" means the agent part is your own harness name and the pod part is your own project.',
+          )}
+        >?</span>
       </div>
       {state.workspaces.length === 0 ? (
         <div style={styles.dim}>{L('还没有 workspace。', 'No workspaces yet.')}</div>
@@ -754,6 +766,22 @@ const styles: Record<string, CSSProperties> = {
   wrap: { display: 'flex', flexDirection: 'column', gap: 20, padding: '16px 0', maxWidth: 640, color: FG, fontSize: 13 },
   card: { display: 'flex', flexDirection: 'column', gap: 8 },
   cardTitle: { fontSize: 13, fontWeight: 600 },
+  cardTitleRow: { display: 'flex', alignItems: 'center', gap: 6 },
+  // 「?」悬停提示：小圆点，cursor:help 暗示可悬停（不占横向空间）
+  helpDot: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 14,
+    height: 14,
+    flexShrink: 0,
+    borderRadius: 7,
+    border: `1px solid ${BORDER}`,
+    fontSize: 10,
+    lineHeight: '12px',
+    color: DIM,
+    cursor: 'help',
+  },
   fields: { margin: 0, display: 'flex', flexDirection: 'column', gap: 6 },
   fieldRow: { display: 'flex', gap: 12, fontSize: 13 },
   fieldName: { flex: 'none', width: 72, color: DIM, fontSize: 12 },
