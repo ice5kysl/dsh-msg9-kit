@@ -56,7 +56,7 @@ import {
   type InboxMessage,
 } from './api.ts'
 import { L } from './locale.ts'
-import { derivePodLabel, ensureInbox, ensureSigningKey, maskKey, migrateInbox, openPod, ownerContext, podState, type InboxContext } from './service.ts'
+import { derivePodLabel, ensureInbox, ensureSigningKey, isMeaningfulPodLabel, maskKey, migrateInbox, openPod, ownerContext, podState, type InboxContext } from './service.ts'
 import { credentialsMigrated, readOrgKey, removeProjectCredentials, resolveCredentials, saveOwner, writeOrgKey } from './credentials.ts'
 import { defaultApiUrl, deleteWorkspaceInbox, getNotifyPaused, isTenantOwner, loadState, saveState, setMessageMark, setNotifyPaused, stateFilePath, withStateLock, type LiveInbox, type OwnerState, type State } from './store.ts'
 import type { OverviewView, PodStateView, WorkspaceHealth, WorkspaceView } from '../shared/types.ts'
@@ -551,6 +551,9 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       const label = fromAddress
         ?? (custom ? state.org!.pod_labels![workspace.key]! : deps.derivePodLabel(workspace))
       const stats = podStats.get(label)
+      // 候选 pod（按 workspace 推导的那个）：只在**与现址不同**时给出，
+      // 让面板能回答"它是否开在自己的 pod 里"，并指出那个 pod 是否已存在。
+      const suggested = deps.derivePodLabel(workspace)
       return {
         state: address ? 'ready' : (orgReady ? 'pod_closed' : 'unconfigured'),
         pod_label: label,
@@ -559,6 +562,11 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         domain,
         agents: stats?.agents ?? null,
         max_agents: stats?.max ?? null,
+        // 只在候选名【有语义】且与现址不同才给出 —— 否则 `ws-89fa` 这种
+        // 纯 hash 名字只是噪音（中文标题无法生成 ASCII pod 名，需人工指定）。
+        ...(suggested !== label && isMeaningfulPodLabel(suggested)
+          ? { suggested_label: suggested, suggested_exists: podStats.has(suggested) }
+          : {}),
       }
     }
 
@@ -741,11 +749,26 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     if (!meta?.label) return null
     const resolved = await readOrgKey(meta.label).catch(() => undefined)
     let podCount: number | null = null
+    let maxPods = meta.max_pods ?? null
     if (resolved?.key) {
+      const orgApiUrl = meta.api_url || defaultApiUrl()
       podCount = await deps.api
-        .orgListPods(meta.api_url || defaultApiUrl(), resolved.key)
+        .orgListPods(orgApiUrl, resolved.key)
         .then((pods) => pods.length)
         .catch(() => null)
+      // 老绑定（本次改动之前绑的）没存 max_pods ⇒ 回填一次。
+      // 与 ownerContext 的惰性探测同一套路：只在缺失时问一次，问到了写回去。
+      if (maxPods === null) {
+        maxPods = await deps.api
+          .orgInfo(orgApiUrl, resolved.key)
+          .then((info) => (typeof info.max_pods === 'number' ? info.max_pods : null))
+          .catch(() => null)
+        if (maxPods !== null) {
+          await deps.updateState((next) => {
+            if (next.org) next.org.max_pods = maxPods
+          }).catch(() => { /* 回填失败不影响本次展示 */ })
+        }
+      }
     }
     return {
       label: meta.label,
@@ -754,6 +777,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       masked: resolved?.key ? maskKey(resolved.key) : '—',
       verified_at: meta.verified_at ?? null,
       pod_count: podCount,
+      max_pods: maxPods,
     }
   }
 
@@ -1242,6 +1266,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
           id: info.id,
           ...(info.name ? { name: info.name } : {}),
           api_url: apiUrl,
+          // pod 上限：面板显示「已有 Pod N / 上限」用
+          ...(typeof info.max_pods === 'number' ? { max_pods: info.max_pods } : {}),
           verified_at: new Date().toISOString(),
           ...(str(body.pod_label) ? { pod_label: str(body.pod_label) } : {}),
         }

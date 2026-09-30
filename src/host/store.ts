@@ -182,6 +182,11 @@ export interface StoredOrgState {
    * 已开 Pod 的 label 是既成事实（地址已经发出去了，改 label 等于换地址）。
    */
   pod_labels?: Record<string, string>
+  /**
+   * 该 ORG 的 pod 上限（`max_pods`）。面板显示「已有 Pod N / 上限」用。
+   * 老绑定没有这个字段 ⇒ `orgView` 用 `GET /api/v1/org` 回填一次。
+   */
+  max_pods?: number | null
   /** 校验通过的时间。 */
   verified_at?: string
 }

@@ -27,6 +27,14 @@ export interface PodStateView {
   agents?: number | null
   /** 该 pod 的 agent 上限（`max_agents`）。 */
   max_agents?: number | null
+  /**
+   * 按 workspace 推导出的「候选 pod」（标题/目录名派生的那个）。
+   * 只在**与现址所在 pod 不同**时才有值 —— 用来回答"它开在自己的 pod 里吗"。
+   * 注意：候选名 ≠ "就应该叫这个"，它只是一个对照基准。
+   */
+  suggested_label?: string
+  /** 上述候选 pod 是否**已存在**于 ORG（已存在却空着，常是"本该开在这儿"的强信号）。 */
+  suggested_exists?: boolean
 }
 
 /**
@@ -115,6 +123,8 @@ export interface OrgView {
   verified_at?: string | null
   /** 该 ORG 下现有的 pod 数（只读探测结果；探测失败为 null）。 */
   pod_count?: number | null
+  /** 该 ORG 的 pod 上限（`max_pods`）；未知为 null。 */
+  max_pods?: number | null
 }
 
 /** One message, as msg9 returns it (inbox and outbox share the shape). */

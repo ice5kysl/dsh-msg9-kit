@@ -111,7 +111,10 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
               <dd style={styles.fieldValue}>
                 {bound.pod_count === null || bound.pod_count === undefined
                   ? L('未知（探测失败）', 'unknown (probe failed)')
-                  : String(bound.pod_count)}
+                  : (typeof bound.max_pods === 'number'
+                      // 与 workspace 行同样的「已用 / 上限」写法，一眼看出还剩多少
+                      ? L('{n} / {max}', '{n} / {max}', { n: bound.pod_count, max: bound.max_pods })
+                      : String(bound.pod_count))}
               </dd>
             </div>
           </dl>
@@ -315,8 +318,22 @@ function WorkspaceRow({
       <div style={styles.rowStats}>
         {opening.error && <span style={styles.warn}>{L('开通失败', 'Failed')}</span>}
         {row.provisioned ? (
-          // 消息数**不在这里**显示（那属于「消息」页签）；这里只留未读徽标做提示。
-          badge ? <span style={styles.badge}>{badge}</span> : null
+          // 这个徽标是**本 workspace（本 Agent 信箱）**的未读数，不是 Pod 合计 ——
+          // 悬停文案说清楚，免得和上面 POD 行的用量混淆。
+          badge
+            ? (
+              <span
+                style={styles.badge}
+                title={L(
+                  '{address} 这个信箱有 {n} 封未读',
+                  '{address} has {n} unread',
+                  { address: row.address ?? '', n: unread },
+                )}
+              >
+                {badge}
+              </span>
+            )
+            : null
         ) : (
           <>
             <button
@@ -499,6 +516,20 @@ function PlacementCard({ state }: { state: Msg9State }): JSX.Element | null {
                   <span style={styles.dim}>{L('（与本实例不同的 Pod）', '(a different pod)')}</span>
                 </div>
               )}
+              {row.pod?.suggested_label && (
+                // 候选 pod = 按这个 workspace 的名字推导出来的那个。
+                // **"已存在却空着"是客观信号**（本机的 llmpool 正是这样：
+                // pod 建好了、0 个信箱，而它的信箱开在 whymyphone 下）。
+                <div style={styles.layerRow}>
+                  <span style={styles.layerTag}>{L('候选', 'alt')}</span>
+                  <code style={styles.code}>{row.pod.suggested_label}</code>
+                  <span style={row.pod.suggested_exists ? styles.warn : styles.dim}>
+                    {row.pod.suggested_exists
+                      ? L('该 Pod 已存在（可能就是它该去的地方）', 'this pod already exists')
+                      : L('该 Pod 尚未创建', 'not created yet')}
+                  </span>
+                </div>
+              )}
             </div>
           </li>
         ))}
@@ -528,6 +559,9 @@ const styles: Record<string, CSSProperties> = {
   row: {
     display: 'flex',
     alignItems: 'center',
+    // ⚠️ 必须允许换行：展开的「移除确认」是这一行的第 4 个子项，
+    //    不换行时它会和 rowText 抢宽度，把中文挤成"一字一行"（实测过的样式事故）。
+    flexWrap: 'wrap',
     gap: 10,
     padding: '9px 0',
     borderTop: `1px solid ${BORDER}`,
@@ -583,6 +617,8 @@ const styles: Record<string, CSSProperties> = {
   confirmBox: {
     display: 'flex',
     flexDirection: 'column',
+    // 整行独占：它讲的是"这条记录"的处置，不该和那一行的其他内容挤在一起
+    flexBasis: '100%',
     gap: 6,
     marginTop: 6,
     padding: '8px 10px',

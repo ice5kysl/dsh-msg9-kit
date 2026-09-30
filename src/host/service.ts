@@ -448,6 +448,19 @@ const GENERIC_POD_LABELS = new Set([
   'workspace', 'ws', 'wip', 'tmp', 'temp', 'test', 'tests', 'src', 'app', 'code', 'codes',
 ])
 
+/**
+ * 一个推导出来的 pod 名**是否有语义**。
+ *
+ * pod label 只能是小写 ASCII（规范 §2），所以中文标题的 slug 会退化成空，
+ * 再叠加 hash 变成 `ws-89fa` / `3-f483` 这种认不出是谁的名字 ——
+ * 拿它当"候选 pod"只是噪音，还会让人以为那就该是它的名字。
+ * 只有"去掉尾部 hash 后仍 ≥3 字符、且不是通用词"才算有意义。
+ */
+export function isMeaningfulPodLabel(label: string): boolean {
+  const stem = label.replace(/-[0-9a-f]{4}$/, '')
+  return stem.length >= 3 && !GENERIC_POD_LABELS.has(stem)
+}
+
 function podSlugify(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20)
 }
