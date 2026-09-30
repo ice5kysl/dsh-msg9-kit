@@ -2111,6 +2111,33 @@ await check('theme: the dsh module loader can neither claim nor delete our style
   assert.equal(doc.tags.includes(reactOwned), false, 'and then deleted — the old failure mode, reproduced')
 })
 
+await check('theme: 白字必须配深色底 —— 主按钮背景不得用会翻转的主题 token（T-19）', () => {
+  const rules = client.M9_CSS.split('\n').map((l) => l.trim()).filter((l) => l.includes('{'))
+  // ① 具体：这条规则曾把背景写成 var(--dsw-alias-brand-primary)。该 token 在外壳主题里
+  //    深浅模式取值不同：body → #0f1115（近黑），body[data-ds-dark-theme] → #f9fafb（★近白）。
+  //    配上写死的 color:#fff，深色模式下就是"白字白底"——按钮看上去是空的（边框还是 transparent，
+  //    连轮廓都没有），而其它元素都正常，所以极难被发现。
+  const primary = rules.find((l) => l.startsWith('.m9-btn-primary {'))
+  assert.ok(primary, '主按钮规则存在')
+  const bg = /background:\s*([^;]+);/.exec(primary)[1].trim()
+  assert.equal(bg, '#2d66f7', '主按钮背景必须是字面量，不能是会被主题翻转的 token')
+  // ② 通用护栏：**任何**白字规则都不许拿 var() 当背景 —— 这类配对的失效方式是"看不见"，
+  //    不像报错那样会被注意到。加这条是为了让同类问题在下一次就红。
+  const offenders = rules.filter(
+    (l) => /color:\s*#(fff|ffffff)\b/i.test(l) && /background:\s*var\(/.test(l),
+  )
+  assert.deepEqual(offenders, [], '不许出现「白字 + 主题变量背景」的配对')
+  // ③ 顺带算一下对比度，确保白字站得住（≥3:1，大号/加粗文字的 AA 门槛）
+  const lum = (hex) => {
+    const c = [1, 3, 5]
+      .map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+      .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4))
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+  }
+  const ratio = 1.05 / (lum(bg) + 0.05)
+  assert.ok(ratio > 3, `白字对比度需 >3:1，实际 ${ratio.toFixed(2)}:1`)
+})
+
 server.closeAllConnections?.()
 server.close()
 

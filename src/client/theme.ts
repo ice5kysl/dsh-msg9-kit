@@ -31,9 +31,18 @@ export const M9_CSS = `
 .m9-btn:hover { background: ${HOVER_BG}; }
 .m9-btn:disabled { opacity: 0.55; cursor: default; }
 .m9-btn:disabled:hover { background: transparent; }
-.m9-btn-primary { background: ${ACCENT}; border-color: transparent; color: #fff; font-weight: 500; }
-.m9-btn-primary:hover { background: ${ACCENT}; opacity: 0.88; }
-.m9-btn-primary:disabled:hover { background: ${ACCENT}; opacity: 0.55; }
+// ⚠️ 主按钮的**背景**不能用 ${ACCENT}（= var(--dsw-alias-brand-primary)）。
+// 那个 token 在外壳主题里是**会翻转成近白**的：
+//     body                     → var(--dsw-static-neutral-bluish-1000) = #0f1115（近黑）
+//     body[data-ds-dark-theme] → var(--dsw-static-neutral-bluish-50)   = #f9fafb（★近白）
+// ⇒ 深色模式下 background 变 #f9fafb，而下面字色写死 #fff：**白字白底，对比度 1.06:1**，
+//    按钮看上去是"空白"的（边框还恰好是 transparent，连轮廓都没有）。
+// 主按钮是要人点的，可见性不能交给一个会翻转的 token ⇒ 用我们自己的强调色字面量
+// （= 胶囊底色在用的 rgba(45,102,247,…) 那个蓝，写法保持一致）。
+// ACCENT 本身保留：它当**字色**用时（nav/chip 的 active 态）深浅模式都正常。
+.m9-btn-primary { background: #2d66f7; border-color: transparent; color: #fff; font-weight: 500; }
+.m9-btn-primary:hover { background: #2d66f7; opacity: 0.88; }
+.m9-btn-primary:disabled:hover { background: #2d66f7; opacity: 0.55; }
 .m9-iconbtn { display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: 6px; background: transparent; color: ${DIM}; padding: 4px; cursor: pointer; }
 .m9-iconbtn:hover { background: ${HOVER_BG}; color: ${FG}; }
 .m9-input, .m9-select, .m9-textarea { width: 100%; box-sizing: border-box; border: 1px solid ${BORDER_STRONG}; border-radius: 8px; background: ${BG}; color: inherit; padding: 6px 9px; font-size: 12.5px; font-family: inherit; line-height: 1.5; }
