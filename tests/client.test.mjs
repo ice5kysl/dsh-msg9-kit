@@ -1873,11 +1873,11 @@ await check('settings section groups workspaces and offers NO one-click migrate'
   await store.refreshAll()
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
   // 四个分组标题都在（合规在最上，越需要处理的越往下）
-  for (const label of ['Compliant', 'Non-compliant', 'Problems', 'Gone', 'Not opened']) {
+  for (const label of ['Compliant', 'Non-compliant', 'Anomalies', 'Gone', 'Not opened yet']) {
     assert.ok(html.includes(label), `group "${label}" rendered`)
   }
   assert.ok(html.indexOf('Compliant') < html.indexOf('Gone'), '合规的排在最上面')
-  assert.ok(html.indexOf('Gone') < html.indexOf('Not opened'), '未开通的排在最后')
+  assert.ok(html.indexOf('Gone') < html.indexOf('Not opened yet'), '暂未开通排在最后')
   assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'the address is shown')
   // 🔴 关键：**不得**再出现「一键迁移」——把别的项目的信箱一起搬走是错的。
   assert.ok(!html.includes('Migrate'), 'no one-click migrate button')

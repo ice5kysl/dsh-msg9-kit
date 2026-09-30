@@ -194,9 +194,9 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
  *
  *   missing      目录已不存在（仓库搬走 / 改名，记录成了残留）
  *   problem      与其他记录共用同一个地址
- *   noncompliant 已开通，但**没开在自己的 Pod 里**
+ *   noncompliant 已开通（不规范），**没开在自己的 Pod 里**
  *                （含：地址无 Pod 归属 / Pod 不存在 / 现址 Pod ≠ 应有 Pod）
- *   unopened     还没有信箱 —— **没有归属可言**，所以既不算合规也不算不合规
+ *   unopened     暂未开通 —— **没有归属可言**，所以既不算规范也不算不规范
  *   ok           已开通、且开在自己的 Pod 里
  *
  * 优先级即上序（故障优先），一行只进一个组。
@@ -211,7 +211,7 @@ export type GroupId = 'missing' | 'problem' | 'noncompliant' | 'unopened' | 'ok'
 export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
   if (row.health?.pathMissing) return 'missing'
   if (row.health?.duplicateOf) return 'problem'
-  // 还没开通 ⇒ 没有"归属"可言，单独一组（放在最下：它不是故障，只是还没做）
+  // 暂未开通 ⇒ 没有"归属"可言，单独一组（放最下：它不是故障，只是还没做）
   if (!row.provisioned || !row.pod) return 'unopened'
   // ① 地址没有 pod 归属（扁平域 / ORG 的 Default Pod）
   if (row.pod.pod_form === false) return 'noncompliant'
@@ -224,17 +224,17 @@ export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
 
 function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
   const bound = Boolean(state.org)
-  // 组序按主人要求：合规的 → 不合规的 → 有问题的 → 不存在了的 → 未开通的。
-  // 越需要处理的越往下；「未开通的」不是故障，放最后。
+  // 组序按主人要求：规范的 → 不规范的 → 异常的 → 不存在了的 → 暂未开通。
+  // 越需要处理的越往下；「暂未开通」不是故障，放最后。
   const groups: { id: GroupId; label: string; hint: string | null; warn: boolean }[] = [
-    { id: 'ok', label: L('合规的', 'Compliant'), warn: false, hint: null },
-    { id: 'noncompliant', label: L('不合规的', 'Non-compliant'), warn: true,
+    { id: 'ok', label: L('规范的', 'Compliant'), warn: false, hint: null },
+    { id: 'noncompliant', label: L('不规范的', 'Non-compliant'), warn: true,
       hint: L('没有开在自己的 Pod 里（含：无 Pod 归属、Pod 不存在）', 'not in its own pod (or no pod ownership / pod missing)') },
-    { id: 'problem', label: L('有问题的', 'Problems'), warn: true,
+    { id: 'problem', label: L('异常的', 'Anomalies'), warn: true,
       hint: L('多条记录指向同一个地址', 'several records share one address') },
     { id: 'missing', label: L('不存在了的', 'Gone'), warn: true,
       hint: L('目录已不存在（仓库搬走或改名了）', 'directory no longer exists') },
-    { id: 'unopened', label: L('未开通的', 'Not opened'), warn: false,
+    { id: 'unopened', label: L('暂未开通', 'Not opened yet'), warn: false,
       hint: L('还没有信箱，点「开通」即可', 'no inbox yet — hit "Open pod"') },
   ]
   const byGroup = new Map<GroupId, Msg9State['workspaces']>()
