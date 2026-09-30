@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
@@ -25,6 +25,16 @@ import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto
 
 process.env.MSG9KIT_LOCALE = 'en'
 const stateDir = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-client-'))
+// fixture 的工作区目录**必须真实存在**：插件有一条硬护栏 —— 目录不存在的工作区
+// 一律拒绝开通（2026-09-30 真事故：给一个目录已消失的僵尸工作区点「开通」，
+// 真的在 ORG 里建出了远端信箱 jev@dsh.ice.msg9.io）。假路径的 fixture 会被它挡下，
+// 所以这里把 /work/* 换成本次运行的真实临时目录（保持测试真实性，不是放宽断言）。
+const workRoot = join(stateDir, 'work')
+const W = Object.fromEntries(
+  ['a', 'b', 'c', 'd', 't', 'taken'].map((name) => [name, join(workRoot, name)]),
+)
+for (const dir of Object.values(W)) await mkdir(dir, { recursive: true })
+
 process.env.MSG9_STATE_FILE = join(stateDir, 'state.json')
 // 凭据仓也指向临时目录：惰性迁移绝不能把测试夹具写进真实 ~/.msg9。
 process.env.MSG9_HOME = join(stateDir, 'msg9-home')
@@ -314,19 +324,19 @@ await writeFile(process.env.MSG9_STATE_FILE, `${JSON.stringify({
   // 只放元数据，**key 本体在凭据仓**（state.json 从不存明文 key）。
   org: { label: 'ice', id: 'org_1', name: 'ICE', api_url: apiUrl, verified_at: '2026-09-30T00:00:00.000Z' },
   workspaces: {
-    'ws-a': { address: 'dsh-alpha-1a2b@msg9.io', api_key: 'msg9_sk_a', api_url: apiUrl, title: 'alpha', path: '/work/a', cursor: 'C1' },
-    'ws-b': { address: 'dsh-beta-3c4d@msg9.io', api_key: 'msg9_sk_b', api_url: apiUrl, title: 'beta', path: '/work/b' },
+    'ws-a': { address: 'dsh-alpha-1a2b@msg9.io', api_key: 'msg9_sk_a', api_url: apiUrl, title: 'alpha', path: W.a, cursor: 'C1' },
+    'ws-b': { address: 'dsh-beta-3c4d@msg9.io', api_key: 'msg9_sk_b', api_url: apiUrl, title: 'beta', path: W.b },
   },
 }, null, 2)}\n`)
 
 // ------------------------------------------------------------- fake dsh host
 
 const workspaces = [
-  { id: 'ws-a', title: 'alpha', path: '/work/a' },
-  { id: 'ws-b', title: 'beta', path: '/work/b' },
-  { id: 'ws-c', title: 'gamma', path: '/work/c' },
+  { id: 'ws-a', title: 'alpha', path: W.a },
+  { id: 'ws-b', title: 'beta', path: W.b },
+  { id: 'ws-c', title: 'gamma', path: W.c },
 ]
-const sessionCwd = { 'sess-a': '/work/a', 'sess-c': '/work/c' }
+const sessionCwd = { 'sess-a': W.a, 'sess-c': W.c }
 
 const host = {
   logger: () => ({ info: () => {} }),
@@ -449,7 +459,7 @@ console.log('dsh-msg9-kit browser-face smoke test:')
 // ------------------------------------------------------------- host bridge
 
 await check('bridge: overview resolves the current workspace from a session cwd', async () => {
-  const { status, payload } = await call(`${BRIDGE_PREFIX}/overview?cwd=%2Fwork%2Fa`)
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/overview?cwd=${encodeURIComponent(W.a)}`)
   assert.equal(status, 200)
   assert.equal(payload.ok, true)
   assert.equal(payload.data.current.key, 'ws-a')
@@ -471,7 +481,7 @@ await check('bridge: overview without a cwd still lists the tenant', async () =>
 
 await check('bridge: no response ever carries a usable key', async () => {
   const secrets = ['msg9_tk_smoketest0123456789', 'msg9_sk_a', 'msg9_sk_b']
-  for (const path of ['/overview?cwd=%2Fwork%2Fa', '/messages?key=ws-a', '/outbox?key=ws-a', '/contacts?key=ws-a', '/peers', '/unread']) {
+  for (const path of ['/overview?cwd=' + encodeURIComponent(W.a), '/messages?key=ws-a', '/outbox?key=ws-a', '/contacts?key=ws-a', '/peers', '/unread']) {
     const { raw } = await call(`${BRIDGE_PREFIX}${path}`)
     for (const secret of secrets) {
       assert.ok(!raw.includes(secret), `${path} leaked ${secret}`)
@@ -538,7 +548,7 @@ await check('bridge: peers and unread serve the sidebar badge', async () => {
 
 await check('bridge: provision opens the inbox of a workspace that has none', async () => {
   const before = seen.ownerAgents
-  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: '/work/c', title: 'gamma' } })
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.c, title: 'gamma' } })
   assert.equal(payload.data.key, 'ws-c')
   assert.ok(payload.data.address.startsWith('dsh-gamma-'), payload.data.address)
   assert.equal(payload.data.provisioned, true)
@@ -546,9 +556,9 @@ await check('bridge: provision opens the inbox of a workspace that has none', as
   // Provisioning writes the yellow-pages profile for the new inbox.
   const profile = seen.provisionProfiles[seen.provisionProfiles.length - 1]
   assert.equal(profile.display_name, 'gamma')
-  assert.equal(profile.links.workspace, '/work/c')
+  assert.equal(profile.links.workspace, W.c)
 
-  const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=%2Fwork%2Fc`)
+  const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=${encodeURIComponent(W.c)}`)
   assert.equal(overview.payload.data.current.key, 'ws-c')
   assert.equal(overview.payload.data.current.provisioned, true)
 })
@@ -667,7 +677,7 @@ await check('store: loads overview, inbox, outbox and contacts through the bridg
     bridge: client.createBridge({ fetch: bridgeFetch() }),
     pollMs: 10 ** 9,
   })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
@@ -688,7 +698,7 @@ await check('store: currentUnread is the current workspace count, not the accoun
     bridge: client.createBridge({ fetch: bridgeFetch() }),
     pollMs: 10 ** 9,
   })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
@@ -708,7 +718,7 @@ await check('store: currentUnread is the current workspace count, not the accoun
 
 await check('store: send, mark-read, contacts and provision move the real data', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
 
   store.setCompose({ to: 'peer@msg9.io', subject: 'ping', text: 'hello from the panel' })
@@ -736,7 +746,7 @@ await check('store: send, mark-read, contacts and provision move the real data',
 })
 await check('store: failed sends surface a notice and keep the draft', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   store.setCompose({ to: '', text: '' })
   await store.send()
@@ -759,7 +769,7 @@ await check('store: a retried send reuses one idempotency key', async () => {
     return base(url, init)
   }
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: flaky }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
 
   store.setCompose({ to: 'peer@msg9.io', text: 'retry me' })
@@ -793,7 +803,7 @@ await check('store: a failed mark-read restores the list AND the unread count', 
     return base(url, init)
   }
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: flaky }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
@@ -814,8 +824,8 @@ await check('store: a stale list response never overwrites the workspace being v
       state_file: '',
       current: null,
       workspaces: [
-        { key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false },
-        { key: 'ws-b', title: 'beta', path: '/work/b', address: 'b@msg9.io', provisioned: true, cursor: null, current: false },
+        { key: 'ws-a', title: 'alpha', path: W.a, address: 'a@msg9.io', provisioned: true, cursor: null, current: false },
+        { key: 'ws-b', title: 'beta', path: W.b, address: 'b@msg9.io', provisioned: true, cursor: null, current: false },
       ],
     }),
     messages: (key) => new Promise((resolve) => release.set(key, resolve)),
@@ -825,7 +835,7 @@ await check('store: a stale list response never overwrites the workspace being v
     peers: async () => ({ peers: [] }),
   }
   const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshOverview()
   assert.ok(release.has('ws-a'), 'inbox of the auto-selected workspace is loading')
 
@@ -845,11 +855,11 @@ await check('store: a stale list response never overwrites the workspace being v
 
 await check('panel renders the current workspace mailbox (server-side markup)', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
-  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
 
   // Three columns: nav (boxes + compose), list, detail placeholder.
@@ -892,13 +902,13 @@ await check('panel renders the current workspace mailbox (server-side markup)', 
 
 await check('square tab lists public agents and shows the agent card', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   store.setTab('square')
   await new Promise((resolve) => setTimeout(resolve, 20))
 
   assert.equal(store.getState().directoryTotal, 2)
-  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
   assert.ok(html.includes('Square'), 'nav: square')
   assert.ok(html.includes('nova@vme.msg9.io'), 'agent of another tenant listed')
@@ -937,13 +947,13 @@ await check('square tab lists public agents and shows the agent card', async () 
 
 await check('contacts tab shows the tenant network grouped by owner', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   store.setTab('contacts')
   await new Promise((resolve) => setTimeout(resolve, 20))
 
   assert.equal(store.getState().accountAgents.length, 3)
-  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
   // 租户网络默认折叠成一行标题（含 agent 总数徽标）——太长会挤掉兄弟信箱。
   assert.ok(html.includes('My tenant network'), 'network header shown')
@@ -972,13 +982,13 @@ await check('account agents: the §28 org endpoint wins once it ships; 404 falls
 
 await check('groups tab lists groups; selecting one shows the card and its archive', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   store.setTab('groups')
   await new Promise((resolve) => setTimeout(resolve, 20))
 
   assert.equal(store.getState().groups.length, 2)
-  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
   assert.ok(html.includes('Groups'), 'nav: groups tab')
   assert.ok(html.includes('Created by me'), 'created section shown')
@@ -1006,7 +1016,7 @@ await check('groups tab lists groups; selecting one shows the card and its archi
 
 await check('processed state: a reply closes the loop; markDone and the pending filter work', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
@@ -1090,11 +1100,11 @@ await check('SSE events: subscribe, get invalidated on mark-read, unsubscribe on
 await check('panel renders the unprovisioned workspace as an explicit action', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
   // A workspace with no inbox: /work/d is not in the registry, so it becomes a cwd bucket.
-  store.setCwd('/work/d')
+  store.setCwd(W.d)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
-  const useSessions = (selector) => selector({ current: 'sess-d', byId: { 'sess-d': { cwd: '/work/d' } } })
+  const useSessions = (selector) => selector({ current: 'sess-d', byId: { 'sess-d': { cwd: W.d } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions, onBack: () => {} }))
   assert.ok(html.includes('Open inbox'), html)
   // The preview shows the real derived address — never the raw `cwd:` key.
@@ -1104,7 +1114,7 @@ await check('panel renders the unprovisioned workspace as an explicit action', a
 
 await check('settings section renders the service intro, ORG binding and its open inboxes', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await store.refreshUnread()
   await new Promise((resolve) => setTimeout(resolve, 20))
@@ -1146,7 +1156,7 @@ await check('panel: the first paint shows a loading state, never a setup-form fl
   // INITIAL.status === 'loading'：overview 还没回来，是否绑定租户是未知数。
   // 此时渲染 SetupView 就是已绑定实例每次打开「消息」都闪一下绑定表单的 bug。
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
   assert.ok(html.includes('Loading'), 'loading state shown while the overview is in flight')
   assert.ok(!html.includes('Skip for now'), 'no setup-form flash for an already-bound instance')
@@ -1167,8 +1177,8 @@ await check('store: a failed write never rolls an old list back over the new vie
       overview: async () => ({
         owner: null, api_url: 'http://fake', state_file: '', current: null,
         workspaces: [
-          { key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false },
-          { key: 'ws-b', title: 'beta', path: '/work/b', address: 'b@msg9.io', provisioned: true, cursor: null, current: false },
+          { key: 'ws-a', title: 'alpha', path: W.a, address: 'a@msg9.io', provisioned: true, cursor: null, current: false },
+          { key: 'ws-b', title: 'beta', path: W.b, address: 'b@msg9.io', provisioned: true, cursor: null, current: false },
         ],
       }),
       messages: async (key) => ({ messages: [{ message_id: `${key}-1`, from_address: 'x@msg9.io' }], total: 1, unread_count: 1 }),
@@ -1187,7 +1197,7 @@ await check('store: a failed write never rolls an old list back over the new vie
   ]
   for (const [writeName, run] of flows) {
     const { store, fail } = makeStore(writeName)
-    store.setCwd('/work/a')
+    store.setCwd(W.a)
     await store.refreshOverview()
     await new Promise((resolve) => setTimeout(resolve, 20))
     assert.deepEqual(store.getState().messages.map((row) => row.message_id), ['ws-a-1'])
@@ -1208,7 +1218,7 @@ await check('store: a failed write never rolls an old list back over the new vie
 
 await check('store: markDone decrements the badge, but only for unread mail', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
@@ -1226,7 +1236,7 @@ await check('store: markDone decrements the badge, but only for unread mail', as
 
 await check('store: switching workspaces clears the badges along with the lists', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(store.getState().unreadCount, 3)
@@ -1266,7 +1276,7 @@ await check('store: group archive append is busy-gated and deduped by message_id
   const fake = {
     overview: async () => ({
       owner: null, api_url: 'http://fake', state_file: '', current: null,
-      workspaces: [{ key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
+      workspaces: [{ key: 'ws-a', title: 'alpha', path: W.a, address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
     }),
     messages: async () => ({ messages: [], total: 0, unread_count: 0 }),
     outbox: async () => ({ messages: [], total: 0 }),
@@ -1282,7 +1292,7 @@ await check('store: group archive append is busy-gated and deduped by message_id
     },
   }
   const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshOverview()
   store.selectGroup('team@msg9.io')
   await new Promise((resolve) => setTimeout(resolve, 20))
@@ -1305,7 +1315,7 @@ await check('groups archive: the channel view threads letters, folds copies and 
   fanoutArchive = true
   try {
     const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-    store.setCwd('/work/a')
+    store.setCwd(W.a)
     await store.refreshAll()
     store.setTab('groups')
     store.selectGroup('team-x@dsh.msg9.io')
@@ -1314,7 +1324,7 @@ await check('groups archive: the channel view threads letters, folds copies and 
     }
     assert.equal(store.getState().groupArchive.length, 8, 'store keeps every archived copy (dedup is by message_id only)')
 
-    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
     const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
     // 布局（主人标注后的取舍）：计数/正倒序行在滚动容器外（钉住）；组信息卡
     // （含发信按钮）在滚动容器内，随存档内容一起滚走。
@@ -1416,7 +1426,7 @@ await check('groups archive: reply_to builds a nested reply tree (copies resolve
 
     // 面板渲染：默认全部展开，嵌套层级与顺序可见。
     const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-    store.setCwd('/work/a')
+    store.setCwd(W.a)
     await store.refreshAll()
     store.setTab('groups')
     store.selectGroup('team-x@dsh.msg9.io')
@@ -1425,7 +1435,7 @@ await check('groups archive: reply_to builds a nested reply tree (copies resolve
     }
     assert.equal(store.getState().groupArchive.length, 9, 'store keeps every archived copy')
 
-    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
     const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
     // 根信 3 份副本折成一张卡（×3），reply_to 指向第 2 个副本的 t3 仍挂在根下。
     assert.equal(html.match(/root body/g).length, 1, 'three copies of the root fold into ONE card')
@@ -1470,12 +1480,12 @@ await check('inbox detail: opening a letter opens its whole conversation (Gmail 
   threadInbox = true
   try {
     const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-    store.setCwd('/work/a')
+    store.setCwd(W.a)
     await store.refreshAll()
     for (let i = 0; i < 50 && store.getState().messages.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 20))
     }
-    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
 
     // 点开 c1 → 会话 = 同 correlation_id 的 2 收 1 发（发的那封只在 outbox），时间正序。
     const readBefore = seen.read.length
@@ -1526,12 +1536,12 @@ await check('inbox list: thread mode groups the list by conversation (toggleable
   threadInbox = true
   try {
     const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-    store.setCwd('/work/a')
+    store.setCwd(W.a)
     await store.refreshAll()
     for (let i = 0; i < 50 && store.getState().messages.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 20))
     }
-    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+    const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
 
     // 纯函数锚点：分组、组间排序（最新一封倒序）、未读/已处理聚合。
     const rows = store.getState().messages
@@ -1583,7 +1593,7 @@ await check('panel: a capped inbox/outbox says so instead of silently truncating
   const fake = {
     overview: async () => ({
       owner: { id: 'own_1', name: 'fake' }, api_url: 'http://fake', state_file: '', current: null,
-      workspaces: [{ key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
+      workspaces: [{ key: 'ws-a', title: 'alpha', path: W.a, address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
     }),
     messages: async () => ({
       messages: [
@@ -1603,11 +1613,11 @@ await check('panel: a capped inbox/outbox says so instead of silently truncating
     groups: async () => ({ groups: [], total: 0 }),
   }
   const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshOverview()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
-  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
   const inboxHtml = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
   assert.ok(inboxHtml.includes('Showing the first 2 of 57'), 'inbox cap hint shown')
 
@@ -1619,7 +1629,7 @@ await check('panel: a capped inbox/outbox says so instead of silently truncating
   // total 不超过已加载数时不显示（同一 fixture 把 total 调小验证）。
   const smallFake = { ...fake, messages: async () => ({ messages: [{ message_id: 'm1', from_address: 'x@msg9.io' }], total: 1, unread_count: 0 }) }
   const smallStore = client.createMsg9Store({ bridge: smallFake, pollMs: 10 ** 9 })
-  smallStore.setCwd('/work/a')
+  smallStore.setCwd(W.a)
   await smallStore.refreshOverview()
   await new Promise((resolve) => setTimeout(resolve, 20))
   const smallHtml = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store: smallStore, useSessions }))
@@ -1663,7 +1673,7 @@ await check('contacts empty state guides; recipient suggestions filter to 6; pen
   const fake = {
     overview: async () => ({
       owner: { id: 'own_1', name: 'fake' }, api_url: 'http://fake', state_file: '', current: null,
-      workspaces: [{ key: 'ws-a', title: 'alpha', path: '/work/a', address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
+      workspaces: [{ key: 'ws-a', title: 'alpha', path: W.a, address: 'a@msg9.io', provisioned: true, cursor: null, current: false }],
     }),
     messages: async () => ({ messages: [], total: 0, unread_count: 0 }),
     outbox: async () => ({ messages: [], total: 0 }),
@@ -1674,11 +1684,11 @@ await check('contacts empty state guides; recipient suggestions filter to 6; pen
     groups: async () => ({ groups: [], total: 0 }),
   }
   const store = client.createMsg9Store({ bridge: fake, pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   store.setTab('contacts')
   await new Promise((resolve) => setTimeout(resolve, 20))
-  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: '/work/a' } } })
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
   const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
   assert.ok(html.includes('No contacts yet — pick one from the network below'), 'empty state guides instead of declaring the page empty')
 
@@ -1693,6 +1703,29 @@ await check('contacts empty state guides; recipient suggestions filter to 6; pen
   assert.ok(chips.includes('ws-7'), 'first 8 chips shown')
   assert.ok(!chips.includes('ws-8'), 'the rest collapse into the overflow chip')
   assert.ok(chips.includes('…and 2 more'), 'overflow chip carries the remaining count')
+})
+
+await check('按钮规则：目录不存在的行不给「开通」；无记录的行不给「移除记录」', async () => {
+  const { canOpen, canRemoveRecord } = client
+  const base = { key: 'k', title: 't', path: '/p', address: null, provisioned: false, stored: false, cursor: null, current: false }
+
+  // ① 目录已不存在 ⇒ 不给开通（开通会真在 ORG 里建资源；2026-09-30 真事故）
+  assert.equal(canOpen({ ...base, health: { pathMissing: true, removable: true } }), false)
+  // ② 目录在、还没开通 ⇒ 给开通
+  assert.equal(canOpen({ ...base, health: { pathMissing: false, removable: false } }), true)
+  // ③ 已经开通的 ⇒ 不需要"开通"入口
+  assert.equal(canOpen({ ...base, provisioned: true, health: { pathMissing: false, removable: false } }), false)
+
+  // ④ 只在注册表里的僵尸行（state 没记录）⇒ **不给**移除（点下去是 404 死按钮）
+  assert.equal(canRemoveRecord({ ...base, health: { pathMissing: true, removable: true } }), false)
+  // ⑤ state 真有记录 + 僵尸 ⇒ 给移除
+  assert.equal(canRemoveRecord({ ...base, stored: true, health: { pathMissing: true, removable: true } }), true)
+  // ⑥ 真记录但不安全移除（唯一持有者）⇒ 不给
+  assert.equal(canRemoveRecord({ ...base, stored: true, health: { pathMissing: false, removable: false } }), false)
+  // ⑦ 真记录 + 重复地址 + 可安全移除 ⇒ 给
+  assert.equal(canRemoveRecord({ ...base, stored: true, address: 'a@x', health: { pathMissing: false, duplicateOf: 'a@x', removable: true } }), true)
+  // ⑧ 真记录 + 正常（无问题）⇒ 不给
+  assert.equal(canRemoveRecord({ ...base, stored: true, health: { pathMissing: false, removable: false } }), false)
 })
 
 await check('settings grouping: 4 objective buckets, and "another pod" is NOT non-compliant', async () => {
@@ -1754,7 +1787,7 @@ await check('store: a successful send refreshes the outbox and the unread badge'
     return base(url, init)
   }
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: counting }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
@@ -1835,13 +1868,13 @@ await check('tenant mode: setup stores the slug and the preview drops the hash',
 
   // cwd bucket "/work/t" -> slug "t": too short for msg9's 3-char minimum, so
   // the preview uses the deterministic `<slug>-<hash4>` fallback.
-  const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=%2Fwork%2Ft`)
+  const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=${encodeURIComponent(W.t)}`)
   assert.equal(overview.payload.data.owner.slug, 'vme')
   assert.match(overview.payload.data.current.planned_address, /^t-[0-9a-f]{4}@vme\.msg9\.io$/)
 })
 
 await check('tenant mode: provisioning asks for the readable address first', async () => {
-  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: '/work/t', title: 'tenantws' } })
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.t, title: 'tenantws' } })
   assert.equal(payload.data.provisioned, true)
   assert.ok(payload.data.address.startsWith('tenantws@'), payload.data.address)
   // No harness prefix: the tenant domain already says whose agent this is.
@@ -1850,7 +1883,7 @@ await check('tenant mode: provisioning asks for the readable address first', asy
 
 await check('tenant mode: a conflicting address falls back to the hashed form', async () => {
   const before = seen.provisioned.length
-  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: '/work/taken', title: 'taken' } })
+  const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.taken, title: 'taken' } })
   assert.equal(payload.data.provisioned, true)
   const attempts = seen.provisioned.slice(before)
   assert.equal(attempts.length, 2, 'one conflict, one retry')
@@ -1869,7 +1902,7 @@ await check('settings section groups workspaces and offers NO one-click migrate'
   assert.equal(row.legacy, true)
 
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
-  store.setCwd('/work/a')
+  store.setCwd(W.a)
   await store.refreshAll()
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
   // 四个分组标题都在（合规在最上，越需要处理的越往下）

@@ -89,6 +89,14 @@ export interface WorkspaceView {
   key: string
   title: string
   path: string
+  /**
+   * 这一行在 msg9-kit 自己的 `state.json` 里**是否真有记录**。
+   *
+   * 为什么需要它：面板的行是"注册表 ∪ state"的并集。只在注册表里的行
+   * （例如 dsh 里那条目录已失效、从未开过信箱的工作区）**没有记录可移除** ——
+   * 界面上若还画「移除记录」，点下去就是 404 死按钮。
+   */
+  stored: boolean
   address: string | null
   /** The address provisioning would assign (host-derived), null once open —
    * except on legacy rows, where it previews the migration target. */

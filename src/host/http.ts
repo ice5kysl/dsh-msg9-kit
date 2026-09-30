@@ -327,6 +327,24 @@ export function defaultBridgeDeps(ctx: Context, override: Partial<BridgeApi> = {
 
 // ------------------------------------------------------------------- helpers
 
+/**
+ * 开通前的硬护栏：**工作区目录必须存在**。
+ *
+ * 为什么必须在服务端：开通不是"显示一下"——它会在 ORG 里建 Pod/Agent（占远端名额）、
+ * 写凭据文件、写 state。2026-09-30 的真事故：界面对"目录已不存在"的僵尸行也画了
+ * 「开通」按钮，点下去真的建出了 `jev@dsh.ice.msg9.io`，而那个工作区的目录早没了。
+ * 界面隐藏按钮只是**减少误触**，不是防线。
+ *
+ */
+function assertWorkspaceDirExists(path: string | undefined): void {
+  if (path && existsSync(path)) return
+  throw new BridgeError(409, 'workspace-dir-missing', L(
+    '工作区目录 {path} 已不存在，无法开通（开通会在你的 ORG 里真的建 Pod/Agent、占用名额）。请在 dsh 里重新登记这个工作区，或直接移除这条记录。',
+    'the workspace directory {path} does not exist, so it cannot be opened (opening really creates pods/agents in your ORG). Re-register the workspace in dsh, or remove this record.',
+    { path: path || '(未提供)' },
+  ))
+}
+
 /** A structured failure the handler turns into an HTTP response. */
 export class BridgeError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -672,6 +690,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         title: workspace.title,
         path: workspace.path,
         address: null,
+        // 只在注册表里、state 没有记录（没有可移除的东西）
+        stored: false,
         // The address provisioning will assign, derived on the host so the
         // panel shows the real thing instead of guessing from the raw key.
         planned_address: planned(workspace),
@@ -704,6 +724,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         key,
         title,
         path,
+        // state 里有记录（哪怕凭据文件丢了 —— 那条记录本身仍可移除）
+        stored: true,
         address,
         planned_address: resolved
           ? (legacy ? planned({ key, title, path }) : null)
@@ -756,6 +778,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         title: current.title,
         path: current.path,
         address: null,
+        // 当前会话所属但不在注册表/state 里 ⇒ 还没有记录
+        stored: false,
         planned_address: `${tenantMode ? deriveAddress(current, { tenant: true }) : deriveAddress(current)}@${currentDomain}`,
         provisioned: false,
         cursor: null,
@@ -1258,6 +1282,12 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         ?? (key && known ? { key, title: known.title, path: known.path } : undefined)
         ?? deps.matchWorkspaceByPath(cwd)
       if (!workspace) throw new BridgeError(400, 'missing-workspace', 'field "key" (workspace) or "cwd" is required')
+      // 🔴 目录都不存在了就别再开通 —— 2026-09-30 真事故：界面上「开通」按钮
+      //    对"目录已不存在"的行也显示，点下去**真的在 ORG 里建出了一个远端
+      //    Agent 信箱**（jev@dsh.ice.msg9.io），而那个目录 /Users/iceskyls/OPC/Jev
+      //    早就不在了。开通会占用远端名额、生成凭据、写 state，全是真动作。
+      //    界面会跟着隐藏这个按钮，但**护栏必须在服务端**（界面拦不住直接调用）。
+      assertWorkspaceDirExists(workspace.path)
       const preferred = str(body.preferred_address)
       if (preferred && !isValidLocalPart(preferred)) {
         throw new BridgeError(400, 'invalid-address', `"${preferred}" is not a valid msg9 local part (3-30 chars, a-z0-9-_ inside)`)
@@ -1339,6 +1369,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         ?? (key && known ? { key, title: known.title, path: known.path } : undefined)
         ?? deps.matchWorkspaceByPath(cwd)
       if (!workspace) throw new BridgeError(400, 'missing-workspace', 'field "key" (workspace) or "cwd" is required')
+      // 同 /provision：目录不在就没有"可以开通"这回事（见那里的注释）
+      assertWorkspaceDirExists(workspace.path)
       const preferredLabel = str(body.pod_label)
       const result = await deps.openPod(workspace, preferredLabel ? { podLabel: preferredLabel } : undefined)
       invalidateUnreadCache()

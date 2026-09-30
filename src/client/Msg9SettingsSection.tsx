@@ -227,6 +227,36 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
  *    §3 只说「项目即 pod」是**推荐用法之一**、不强制 —— 措辞上要把两者分开，
  *    别让人以为那是规范违反。
  */
+/**
+ * 这一行**能不能给「开通」入口**。
+ *
+ * 目录已不存在的行**不能**：开通是**真动作** —— 会在 ORG 里建 Pod/Agent（占远端
+ * 名额）、写凭据文件、写 state，而那个目录根本不在，开出来的信箱挂不到任何地方。
+ *
+ * 2026-09-30 真事故：界面对这种僵尸行也画了「开通」，点下去真的建出了
+ * `jev@dsh.ice.msg9.io`，而它的目录 `/Users/iceskyls/OPC/Jev` 早就不在了。
+ * 服务端另有一道同名硬护栏（`assertWorkspaceDirExists`）—— 这里只是**减少误触**，
+ * 防线在服务端。
+ */
+export function canOpen(row: Msg9State['workspaces'][number]): boolean {
+  return !row.provisioned && !row.health?.pathMissing
+}
+
+/**
+ * 这一行**能不能给「移除记录」入口**。
+ *
+ * 面板的行是「注册表 ∪ state」的并集：只在注册表里的僵尸行（例如 dsh 里那条
+ * 目录已失效、从未开过信箱的工作区）**没有记录可移除**，画了按钮点下去就是 404。
+ * 所以要求 `stored`（state 里真有这条记录）且健康判断认为移除是安全的。
+ */
+export function canRemoveRecord(row: Msg9State['workspaces'][number]): boolean {
+  return Boolean(
+    row.stored
+    && row.health?.removable
+    && (row.health.pathMissing || row.health.duplicateOf),
+  )
+}
+
 export type GroupId = 'missing' | 'problem' | 'noncompliant' | 'unopened' | 'ok'
 
 export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
@@ -592,7 +622,9 @@ function WorkspaceRow({
       </div>
       <div style={styles.rowStats}>
         {opening.error && <span style={styles.warn}>{L('开通失败', 'Failed')}</span>}
-        {!row.provisioned && (
+        {/* 规则见 `canOpen()`：目录不存在的行不给开通入口
+            （「改 slug」一并隐藏 —— 它的唯一用途就是"开通前先改名"）。 */}
+        {canOpen(row) && (
           <>
             <button
               type="button"
@@ -637,7 +669,9 @@ function WorkspaceRow({
           </button>
         )}
         {/* 人工移除：**只在判断为安全时出现**，且永不触碰远端信箱 */}
-        {row.health?.removable && (row.health.pathMissing || row.health.duplicateOf) && (
+        {/* 规则见 `canRemoveRecord()`：只在 state 真有记录时才给，
+            否则是 404 死按钮。 */}
+        {canRemoveRecord(row) && (
           <button
             type="button"
             className="m9-btn"

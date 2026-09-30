@@ -277,6 +277,48 @@ await check('R7：目标不在注册表 / 目标目录不存在 / 源==目标 �
   assert.equal(e.status, 400, JSON.stringify(e.payload))
 })
 
+// ---------------------------------------------------- 开通的目录硬护栏
+//
+// 2026-09-30 真事故：界面对"目录已不存在"的僵尸行也画了「开通」按钮，
+// 点下去**真的在 ORG 里建出了远端 Agent 信箱**（jev@dsh.ice.msg9.io），
+// 而那个工作区的目录 /Users/iceskyls/OPC/Jev 早就不在了。
+// 界面隐藏按钮只是减少误触，**护栏必须在服务端** —— 下面这两条就是钉它。
+
+await check('G1：目录已不存在的工作区，开通一律 409（服务端硬护栏，且不碰远端）', async () => {
+  await seedState()
+  const { deps, calls } = makeDeps()
+  const post = (url, body) => call(deps, { method: 'POST', url, body })
+
+  // ws-old 的目录是故意没创建的（模拟"仓库搬走了"）
+  const a = await post('/dsh-msg9/open-pod', { key: 'ws-old' })
+  assert.equal(a.status, 409, JSON.stringify(a.payload))
+  assert.match(String(a.payload.error?.code ?? ''), /workspace-dir-missing/)
+
+  const b = await post('/dsh-msg9/provision', { key: 'ws-old' })
+  assert.equal(b.status, 409, JSON.stringify(b.payload))
+  assert.match(String(b.payload.error?.code ?? ''), /workspace-dir-missing/)
+
+  // 关键：被拒之后**一次远端调用都没有发生**（桩一被调用就抛错）
+  assert.deepEqual(calls, [], 'no remote call at all')
+
+  // 而且没有凭空写出凭据/记录
+  const state = await loadState()
+  assert.equal(state.workspaces['ws-old'].project_key, 'proj-abc123', '记录未被改写')
+})
+
+await check('G2：目录存在的工作区照常可以走开通路径（护栏不误伤）', async () => {
+  await seedState()
+  const { deps } = makeDeps()
+  // ws-bare 的目录存在、且没有记录 ⇒ 不该被 workspace-dir-missing 拦掉
+  const res = await call(deps, {
+    method: 'POST',
+    url: '/dsh-msg9/open-pod',
+    body: { key: 'ws-bare' },
+  })
+  assert.notEqual(res.status, 409, JSON.stringify(res.payload))
+  assert.doesNotMatch(String(res.payload.error?.code ?? ''), /workspace-dir-missing/)
+})
+
 // --------------------------------------------------------------- 汇总
 
 console.log(failed === 0 ? '\nall checks passed' : `\n${failed} check(s) failed`)
