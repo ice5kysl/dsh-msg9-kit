@@ -172,7 +172,7 @@ function fakeWs() {
  * `pages.since` is keyed by the cursor the engine passes; `pages.unprocessed`
  * answers the pre-delivery reconcile.
  */
-async function makeEngine({ sincePages = {}, bootstrapPage, unprocessed = [], deliver, extraConfig = {} } = {}) {
+async function makeEngine({ sincePages = {}, bootstrapPage, unprocessed = [], deliver, extraConfig = {}, wsConnect, logs } = {}) {
   const home = await tempHome()
   const store = await openDaemonStore(home)
   const registry = createRegistry()
@@ -192,7 +192,7 @@ async function makeEngine({ sincePages = {}, bootstrapPage, unprocessed = [], de
       wsWatchdogMs: 600_000,
       ...extraConfig,
     },
-    log: () => {},
+    log: (message) => { logs?.push(message) },
     uuid: (() => { let n = 0; return () => `uuid-${(n += 1)}` })(),
     now: () => Date.now(),
     listInbox: async (_url, _key, query) => {
@@ -204,7 +204,7 @@ async function makeEngine({ sincePages = {}, bootstrapPage, unprocessed = [], de
       return typeof page === 'function' ? page() : page
     },
     issueWsTicket: async () => ({ ticket: 'ticket-1' }),
-    wsConnect: async () => ws,
+    wsConnect: wsConnect ?? (async () => ws),
     deliverPost: deliver ?? (async (target, body) => { delivered.push({ target, body }) }),
     sleep,
     enumerate: async () => [{ project_key: 'pk-1', address: 'a@msg9.io', api_key: 'k', api_url: 'http://fake' }],
@@ -313,6 +313,63 @@ await check('engine: notify_paused tracks silently (cursor advances, nothing del
 })
 
 // ---------------------------------------------------------------- wsclient
+
+await check('engine: WS「连着但不发帧」（活进程·死连接）→ 看门狗判死并重连', async () => {
+  // 这是真实故障形态：服务端重启后 socket 还"开着"，但再也不推任何东西。
+  // 若没有看门狗，进程会**一直活着、一声不响**——信照样进账本（真相源是 inbox），
+  // 只是没人被叫醒。这是最难察觉的一类故障：不报错、不丢数据，只是静默失效。
+  let connects = 0
+  const logs = []
+  const { engine, registry, instance, store } = await makeEngine({
+    bootstrapPage: { messages: [], next_cursor: 'C1', has_more: false },
+    extraConfig: { wsWatchdogMs: 80, reconnectBaseMs: 20, reconnectMaxMs: 40, safetyNetMs: 600_000 },
+    logs,
+    // 每次连接都返回一个"通但沉默"的 socket（永不发帧 ⇒ lastFrameAt 不再更新）
+    wsConnect: async () => { connects += 1; return fakeWs() },
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    await waitFor(() => store.get().inboxes['pk-1']?.watch_cursor === 'C1')
+    assert.equal(connects, 1, '先建立一次连接')
+    // ★ 关键断言：没有看门狗的话 connects 会一直停在 1
+    await waitFor(() => connects >= 3, 4000)
+    assert.ok(connects >= 3, `看门狗应反复判死重连，实际只连了 ${connects} 次`)
+    assert.ok(
+      logs.some((line) => /silent past the watchdog window/.test(line)),
+      '判死必须留下日志（静默失效唯一能被发现的痕迹）',
+    )
+  } finally {
+    await engine.stop()
+  }
+})
+
+await check('engine: 门铃全程不响，安全网仍把信取回并投递（"门铃停了、信没丢"）', async () => {
+  // 与上一条配对：上一条证明"会重连"，这一条证明**即使重连一直不成，信也不会丢** ——
+  // 因为真相源是 inbox，安全网每 safetyNetMs 做一次按游标的完整回捞。
+  const { engine, registry, instance, ws, delivered, store } = await makeEngine({
+    bootstrapPage: { messages: [mail('m0')], next_cursor: 'C1', has_more: false },
+    sincePages: { C1: { messages: [mail('m9')], next_cursor: 'C2', has_more: false } },
+    unprocessed: () => [mail('m9')],
+    extraConfig: { safetyNetMs: 60, wsWatchdogMs: 600_000, batchWindowMs: 20, batchMaxWaitMs: 200 },
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    await waitFor(() => store.get().inboxes['pk-1']?.watch_cursor === 'C1')
+    assert.equal(delivered.length, 0, '基线阶段不播报')
+    // ★ 关键：**全程不调用 ws.ontext** —— 模拟"门铃一次都没响"
+    assert.equal(ws.ontext !== undefined, true, 'WS 已接上，只是永远不推')
+    await waitFor(() => delivered.length === 1, 4000)
+    assert.deepEqual(
+      delivered[0].body.messages.map((message) => message.message_id),
+      ['m9'],
+      '安全网按游标回捞到了 WS 从未推送的那封',
+    )
+  } finally {
+    await engine.stop()
+  }
+})
 
 await check('wsclient: handshake + text roundtrip + ping/pong + close (spec-faithful fake server)', async () => {
   const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'

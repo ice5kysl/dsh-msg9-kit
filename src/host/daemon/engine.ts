@@ -335,12 +335,19 @@ class InboxRunner {
       this.releaseWs()
     }
     if (this.watchdog) clearInterval(this.watchdog)
+    // 检查节奏**从阈值推导**，不再硬编码 15 秒。
+    // 原来写死 15_000 时，"阈值"和"多久检查一次"是两个互不相关的旋钮：
+    // 默认 120s 阈值 + 15s 节奏看着没问题，但**整条看门狗因此无法被测**
+    // （测试只能把阈值设成 600s 等于关掉）—— 一道从未被验证过的安全机制，
+    // 和不存在没有区别。默认值下节奏仍是 15s，行为不变。
+    const watchdogMs = this.engine.deps.config.wsWatchdogMs
+    const cadence = Math.max(50, Math.min(15_000, Math.floor(watchdogMs / 4)))
     this.watchdog = setInterval(() => {
-      if (Date.now() - ws.lastFrameAt > this.engine.deps.config.wsWatchdogMs) {
+      if (Date.now() - ws.lastFrameAt > watchdogMs) {
         this.log(`msg9 daemon: ws for ${this.projectKey} silent past the watchdog window; reconnecting`)
         ws.destroy()
       }
-    }, 15_000)
+    }, cadence)
   }
 
   private releaseWs(): void {
