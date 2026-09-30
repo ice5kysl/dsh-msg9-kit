@@ -36,6 +36,12 @@ export interface PodStateView {
   /** 上述候选 pod 是否**已存在**于 ORG（已存在却空着，常是"本该开在这儿"的强信号）。 */
   suggested_exists?: boolean
   /**
+   * 那个"应有 pod"的名字**是否有语义**。
+   * `false` = 名字是 `ws-89fa` 这种纯 hash（中文标题无法生成合法 ASCII pod 名），
+   * 界面据此把"名字本来就没法取"和"名字好好的却开错了"分开说。
+   */
+  suggested_meaningful?: boolean
+  /**
    * 现址是否是 pod 形态（`<agent>@<pod>.<org>.<base>`）。
    * `false` = 扁平域 / ORG 的 Default Pod ⇒ 没有 pod 归属。只在已开通时有值。
    */

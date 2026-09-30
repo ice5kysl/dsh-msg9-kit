@@ -549,14 +549,13 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
 
     const podFor = (workspace: CurrentWorkspace, address: string | null, domain: string | null): PodStateView => {
       const custom = Boolean(state.org?.pod_labels?.[workspace.key])
-      // 已开通 ⇒ 以地址为准（既成事实）；未开通 ⇒ 用推导的候选名（可被人工覆盖）。
+      // 已开通 ⇒ 以地址为准（既成事实）；未开通 ⇒ 用指定/推导的候选名。
       const fromAddress = podLabelFromAddress(address, orgMeta?.label)
-      const label = fromAddress
-        ?? (custom ? state.org!.pod_labels![workspace.key]! : deps.derivePodLabel(workspace))
+      // 这个 workspace **应有**的 pod：人工指定优先，其次按名字推导。
+      const expected = custom ? state.org!.pod_labels![workspace.key]! : deps.derivePodLabel(workspace)
+      const label = fromAddress ?? expected
       const stats = podStats.get(label)
-      // 候选 pod（按 workspace 推导的那个）：只在**与现址不同**时给出，
-      // 让面板能回答"它是否开在自己的 pod 里"，并指出那个 pod 是否已存在。
-      const suggested = deps.derivePodLabel(workspace)
+      const mismatch = Boolean(fromAddress) && fromAddress !== expected
       return {
         state: address ? 'ready' : (orgReady ? 'pod_closed' : 'unconfigured'),
         pod_label: label,
@@ -565,10 +564,15 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         domain,
         agents: stats?.agents ?? null,
         max_agents: stats?.max ?? null,
-        // 只在候选名【有语义】且与现址不同才给出 —— 否则 `ws-89fa` 这种
-        // 纯 hash 名字只是噪音（中文标题无法生成 ASCII pod 名，需人工指定）。
-        ...(suggested !== label && isMeaningfulPodLabel(suggested)
-          ? { suggested_label: suggested, suggested_exists: podStats.has(suggested) }
+        // 「应有 pod」只在**与现址不同**时给出 —— 这正是"没开在自己的 pod 里"。
+        // 不论候选名有没有语义都给（分类要靠它）；有无语义另用一个字段表达，
+        // 好让界面把"ws-89fa 这种名字本来就不合法"和"名字好好的却开错了"分开说。
+        ...(mismatch
+          ? {
+              suggested_label: expected,
+              suggested_meaningful: isMeaningfulPodLabel(expected),
+              ...(podProbeOk ? { suggested_exists: podStats.has(expected) } : {}),
+            }
           : {}),
         // 现址的归属事实（用于面板分"合规 / 不合规"）：
         //   pod_form=false ⇒ 扁平域或 Default Pod（没有 pod 归属）

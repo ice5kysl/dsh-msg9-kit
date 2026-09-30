@@ -210,8 +210,16 @@ export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
   if (row.health?.pathMissing) return 'missing'
   if (row.health?.duplicateOf) return 'problem'
   if (row.provisioned && row.pod) {
+    // ① 地址没有 pod 归属（扁平域 / ORG 的 Default Pod）
     if (row.pod.pod_form === false) return 'noncompliant'
+    // ② 地址指向一个 ORG 里不存在的 pod
     if (row.pod.pod_exists === false) return 'noncompliant'
+    // ③ ★「没开在自己的 pod 里」—— 主人 2026-09-30 定的本项目约定：
+    //    一个 workspace 的信箱应当开在它自己那个 pod 下（项目即 pod）。
+    //    host 只在"应有 pod ≠ 现址 pod"时给出 suggested_label，故有值即不合规。
+    //    ⚠️ 规范本身只把"项目即 pod"列为**推荐用法**，不强制；
+    //       所以这条是**本工作区的约定**，不是规范违反 —— 措辞上要区分。
+    if (row.pod.suggested_label) return 'noncompliant'
   }
   return 'ok'
 }
@@ -223,7 +231,7 @@ function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store })
   const groups: { id: GroupId; label: string; hint: string | null; warn: boolean }[] = [
     { id: 'ok', label: L('合规的', 'Compliant'), warn: false, hint: null },
     { id: 'noncompliant', label: L('不合规的', 'Non-compliant'), warn: true,
-      hint: L('地址没有 Pod 归属，或指向 ORG 里不存在的 Pod', 'no pod ownership, or a pod missing from the ORG') },
+      hint: L('没有开在自己的 Pod 里（含：无 Pod 归属、Pod 不存在）', 'not in its own pod (or no pod ownership / pod missing)') },
     { id: 'problem', label: L('有问题的', 'Problems'), warn: true,
       hint: L('多条记录指向同一个地址', 'several records share one address') },
     { id: 'missing', label: L('不存在了的', 'Gone'), warn: true,
@@ -372,17 +380,23 @@ function WorkspaceRow({
             <code style={styles.code}>{row.health.duplicateOf}</code>
           </div>
         )}
-        {/* 候选 Pod 已存在、而信箱开在别处 —— 这是"可能开错地方"的**客观**信号
-            （本机 LLMPool：ORG 里的 `llmpool` pod 空着，信箱却在 `whymyphone` 下）。
-            只在候选 pod **确实存在**时才提示，免得给十几条"候选尚未创建"的行添噪音。
-            注意：这**不是**不合规 —— 规范并不要求 pod 名等于项目名。 */}
-        {pod?.suggested_exists && pod.suggested_label && (
+        {/* 没开在自己的 pod 里 —— 这是"不合规"的具体原因，逐行说清楚。
+            两种情形分开讲：
+              · 名字有语义、pod 也已存在 ⇒ 很可能就是该迁过去的地方（最强信号）
+              · 名字本身取不出合法 pod 名（纯 ASCII 限制）⇒ 需要人工指定
+            注意措辞：这违反的是**本工作区约定**（项目即 pod），
+            规范里它只是推荐用法 —— 不把约定说成规范。 */}
+        {pod?.suggested_label && (
           <div style={styles.rowMeta}>
             <span style={styles.warn}>
-              {L('⚠ 候选 Pod「{pod}」已存在', '⚠ candidate pod "{pod}" already exists', { pod: pod.suggested_label })}
+              {L('⚠ 没开在自己的 Pod 里（应为「{pod}」）', '⚠ not in its own pod (expected "{pod}")', { pod: pod.suggested_label })}
             </span>
             <span style={styles.dim}>
-              {L('（它可能是这个 workspace 该去的地方）', '(it may be where this workspace belongs)')}
+              {!pod.suggested_meaningful
+                ? L('（该名字取不出合法的 Pod 名，需人工指定）', '(name cannot yield a valid pod label; set it manually)')
+                : pod.suggested_exists
+                  ? L('（该 Pod 已存在，可能就是它该去的地方）', '(that pod already exists — likely where it belongs)')
+                  : L('（该 Pod 尚未创建）', '(that pod does not exist yet)')}
             </span>
           </div>
         )}

@@ -1708,10 +1708,20 @@ await check('settings grouping: 4 objective buckets, and "another pod" is NOT no
   assert.equal(groupOf({ ...base, address: 'a@msg9.io', pod: pod({ pod_form: false }) }), 'noncompliant')
   // ④ 地址指向 ORG 里不存在的 pod → 不合规的
   assert.equal(groupOf({ ...base, pod: pod({ pod_form: true, pod_exists: false }) }), 'noncompliant')
-  // ⑤ ★ 开在别的 pod 下，但那个 pod 存在于 ORG → **算合规**。
-  //    规范 address-format.md §3 明说「项目即 pod」只是推荐用法之一，
-  //    归属与直觉是否一致不属于"违反规范"。
-  assert.equal(groupOf({ ...base, pod: pod({ pod_label: 'whymyphone', pod_form: true, pod_exists: true }) }), 'ok')
+  // ⑤ ★ 开在别的 pod 下 ⇒ **不合规**（主人 2026-09-30 定的本项目约定：
+  //    一个 workspace 的信箱要开在它自己那个 pod 里）。
+  //    host 只在"应有 pod ≠ 现址 pod"时给 suggested_label，有值即判。
+  assert.equal(
+    groupOf({ ...base, pod: pod({ pod_label: 'whymyphone', pod_form: true, pod_exists: true, suggested_label: 'llmpool' }) }),
+    'noncompliant',
+  )
+  // ⑤b 名字取不出合法 pod 名（纯 hash）时同样算不合规，只是措辞不同
+  assert.equal(
+    groupOf({ ...base, pod: pod({ pod_label: 'msg9', pod_form: true, pod_exists: true, suggested_label: 'ws-3410', suggested_meaningful: false }) }),
+    'noncompliant',
+  )
+  // ⑤c 开在自己的 pod 里（host 不会给 suggested_label）⇒ 合规
+  assert.equal(groupOf({ ...base, pod: pod({ pod_label: 'dsh', pod_form: true, pod_exists: true }) }), 'ok')
   // ⑥ 探测失败（pod_exists 未知）不得当成"不存在"
   assert.equal(groupOf({ ...base, pod: pod({ pod_form: true }) }), 'ok')
   // ⑦ 未开通的行（没有 pod 信息）不因为缺字段被判不合规
