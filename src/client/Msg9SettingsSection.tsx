@@ -143,8 +143,12 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
         <>
           <div style={styles.dim}>
             {L(
-              '在 msg9.io 的 Account 页创建一个 ORG，复制它的 key（msg9_ok_…，只显示一次）粘到这里。每个项目对应一个 Pod，Pod 里放各 harness 的信箱。',
-              'Create an ORG on the msg9.io Account page and paste its key (msg9_ok_…, shown once) here. One project = one pod, and each harness gets an inbox inside it.',
+              // 删掉原先的第二句「每个项目对应一个 Pod，Pod 里放各 harness 的信箱」：
+              // 它与本页「规范的 / 不规范的」判据（pod 名 = workspace 名）说法相反，
+              // 同一页里两处互相矛盾。ORG 卡的职责只是"这把 key 怎么来"，
+              // 不该在这里替 Pod 归属下定义（那是下面那张表要讲的事）。
+              '在 msg9.io 的 Account 页创建一个 ORG，复制它的 key（msg9_ok_…，只显示一次）粘到这里。',
+              'Create an ORG on the msg9.io Account page and paste its key (msg9_ok_…, shown once) here.',
             )}
           </div>
           <form
