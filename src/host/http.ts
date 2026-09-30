@@ -202,9 +202,19 @@ const UNREAD_TTL_MS = 10_000
 let unreadCache: { at: number; view: UnreadView } | undefined
 let unreadInflight: Promise<UnreadView> | undefined
 
-/** 本地状态变化后（已读/闭环/开通/迁移）立刻作废旧快照。 */
+/**
+ * 本地状态变化后（已读/闭环/开通/迁移）立刻作废旧快照。
+ *
+ * ⚠️ **必须连在途请求一起作废**（只清 `unreadCache` 不够）：
+ * 一次拉取可能在本地的写操作**之前**就已经发出，它带回来的是写之前的快照。
+ * 若不作废，写操作后立刻发起的刷新会 join 那次旧拉取（`computeUnread` 里
+ * `if (unreadInflight) return unreadInflight`），于是"刚点已读、未读数又跳回去"。
+ * 这里只是把登记清掉，之后的新调用会重新拉；已经拿到旧 promise 的调用方
+ * 不受影响（它们本来就该拿到那次结果）。
+ */
 export function invalidateUnreadCache(): void {
   unreadCache = undefined
+  unreadInflight = undefined
 }
 
 /**
@@ -219,7 +229,7 @@ export async function computeUnread(deps: BridgeDeps, signal: AbortSignal, optio
   // 共享任务不带任何单个调用方的 signal：第一个调用方断开不应中止合并后
   // 其余等待者的上游拉取（出站调用自带 30s 超时兜底）。
   void signal
-  unreadInflight = (async () => {
+  const task = (async () => {
     const state = await deps.loadState()
     // 统一从凭据仓解析（含惰性迁移）；解析不到的 entry 不参与计数。
     const keys = Object.keys(state.workspaces)
@@ -256,10 +266,14 @@ export async function computeUnread(deps: BridgeDeps, signal: AbortSignal, optio
     const view: UnreadView = { total, byKey, totalByKey }
     unreadCache = { at: Date.now(), view }
     return view
-  })().finally(() => {
-    unreadInflight = undefined
+  })()
+  // 只在"当前登记的就是这一次"时才摘牌：`invalidateUnreadCache()` 可能已经把
+  // 登记换成了更新的一次拉取，旧任务的 finally 不得把后来者误清掉。
+  const tracked = task.finally(() => {
+    if (unreadInflight === tracked) unreadInflight = undefined
   })
-  return unreadInflight
+  unreadInflight = tracked
+  return tracked
 }
 
 /** The real dependencies, bound to a host context. */
@@ -612,7 +626,12 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         pathMissing: Boolean(p) && !existsSync(p),
       }])
     }
-    const healthFor = (key: string, address: string | null, path: string): WorkspaceHealth => {
+    const healthFor = (
+      key: string,
+      address: string | null,
+      path: string,
+      stale?: { registryPath: string; statePath: string } | null,
+    ): WorkspaceHealth => {
       const pathMissing = Boolean(path) && !existsSync(path)
       const holders = address ? (byAddress.get(address) ?? []) : []
       const others = holders.filter((h) => h.key !== key)
@@ -642,6 +661,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         duplicateOf,
         removable,
         ...(reason ? { reason } : {}),
+        // 两处记录对"目录在哪"说法不一致 —— 以注册表为准，但把差异摆出来
+        ...(stale ? { stalePath: stale.statePath, registryPath: stale.registryPath } : {}),
       }
     }
 
@@ -669,7 +690,16 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       // outside the current tenant domain and should be migrated.
       const legacy = Boolean(resolved && tenantMode && address && !address.endsWith(`@${domain}`))
       const title = inbox.title || existing?.title || key
-      const path = inbox.path || existing?.path || ''
+      // ⚠️ 路径以 **dsh 的工作区注册表**为准（`existing.path`）：那是活数据，
+      //    决定工作区能不能用、信箱往哪挂。msg9 的 state 只是自己的备忘。
+      //    反过来的话，会出现"工作区好好的、面板却说目录不存在"的误报。
+      const registryPath = existing?.path ?? ''
+      const statePath = inbox.path || ''
+      const path = registryPath || statePath
+      // 两处不一致 ⇒ 把 msg9 记录里的旧路径一并交给健康判断（只提示，不改）
+      const stalePathInfo = registryPath && statePath && registryPath !== statePath
+        ? { registryPath, statePath }
+        : null
       rows.set(key, {
         key,
         title,
@@ -685,7 +715,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         // 已开通 ⇒ ready；pod 域取地址里 `@` 之后那一段（真实值，不是推导值）。
         pod: podFor({ key, title, path }, address, address ? address.slice(address.indexOf('@') + 1) : null),
         pod_domain: address ? address.slice(address.indexOf('@') + 1) : null,
-        health: healthFor(key, address, path),
+        health: healthFor(key, address, path, stalePathInfo),
       })
     }
 

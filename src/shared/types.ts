@@ -63,6 +63,19 @@ export interface PodStateView {
 export interface WorkspaceHealth {
   /** 目录已不存在（记录指向一个被搬走/删除的路径）。 */
   pathMissing: boolean
+  /**
+   * msg9 记录里的路径与**工作区当前路径**不一致时，给出那个旧路径。
+   *
+   * 为什么要单列：一个 workspace 的"目录"有**两处记录** ——
+   *   ① dsh 的工作区注册表（决定工作区能不能用、信箱往哪挂）
+   *   ② msg9-kit 的 state（只是它自己的备忘）
+   * 两者不一致时，**以注册表为准**（那是 dsh 的活数据）。
+   * 若拿旧记录去判"目录不存在"，就会出现"工作区明明好好的，
+   * 面板却说它目录没了"的误报。
+   */
+  stalePath?: string
+  /** 工作区注册表里的当前路径（仅在它与 msg9 记录的路径不同时给出）。 */
+  registryPath?: string
   /** 与另一条记录共用同一个地址（两条都指向同一个信箱）。 */
   duplicateOf?: string | null
   /** 移除这条记录是否安全。`false` = 它是该地址唯一的持有者（移除会孤立信箱）。 */

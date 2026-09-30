@@ -334,6 +334,58 @@ await check('#4: TTL 缓存 + in-flight 合并，不再每个标签页各打一�
   assert.deepEqual(a, b)
 })
 
+await check('#4: 作废缓存时连"在途"的那次拉取一起作废（否则刚标已读、未读数又跳回旧值）', async () => {
+  invalidateUnreadCache()
+  const calls = []
+  const resolvers = []
+  const deps = {
+    loadState: async () => ({
+      workspaces: { 'ws-r': { address: 'r@msg9.io', api_key: 'kr', api_url: 'http://x', title: 'r', path: '/r' } },
+    }),
+    resolveCredentials: async () => ({ address: 'r@msg9.io', api_key: 'kr', api_url: 'http://x' }),
+    api: {
+      // 每次调用都挂起，由测试决定何时返回 —— 这样才能精确制造"在途"窗口
+      listInbox: async () => {
+        calls.push(calls.length + 1)
+        await new Promise((resolve) => resolvers.push(resolve))
+        return { unread_count: 5, total: 9, messages: [] }
+      },
+    },
+  }
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  let first
+  let second
+  let third
+  // 用 try/finally 释放挂在 listInbox 上的 resolver：一旦断言失败就 bailed，
+  // 若不释放，`unreadInflight` 会永久挂着一个不 settle 的 promise，
+  // 后面每个测试的 computeUnread 都会 join 它 —— 整个文件卡死（踩过）。
+  try {
+    first = computeUnread(deps, SIGNAL, { ttlMs: 0 })
+    await tick()
+    assert.equal(calls.length, 1, '第一次拉取已在途')
+
+    // 模拟"用户点了标记已读"：本地状态变了，作废旧快照
+    invalidateUnreadCache()
+    second = computeUnread(deps, SIGNAL, { ttlMs: 0 })
+    await tick()
+    // 🔴 关键：写操作之后发起的刷新**不得** join 写之前就已发出的那次拉取
+    //    —— 那次带回来的是"标记已读之前"的快照，会让未读数跳回去。
+    assert.equal(calls.length, 2, '作废后应重新拉一次，而不是复用旧的在途请求')
+
+    // 旧任务先收尾：它的 finally **不得**把第二次的登记清掉，
+    // 否则后面的调用会以为没人拉、又重复拉一轮。
+    resolvers[0]()
+    await tick()
+    third = computeUnread(deps, SIGNAL, { ttlMs: 0 })
+    await tick()
+    assert.equal(calls.length, 2, '第二次仍在途 ⇒ 第三次应合并进去，而不是再拉一轮')
+  } finally {
+    for (const release of resolvers) release()
+    await Promise.allSettled([first, second, third].filter(Boolean))
+  }
+})
+
 await check('#4: 部分信箱失败时沿用上轮快照，不再静默缺 key', async () => {
   invalidateUnreadCache()
   let failing = false

@@ -381,6 +381,21 @@ function WorkspaceRow({
             </span>
           </div>
         )}
+        {/* 两处记录对"目录在哪"说法不一致：以注册表为准，但把旧记录摆出来。
+            这不是故障（工作区照常可用），所以是提示而非报警。 */}
+        {row.health?.stalePath && (
+          <div style={styles.rowMeta}>
+            <span style={styles.dim}>
+              {L('msg9 记录里的目录是旧路径', 'the msg9 record holds an old path')}
+            </span>
+            <code style={styles.code}>{row.health.stalePath}</code>
+            <span style={styles.dim}>
+              {L('（工作区现在在 {now}，以它为准）', '(the workspace is now at {now}; that one wins)', {
+                now: row.health.registryPath ?? '',
+              })}
+            </span>
+          </div>
+        )}
         {row.health?.duplicateOf && (
           <div style={styles.rowMeta}>
             <span style={styles.warn}>{L('⚠ 与另一条记录共用同一地址', '⚠ shares an address with another record')}</span>
