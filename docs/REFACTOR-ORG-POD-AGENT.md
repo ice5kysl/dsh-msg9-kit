@@ -494,19 +494,43 @@ official ORG key（org_RK9z2VyOuIZ7）        → ORG「official」
 | # | 动作 | 端点 / 手段 | key |
 |---|---|---|---|
 | 0 | **前置：把 `Documents/OPC/Jev` 在 dsh 里登记成工作区** | 主人操作（我不代改 dsh 注册表） | — |
-| 1 | 建 `dsh@jev.ice.msg9.io` | `POST /owner/agents` | jev pod key |
+| 1 | **先建** `dsh@jev.ice.msg9.io` | `POST /owner/agents` | jev pod key |
 | 2 | 给旧 agent 签一把新 key（否则搬不了信） | `POST /owner/agents/:address/keys` | whymyphone pod key |
-| 3 | 搬历史 | `POST /owner/agents/:address/move-mail` | pod key |
+| 3 | **再**搬历史（目标此刻已存在，见下） | `POST /owner/agents/:address/move-mail` | whymyphone pod key |
 | 4 | 老地址设转发（漏网来信进新信箱） | `PUT /agent/forwarding` | 旧 agent key（第 2 步所得） |
 | 5 | `disable` 旧 agent（消息全保留） | `POST /agent/disable` | 旧 agent key |
 | 6 | 删掉误建的 `jev@dsh.ice.msg9.io` | `DELETE /owner/agents/<local>` | jev pod key |
 | 7 | 本地：记录挂到新工作区 + 写新凭据；移除旧记录 | 本插件 | — |
 
-**两个未验证点（动手前先验）**：
-1. **搬信是否接受跨 pod**：规格写「目标须同租户 / 同 ORG / 同账户」，旧在 `whymyphone` pod、
-   新在 `jev` pod —— 是"同 ORG 但不同 pod"，**三个条件是"且"还是"或"没验**。
-   **退路**：不搬信、只设转发（旧信留旧信箱，新信自动进新信箱）。
-2. **旧信箱实际有几封**：第 2 步拿到 key 后**先数一遍**再决定要不要搬。
+**⚠️ 第 1 步必须在第 3 步之前** —— 见下面这条踩过的坑。
+
+### 13.3.1 踩过的坑：我把"目标不存在"误读成"跨 pod 被禁止"
+
+**我一度报了一个缺陷，主结论是错的，已去信更正。** 记录在此以免重犯：
+
+| 探测（`dry_run`） | 目标状态 | 结果 |
+|---|---|---|
+| `to = dsh@dsh.ice.msg9.io` | **存在**（不同 pod） | ✅ `code=0`，`moved=2` |
+| `to = dsh@jev.ice.msg9.io` | **不存在**（jev pod 里 0 agent） | ❌ `40311 not owned by this owner` |
+
+`40311` 的字面意思诱使我推断"**同 ORG 跨 pod 不被允许**"，于是准备**放弃迁移历史、
+退化成只设转发**。实际只是**目标还没建**。
+
+平台侧**已修**（实测：同一调用连测 3 次均为 `40410 not found`）——
+即"目标不存在"不再复用"越权"的错误码。
+
+**⇒ 两条纪律**：
+1. **迁移类动作的顺序是"先建目标、再搬信"** —— 反了会得到一个语义完全错位的报错；
+2. **错误码把两种语义揉在一起时，使用者会替它做一次错误的因果推断。**
+   看到 `not owned` 先问一句"**是不是目标根本不存在**"，别急着下"被禁止"的结论。
+
+### 13.3.2 已确认的前提（不必再验）
+
+* **跨 pod 搬信允许**（规格 §12.1 的 ②「同 ORG 另一个 pod」是真的）；
+* **旧信箱里只有 2 封，且都未读**（`dry_run` 报 `by_folder={"inbox/unread":2}`）；
+* **目标 `dsh@jev.ice.msg9.io` 空着**，`jev` pod 已存在（0 agent）；
+* **`whymyphone-ice.key` 有权管旧 agent**（`GET /owner/agents/:address/keys` → `code=0`）；
+* 搬信**保留 folder**（未读搬过去仍未读），且**是 move 不是 copy**、**不可逆**。
 
 ### 13.4 本次已落地的界面改动
 
