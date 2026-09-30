@@ -1126,8 +1126,11 @@ await check('settings section renders the service intro, ORG binding and its ope
   assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'first inbox listed')
   assert.ok(html.includes('dsh-beta-3c4d@msg9.io'), 'second inbox listed')
   assert.ok(html.includes('dsh-gamma-'), 'newly opened inbox listed too')
-  // Per-inbox counts from /unread (the fake reports 3 unread of a 2-message box).
-  assert.ok(html.includes('3 unread · 3 total'), html)
+  // 三层分明：workspace / Pod / Agent（主人 2026-09-30 的 UI 要求）
+  assert.ok(html.includes('Pod'), '显示 Pod 层')
+  assert.ok(html.includes('Agent'), '显示 Agent 层')
+  // 消息数**不再**出现在设置页 —— 那属于「消息」页签
+  assert.ok(!html.includes('unread · '), '设置页不显示消息数')
 })
 
 await check('store.start() keeps one poller and its disposer stops it', async () => {

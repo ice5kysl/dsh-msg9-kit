@@ -128,6 +128,14 @@ export interface BridgeClient {
     existingAgents?: number
     note?: string
   }>
+  /**
+   * 移除一条**本地** workspace 记录（僵尸 / 重复条目）。
+   * 只删凭据文件 + 热状态，**不调用任何远端接口**。
+   */
+  removeWorkspace(
+    input: { key: string },
+    signal?: AbortSignal,
+  ): Promise<{ key: string; address: string | null; removed_files: string[]; remote_untouched: boolean }>
   resolve(address: string, signal?: AbortSignal): Promise<{ record: Record<string, unknown> }>
 }
 
@@ -265,6 +273,12 @@ export function createBridge(options: BridgeOptions = {}): BridgeClient {
       planned_pod_label: string
       org: { label: string; name: string | null } | null
     }>(`/pod-state${query({ key: input.key, cwd: input.cwd })}`, { signal }),
+    removeWorkspace: (input, signal) => request<{
+      key: string
+      address: string | null
+      removed_files: string[]
+      remote_untouched: boolean
+    }>('/remove-workspace', { method: 'POST', body: input, signal }),
     openPod: (input, signal) => request<{
       key: string
       state: string

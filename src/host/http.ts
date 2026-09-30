@@ -28,6 +28,7 @@
  * @module dsh-msg9-kit/http
  */
 
+import { existsSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { timingSafeEqual } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
@@ -54,10 +55,11 @@ import {
   sendMessage,
   type InboxMessage,
 } from './api.ts'
+import { L } from './locale.ts'
 import { derivePodLabel, ensureInbox, ensureSigningKey, maskKey, migrateInbox, openPod, ownerContext, podState, type InboxContext } from './service.ts'
-import { credentialsMigrated, readOrgKey, resolveCredentials, saveOwner, writeOrgKey } from './credentials.ts'
-import { defaultApiUrl, getNotifyPaused, isTenantOwner, loadState, saveState, setMessageMark, setNotifyPaused, stateFilePath, withStateLock, type LiveInbox, type OwnerState, type State } from './store.ts'
-import type { OverviewView, PodStateView, WorkspaceView } from '../shared/types.ts'
+import { credentialsMigrated, readOrgKey, removeProjectCredentials, resolveCredentials, saveOwner, writeOrgKey } from './credentials.ts'
+import { defaultApiUrl, deleteWorkspaceInbox, getNotifyPaused, isTenantOwner, loadState, saveState, setMessageMark, setNotifyPaused, stateFilePath, withStateLock, type LiveInbox, type OwnerState, type State } from './store.ts'
+import type { OverviewView, PodStateView, WorkspaceHealth, WorkspaceView } from '../shared/types.ts'
 import type { OrgInfo } from './api.ts'
 import {
   deriveAddress,
@@ -500,19 +502,75 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     }
     const rows = new Map<string, WorkspaceView>()
 
-    // 三态开通状态（主人 2026-09-30）：整个 overview 只探测一次 ORG 是否有 key，
-    // 免得每个 workspace 行都去读一遍凭据仓。
+    // 三态开通状态（主人 2026-09-30）：整个 overview 只探测一次 ORG 的 key 与
+    // pod 列表，免得每个 workspace 行都去读一遍凭据仓 / 打一次 API。
     const orgMeta = state.org
     const orgKey = orgMeta?.label ? await readOrgKey(orgMeta.label).catch(() => undefined) : undefined
     const orgReady = Boolean(orgKey?.key)
+    // pod 名 → { agents, max_agents }：来自只读探测 `GET /api/v1/org/pods`。
+    // 探测失败 ⇒ 空表 ⇒ 面板显示"—"，**不把"未知"画成"零"**。
+    const podStats = new Map<string, { agents: number | null; max: number | null }>()
+    if (orgReady) {
+      const pods = await deps.api
+        .orgListPods(orgMeta?.api_url || defaultApiUrl(), orgKey!.key)
+        .catch(() => [])
+      for (const pod of pods) {
+        podStats.set(pod.pod_label, {
+          agents: typeof pod.agents === 'number' ? pod.agents : null,
+          max: typeof pod.max_agents === 'number' ? pod.max_agents : null,
+        })
+      }
+    }
     const podFor = (workspace: CurrentWorkspace, address: string | null, domain: string | null): PodStateView => {
       const custom = Boolean(state.org?.pod_labels?.[workspace.key])
       const label = custom ? state.org!.pod_labels![workspace.key]! : deps.derivePodLabel(workspace)
+      const stats = podStats.get(label)
       return {
         state: address ? 'ready' : (orgReady ? 'pod_closed' : 'unconfigured'),
         pod_label: label,
         custom,
         domain,
+        agents: stats?.agents ?? null,
+        max_agents: stats?.max ?? null,
+      }
+    }
+
+    /**
+     * 一条记录的健康判断（只读）。
+     *
+     * 两类问题**必须被标出来**，因为从地址本身看不出来：
+     *   ① **僵尸**：`path` 已不存在（仓库搬走了，记录还留着）；
+     *   ② **重复**：两条记录指向同一个地址 —— 我 09-30 修信箱时就制造过一条
+     *      （`dsh-42b65c` 与 `dsh-c3330f` 撞到了 `dsh@dsh.ice.msg9.io`）。
+     *
+     * `removable` 的判据：**移除它不会让某个地址失去唯一的持有者**。
+     * 否则那个信箱就没人管了（游标、转发、key 都在记录里）。
+     */
+    const addressCount = new Map<string, number>()
+    for (const [key, inbox] of Object.entries(state.workspaces)) {
+      const resolved = resolvedByKey.get(key)
+      const addr = resolved?.address ?? inbox.address ?? null
+      if (addr) addressCount.set(addr, (addressCount.get(addr) ?? 0) + 1)
+    }
+    const healthFor = (address: string | null, path: string): WorkspaceHealth => {
+      const pathMissing = Boolean(path) && !existsSync(path)
+      const dupCount = address ? (addressCount.get(address) ?? 0) : 0
+      const duplicateOf = address && dupCount > 1 ? address : null
+      // 该地址只有它一个持有者 ⇒ 移除会孤立这个信箱 —— 除非它本来就是僵尸
+      // （目录都没了，那条记录已无实际用途，留着才是问题）。
+      const soleHolder = Boolean(address) && dupCount === 1
+      const removable = !soleHolder || pathMissing
+      return {
+        pathMissing,
+        duplicateOf,
+        removable,
+        ...(removable ? {} : {
+          reason: L(
+            '这是地址 {address} 的唯一记录，移除后该信箱将不再被管理。',
+            'This is the only record for {address}; removing it leaves that inbox unmanaged.',
+            { address: address ?? '' },
+          ),
+        }),
       }
     }
 
@@ -529,6 +587,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         cursor: null,
         current: workspace.key === currentKey,
         pod: podFor(workspace, null, null),
+        health: healthFor(null, workspace.path),
       })
     }
     for (const [key, inbox] of Object.entries(state.workspaces)) {
@@ -555,6 +614,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         // 已开通 ⇒ ready；pod 域取地址里 `@` 之后那一段（真实值，不是推导值）。
         pod: podFor({ key, title, path }, address, address ? address.slice(address.indexOf('@') + 1) : null),
         pod_domain: address ? address.slice(address.indexOf('@') + 1) : null,
+        health: healthFor(address, path),
       })
     }
 
@@ -1165,6 +1225,58 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       const result = await deps.openPod(workspace, preferredLabel ? { podLabel: preferredLabel } : undefined)
       invalidateUnreadCache()
       return ok(res, { key: workspace.key, ...result })
+    }
+
+    // 移除**本地记录**（僵尸 / 重复条目）。
+    //
+    // 🔴 这个端点【只动本地】：删凭据文件 + state 里那条 workspace 记录。
+    //    **不调用任何远端接口** —— 不 disable、不 purge、不删信。
+    //    "收回本地引用"与"注销身份"是两件事，这里只做前者（后者是不可逆的对外动作）。
+    //
+    // 安全判断在这里**再判一次**（不信客户端）：如果它是该地址唯一的持有者，
+    // 就拒绝 —— 否则那个信箱会失去管理（游标、转发、key 都在记录里）。
+    // 例外：目录已经不存在的僵尸记录允许移除（它已无实际用途，留着才是问题）。
+    if (method === 'POST' && path === `${BRIDGE_PREFIX}/remove-workspace`) {
+      const body = await readJsonBody(req)
+      const key = str(body.key)
+      if (!key) throw new BridgeError(400, 'missing-workspace', 'field "key" is required')
+      const state = await deps.loadState()
+      const inbox = state.workspaces[key]
+      if (!inbox) throw new BridgeError(404, 'unknown-workspace', `no workspace record is registered as "${key}"`)
+
+      // 数一下这个地址还有几条记录（必须与 overview 用同一算法）
+      const selfAddress = (await resolveVia(deps, key))?.address ?? inbox.address ?? null
+      const holders = selfAddress
+        ? (await Promise.all(Object.keys(state.workspaces).map(async (k) => ({
+            k, address: (await resolveVia(deps, k))?.address ?? state.workspaces[k]?.address ?? null,
+          })))).filter((row) => row.address === selfAddress)
+        : []
+      const pathMissing = Boolean(inbox.path) && !existsSync(inbox.path)
+      if (holders.length <= 1 && !pathMissing) {
+        throw new BridgeError(
+          409,
+          'sole-holder',
+          L(
+            '"{key}" 是地址 {address} 的唯一记录，移除后该信箱将不再被管理；已拒绝。',
+            '"{key}" is the only record for {address}; removing it would leave that inbox unmanaged.',
+            { key, address: selfAddress ?? '' },
+          ),
+        )
+      }
+
+      const removedFiles = inbox.project_key
+        ? await removeProjectCredentials(inbox.project_key)
+        : []
+      await deleteWorkspaceInbox(key)
+      invalidateUnreadCache()
+      deps.log(`msg9: removed local record ${key} (${removedFiles.length} credential file(s))`)
+      return ok(res, {
+        key,
+        address: selfAddress,
+        removed_files: removedFiles,
+        // 明确回给界面：远端什么都没动
+        remote_untouched: true,
+      })
     }
 
     // 开通状态（只读；面板据此决定显示"未配置"/"未开启"/"已开通"）

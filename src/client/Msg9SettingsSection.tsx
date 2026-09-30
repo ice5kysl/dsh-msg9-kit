@@ -273,6 +273,7 @@ function WorkspaceRow({
   const badge = badgeText(unread)
   const opening = state.opening[row.key] ?? { busy: false, error: null }
   const [editLabel, setEditLabel] = useState<string | null>(null)
+  const [confirmRemove, setConfirmRemove] = useState(false)
 
   const stateText = !pod || pod.state === 'unconfigured'
     ? L('未配置 ORG', 'No ORG')
@@ -284,27 +285,57 @@ function WorkspaceRow({
     <li style={styles.row}>
       <Mail size={14} style={styles.rowIcon} />
       <div style={styles.rowText}>
+        {/* 第 1 层：workspace 本身 */}
         <div style={styles.rowTitle}>{row.title}</div>
         <div style={styles.path}>{row.path}</div>
-        <div style={styles.rowMeta}>
-          <span style={pod?.state === 'ready' ? styles.ok : styles.warn}>{stateText}</span>
-          {pod && (
+
+        {/* 健康判断：僵尸 / 重复。**从地址看不出来，所以必须标出来。** */}
+        {row.health?.pathMissing && (
+          <div style={styles.rowMeta}>
+            <span style={styles.warn}>{L('⚠ 目录已不存在', '⚠ directory is gone')}</span>
+            <span style={styles.dim}>
+              {L('（仓库搬走了，这条记录是残留）', '(the repo moved; this record is a leftover)')}
+            </span>
+          </div>
+        )}
+        {row.health?.duplicateOf && (
+          <div style={styles.rowMeta}>
+            <span style={styles.warn}>{L('⚠ 与另一条记录共用同一地址', '⚠ shares an address with another record')}</span>
+            <code style={styles.code}>{row.health.duplicateOf}</code>
+          </div>
+        )}
+
+        {/* 第 2 层：Pod —— 显示它自己的状态与用量（不是这个 workspace 的消息数） */}
+        <div style={styles.layerRow}>
+          <span style={styles.layerTag}>{L('Pod', 'Pod')}</span>
+          {pod ? (
             <>
-              <span style={styles.dot}>·</span>
-              <span>
-                {L('Pod', 'Pod')}{' '}
-                <code style={styles.code}>{pod.pod_label}</code>
-                {pod.custom && <span style={styles.dim}>{L('（已自定义）', ' (custom)')}</span>}
+              <code style={styles.code}>{pod.pod_label}</code>
+              {pod.custom && <span style={styles.dim}>{L('（已自定义）', ' (custom)')}</span>}
+              {pod.domain && <span style={styles.code}>{pod.domain}</span>}
+              {/* 已开 agent 数 / 上限 —— 这才是 Pod 的真实状态 */}
+              <span style={pod.state === 'ready' ? styles.ok : styles.warn}>{stateText}</span>
+              <span style={styles.dim}>
+                {pod.agents === null || pod.agents === undefined
+                  ? L('agent —（未探测到）', 'agents — (not probed)')
+                  : L('{n} / {max} 个 Agent 信箱', '{n} / {max} inboxes', {
+                      n: pod.agents, max: pod.max_agents ?? '—',
+                    })}
               </span>
             </>
-          )}
-          {row.address && (
-            <>
-              <span style={styles.dot}>·</span>
-              <span style={styles.code}>{row.address}</span>
-            </>
+          ) : (
+            <span style={styles.dim}>{L('（此 workspace 尚无 Pod）', '(no pod yet)')}</span>
           )}
         </div>
+
+        {/* 第 3 层：Agent 信箱地址 */}
+        {row.address && (
+          <div style={styles.layerRow}>
+            <span style={styles.layerTag}>{L('Agent', 'Agent')}</span>
+            <code style={styles.code}>{row.address}</code>
+          </div>
+        )}
+
         {editLabel !== null && pod?.state !== 'ready' && (
           <div style={styles.rowMeta}>
             <input
@@ -324,17 +355,8 @@ function WorkspaceRow({
       <div style={styles.rowStats}>
         {opening.error && <span style={styles.warn}>{L('开通失败', 'Failed')}</span>}
         {row.provisioned ? (
-          <>
-            {/* 未读 / 总数：改版前就有，这里补回来（信息不能因为换布局而丢） */}
-            {mailboxSize !== undefined && (
-              <span style={styles.dim}>
-                {L('{unread} 未读 · 共 {total} 封', '{unread} unread · {total} total', {
-                  unread, total: mailboxSize,
-                })}
-              </span>
-            )}
-            {badge ? <span style={styles.badge}>{badge}</span> : null}
-          </>
+          // 消息数**不在这里**显示（那属于「消息」页签）；这里只留未读徽标做提示。
+          badge ? <span style={styles.badge}>{badge}</span> : null
         ) : (
           <>
             <button
@@ -358,8 +380,77 @@ function WorkspaceRow({
             </button>
           </>
         )}
+        {/* 人工移除：**只在判断为安全时出现**，且永不触碰远端信箱 */}
+        {row.health?.removable && (row.health.pathMissing || row.health.duplicateOf) && (
+          <button
+            type="button"
+            className="m9-btn"
+            style={styles.smallBtn}
+            title={L('只移除本地记录，不动远端信箱', 'Removes the local record only — the remote inbox is untouched')}
+            onClick={() => setConfirmRemove(true)}
+          >
+            {L('移除记录', 'Remove')}
+          </button>
+        )}
       </div>
+      {confirmRemove && (
+        <RemoveConfirm row={row} store={store} onClose={() => setConfirmRemove(false)} />
+      )}
     </li>
+  )
+}
+
+/**
+ * 移除确认。**说清楚会发生什么**，并且明确区分"本地记录"与"远端信箱"：
+ *
+ * 移除只做一件事 —— 删掉 `~/.msg9/projects/<harness>/<project-key>.yaml(/.signing.yaml)`
+ * 与 state 里那条 workspace 记录。
+ * **不调用任何远端接口**（不 disable、不 purge、不删信）。
+ *
+ * 若该地址还有别的记录持有，会一并说明"信箱仍由谁管"，避免用户以为信箱没了。
+ */
+function RemoveConfirm({
+  row, store, onClose,
+}: {
+  row: Msg9State['workspaces'][number]
+  store: Msg9Store
+  onClose: () => void
+}): JSX.Element {
+  const busy = false
+  return (
+    <div style={styles.confirmBox}>
+      <div style={styles.rowMeta}>
+        <strong>{L('移除这条记录？', 'Remove this record?')}</strong>
+      </div>
+      <ul style={styles.confirmList}>
+        <li>{L('只删本地记录（凭据文件 + 热状态），不调用任何远端接口。',
+              'Deletes the local record only (credential files + hot state); no remote call.')}</li>
+        {row.address && row.health?.duplicateOf
+          ? <li>{L('信箱 {address} 仍由另一条记录管理，收发不受影响。',
+                  'Inbox {address} stays managed by the other record; mail is unaffected.',
+                  { address: row.address })}</li>
+          : null}
+        {row.health?.pathMissing
+          ? <li>{L('目录 {path} 已不存在，这条记录不会再被用到。',
+                  'Directory {path} no longer exists, so this record is already unused.',
+                  { path: row.path })}</li>
+          : null}
+      </ul>
+      <div style={styles.orgActions}>
+        <button
+          type="button"
+          className="m9-btn m9-btn-primary"
+          style={styles.smallBtn}
+          disabled={busy}
+          onClick={() => void store.removeWorkspace(row.key).then(onClose)}
+        >
+          {L('确认移除', 'Remove')}
+        </button>
+        <button type="button" className="m9-btn" style={styles.smallBtn} onClick={onClose}>
+          {L('取消', 'Cancel')}
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -485,4 +576,26 @@ const styles: Record<string, CSSProperties> = {
   warn: { color: '#d9534f' },
   smallBtn: { fontSize: 11, padding: '2px 8px' },
   slugInput: { width: 140, fontSize: 11, padding: '2px 6px' },
+  // 三层分明：workspace（标题+路径）/ Pod / Agent 各占一行，左侧小标签对齐。
+  layerRow: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 12, marginTop: 2 },
+  layerTag: {
+    flex: 'none',
+    width: 42,
+    fontSize: 10,
+    color: DIM,
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+  },
+  // 移除确认：给它自己的框，别和那一行的其它内容混在一起。
+  confirmBox: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    marginTop: 6,
+    padding: '8px 10px',
+    border: `1px solid ${BORDER}`,
+    borderRadius: 6,
+    background: 'rgba(217,83,79,0.04)',
+  },
+  confirmList: { margin: 0, paddingLeft: 18, fontSize: 12, color: DIM, lineHeight: 1.6 },
 }

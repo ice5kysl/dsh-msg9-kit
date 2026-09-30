@@ -19,6 +19,32 @@ export interface PodStateView {
   custom: boolean
   /** 已开 Pod 时的地址域（如 `dsh.ice.msg9.io`）。 */
   domain?: string | null
+  /**
+   * 该 pod 下**已开**的 agent（信箱）数。
+   * 来源：ORG 只读探测 `GET /api/v1/org/pods` 的 `agents` 字段。
+   * `null` = 没探到 —— 面板显示"—"而不是 0（**别把"未知"画成"零"**）。
+   */
+  agents?: number | null
+  /** 该 pod 的 agent 上限（`max_agents`）。 */
+  max_agents?: number | null
+}
+
+/**
+ * 一条 workspace 记录的**健康判断**（只读推导；面板据此标注，并允许人工移除）。
+ *
+ * 为什么要它：`~/.msg9/projects/` 是**多项目共用**的，一条记录可能因为
+ * 「仓库搬走了」或「两个 workspace 撞到同一地址」而变成僵尸/冲突 ——
+ * **而这些从地址本身看不出来**，必须由程序判断，不能靠人记得。
+ */
+export interface WorkspaceHealth {
+  /** 目录已不存在（记录指向一个被搬走/删除的路径）。 */
+  pathMissing: boolean
+  /** 与另一条记录共用同一个地址（两条都指向同一个信箱）。 */
+  duplicateOf?: string | null
+  /** 移除这条记录是否安全。`false` = 它是该地址唯一的持有者（移除会孤立信箱）。 */
+  removable: boolean
+  /** 不可移除的原因（给用户看的一句话）。 */
+  reason?: string
 }
 
 /** One workspace row of the tenant table (never carries a key). */
@@ -42,6 +68,8 @@ export interface WorkspaceView {
   pod?: PodStateView
   /** 该 pod 的地址域（已开 Pod 时）；未开时为 null。 */
   pod_domain?: string | null
+  /** 这条记录的健康判断（僵尸 / 重复 / 可否移除）。 */
+  health?: WorkspaceHealth
 }
 
 /** The msg9 owner (tenant) behind this dsh instance. */

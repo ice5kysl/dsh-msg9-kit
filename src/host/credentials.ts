@@ -249,6 +249,27 @@ export async function writeSigningSeed(projectKey: string, seed: string, options
 }
 
 /**
+ * 删掉一个 workspace 的**本地凭据文件**（yaml + signing.yaml）。
+ *
+ * ⚠️ **只删本地**，不调用任何远端接口 —— 不 disable、不 purge、不删信。
+ * 这也是"移除记录"这个动作的全部含义：收回本地引用，而不是注销身份。
+ *
+ * 返回实际删掉的文件名（给用户/日志一个可核对的清单，而不是"已删除"三个字）。
+ */
+export async function removeProjectCredentials(projectKey: string): Promise<string[]> {
+  const removed: string[] = []
+  for (const path of [projectYamlPath(projectKey), signingYamlPath(projectKey)]) {
+    try {
+      await rm(path, { force: true })
+      removed.push(path)
+    } catch {
+      /* 不存在就是已经干净了；不视为失败 */
+    }
+  }
+  return removed
+}
+
+/**
  * 按规范解析 pod 租户 key（`address-format.md` §5 / `12-org-pods.md`）。
  *
  * 优先级（规范原文）：

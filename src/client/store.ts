@@ -196,6 +196,11 @@ export interface Msg9Store {
   loadPodState(key?: string): Promise<void>
   /** 开启当前 workspace 的 Pod（ORG → Pod → Agent）。**唯一写路径。** */
   openPod(key?: string): Promise<void>
+  /**
+   * 移除一条**本地** workspace 记录（僵尸 / 重复条目）。
+   * 服务端会再判一次"是否为该地址的唯一持有者"，不安全就拒绝。
+   */
+  removeWorkspace(key: string): Promise<void>
   /** Skip binding for now. */
   dismissSetup(): void
 }
@@ -999,6 +1004,22 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
         await refreshAll()
       } catch {
         /* 只读探测失败不打扰用户：overview 的 pod 行已能显示三态 */
+      }
+    },
+    /**
+     * 移除一条本地记录。**不做乐观更新** —— 等服务端确认（它可能因"唯一持有者"拒绝）。
+     */
+    async removeWorkspace(key) {
+      try {
+        const result = await bridge.removeWorkspace({ key })
+        notice('ok', L(
+          '已移除本地记录（{n} 个凭据文件）。远端信箱未做任何改动。',
+          'Local record removed ({n} credential files). The remote inbox was not touched.',
+          { n: result.removed_files.length },
+        ))
+        await refreshAll()
+      } catch (error) {
+        notice('error', errorText(error))
       }
     },
     /**
