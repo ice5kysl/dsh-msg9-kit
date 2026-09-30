@@ -27,6 +27,7 @@ import { Msg9Panel } from './Msg9Panel.tsx'
 import { Msg9SettingsSection } from './Msg9SettingsSection.tsx'
 import { L } from './locale.ts'
 import { getMsg9Store, currentUnread } from './store.ts'
+import { ensureMsg9Styles } from './theme.ts'
 import { badgeText } from './view.ts'
 
 export const name = 'msg9-kit'
@@ -47,6 +48,7 @@ export { filterRecipients, threadRows } from './view.ts'
 export { createBridge } from './api.ts'
 export { highlightReady, highlightCode } from './highlight.ts'
 export { createMsg9Store, getMsg9Store, selectedWorkspace, currentUnread } from './store.ts'
+export { ensureMsg9Styles, CLIENT_PLUGIN_ID, CSS_TAG_ID, M9_CSS, type StylesDocument } from './theme.ts'
 
 /** Minimal service faces this plugin consumes (typed locally at the boundary). */
 interface SlotsLike {
@@ -63,6 +65,12 @@ export function apply(raw: Context): void {
   const ctx = raw as unknown as ClientCtxLike
   const log = ctx.logger('msg9-kit:client')
   const store = getMsg9Store()
+
+  // The stylesheet is a package-owned <head> tag (T-15 mechanism: a React-
+  // rendered <style> is untagged, so dsh's module loader books it for the next
+  // materializing stranger and deletes it on that package's HMR — the panel
+  // then degrades to unstyled markup). Idempotent + self-healing.
+  ensureMsg9Styles()
 
   // The badge is useful before the view is ever opened.
   ctx.effect(() => store.start(), 'msg9-kit: unread poller')

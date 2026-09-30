@@ -17,7 +17,7 @@ import { L } from './locale.ts'
 import { SetupView } from './Msg9Panel.tsx'
 import type { Msg9State, Msg9Store } from './store.ts'
 import type { RelinkTarget } from '../shared/types.ts'
-import { ACCENT, BORDER, DIM, FG, M9_CSS } from './theme.ts'
+import { ACCENT, BORDER, DIM, FG, ensureMsg9Styles } from './theme.ts'
 import { badgeText } from './view.ts'
 
 /** Props handed to the section: the injected store (owner prop `close` unused). */
@@ -30,8 +30,10 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
   const { store } = props
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState)
 
-  // The settings page can be the first surface the user opens.
+  // The settings page can be the first surface the user opens. Re-assert the
+  // package-owned stylesheet here too (it lives in document.head, idempotent).
   useEffect(() => {
+    ensureMsg9Styles()
     void store.refreshOverview()
     void store.refreshUnread()
     void store.refreshPeers()
@@ -39,7 +41,6 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
 
   return (
     <div style={styles.wrap}>
-      <style>{M9_CSS}</style>
 
       {/* ① 介绍 + 注册/登录引导（主人 2026-09-30 定的三步结构之首） */}
       <section style={styles.card}>

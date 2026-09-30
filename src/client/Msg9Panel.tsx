@@ -29,7 +29,7 @@ import { Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, Globe, Inbox, Me
 import { highlightCode, highlightReady } from './highlight.ts'
 import { L } from './locale.ts'
 import { selectedWorkspace, type Msg9State, type Msg9Store, type Tab } from './store.ts'
-import { ACTIVE_BG, ACCENT, BG, BORDER, BORDER_STRONG, DIM, FG, M9_CSS, MINE_BG } from './theme.ts'
+import { ACTIVE_BG, ACCENT, BG, BORDER, BORDER_STRONG, DIM, FG, MINE_BG, ensureMsg9Styles } from './theme.ts'
 import {
   FOLDERS,
   agentLabel,
@@ -178,7 +178,10 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   }, [])
 
   // First paint: tenant table + workspace data + sibling list + bell state.
+  // Also re-assert the package-owned stylesheet on every mount — it rides
+  // document.head, never the React tree (dsh's loader steals untagged sheets).
   useEffect(() => {
+    ensureMsg9Styles()
     void store.refreshAll()
     void store.refreshNotifyStatus()
   }, [store])
@@ -189,7 +192,6 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   if (state.status === 'loading') {
     return (
       <div style={styles.root} ref={rootHeightRef}>
-        <style>{M9_CSS}</style>
         <div style={styles.empty}>
           <p style={styles.emptyText}>{L('正在加载 msg9 状态…', 'Loading msg9 state…')}</p>
         </div>
@@ -204,7 +206,6 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   if (needsSetup) {
     return (
       <div style={styles.root} ref={rootHeightRef}>
-        <style>{M9_CSS}</style>
         <SetupView state={state} store={store} />
       </div>
     )
@@ -213,7 +214,6 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   if (state.status === 'error' && state.error) {
     return (
       <div style={styles.root} ref={rootHeightRef}>
-        <style>{M9_CSS}</style>
         <div style={styles.errorBlock}>
           <div>{L('无法读取 msg9 状态：{error}', 'Cannot read msg9 state: {error}', { error: state.error })}</div>
           {state.cwd && !workspace?.provisioned && (
@@ -229,7 +229,6 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
   if (!workspace || !workspace.provisioned) {
     return (
       <div style={styles.root} ref={rootHeightRef}>
-        <style>{M9_CSS}</style>
         <Notice state={state} store={store} />
         {!workspace ? (
           <Empty
@@ -257,7 +256,6 @@ export function Msg9Panel(props: Msg9PanelProps): JSX.Element {
 
   return (
     <div style={styles.root} ref={rootHeightRef}>
-      <style>{M9_CSS}</style>
       <Notice state={state} store={store} />
       <div style={styles.columns}>
         <NavColumn state={state} store={store} />

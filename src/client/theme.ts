@@ -5,7 +5,9 @@
  * Colors ride the dsh shell's `--dsw-alias-*` design tokens (the same ones the
  * shipped surfaces use), with fallbacks for older shells. Inline styles cannot
  * express :hover / :focus / :disabled, so every interactive element carries a
- * class from `M9_CSS`, injected once per surface via <style>{M9_CSS}</style>.
+ * class from `M9_CSS`, injected once into document.head as a package-owned tag
+ * by {@link ensureMsg9Styles} — never as a React-rendered `<style>` (dsh's
+ * module loader claims untagged sheets and deletes them on a stranger's HMR).
  *
  * @module dsh-msg9-kit/client-theme
  */
@@ -97,3 +99,51 @@ export const M9_CSS = `
   .m9-listcol { width: 250px !important; }
 }
 `
+
+/** The package id dsh's client module loader knows us by (package.json name). */
+export const CLIENT_PLUGIN_ID = 'dsh-msg9-kit'
+
+/** The stylesheet tag's fingerprint: loader inventory key + our dedupe key. */
+export const CSS_TAG_ID = `${CLIENT_PLUGIN_ID}/theme.css`
+
+/** Minimal DOM face {@link ensureMsg9Styles} needs (real Document, or a test
+ *  stub — the function is deliberately drivable in tests). */
+export interface StylesDocument {
+  head: { appendChild(node: unknown): unknown }
+  createElement(tag: string): { textContent: string; setAttribute(name: string, value: string): void }
+  querySelector(selector: string): unknown
+}
+
+/**
+ * Inject {@link M9_CSS} into `document.head` once, TAGGED as our own.
+ *
+ * Two rules, both load-bearing (same failure as taskboard's T-15, 2026-09-30 —
+ * dsh 点名本 kit 的 6 处 React <style> 同病）:
+ *
+ *  1. **Never let React own the tag.** dsh's client module loader claims every
+ *     untagged `<style>` in the document for whichever plugin module
+ *     materializes next (`style:not([data-plugin])` → `data-plugin = id`), and
+ *     deletes `style[data-plugin=<pkg>]` when that package unloads or hot
+ *     reloads. A React-rendered tag has no `data-plugin`, so it gets claimed by
+ *     a stranger and later deleted behind React's back — the fiber still
+ *     believes the node exists and never re-adds it, silently losing the whole
+ *     stylesheet. Our tag is therefore born with `data-plugin` +
+ *     `data-plugin-css` (the shipped dsh packages' convention), so the loader
+ *     never claims it and our own unload removes exactly ours.
+ *  2. **Idempotent + self-healing.** Keyed by `data-plugin-css`, so a second
+ *     call (every surface mount, the client plugin's apply) is a no-op; if the
+ *     tag ever disappears the next call puts it back.
+ *
+ * @param doc - document to inject into; defaults to the browser document and
+ *   is a no-op when there is none (SSR / plain Node).
+ */
+export function ensureMsg9Styles(doc?: StylesDocument | null): void {
+  const target = doc !== undefined ? doc : typeof document === 'undefined' ? null : (document as unknown as StylesDocument)
+  if (!target) return
+  if (target.querySelector(`style[data-plugin-css=${JSON.stringify(CSS_TAG_ID)}]`)) return
+  const tag = target.createElement('style')
+  tag.setAttribute('data-plugin', CLIENT_PLUGIN_ID)
+  tag.setAttribute('data-plugin-css', CSS_TAG_ID)
+  tag.textContent = M9_CSS
+  target.head.appendChild(tag)
+}

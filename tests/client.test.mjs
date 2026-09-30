@@ -905,8 +905,8 @@ await check('panel renders the current workspace mailbox (server-side markup)', 
   assert.ok(composing.includes('Write'), 'write tab offered')
   assert.ok(composing.includes('Preview'), 'preview tab offered')
   assert.ok(composing.includes('m9-textarea'), 'write mode shows the textarea by default')
-  // 列表密度：行内 padding 收紧（M9_CSS 随面板注入）。
-  assert.ok(composing.includes('padding: 5px 10px'), 'list rows use the denser padding')
+  // 列表密度：行内 padding 收紧（规则在 M9_CSS 里，样式表走 head 注入、不进 markup——T-16）。
+  assert.ok(client.M9_CSS.includes('padding: 5px 10px'), 'list rows use the denser padding')
 })
 
 await check('square tab lists public agents and shows the agent card', async () => {
@@ -1344,8 +1344,8 @@ await check('groups archive: the channel view threads letters, folds copies and 
     // 卡片宽度约束锚点：通栏（fit-content 气泡在超宽窗口会留出大片空白，
     // "我"的信靠右悬浮时尤其明显），任何卡片不超出右栏可视宽度。
     assert.ok(html.includes('width:100%'), 'letter cards run full-width of the column')
-    // 宽表格处理规则随 M9_CSS 注入（表格内部横滚，不撑破卡片）。
-    assert.ok(html.includes('.m9-letter-md table'), 'archive tables scroll internally')
+    // 宽表格处理规则在 M9_CSS 里（表格内部横滚，不撑破卡片；样式表走 head 注入、不进 markup——T-16）。
+    assert.ok(client.M9_CSS.includes('.m9-letter-md table'), 'archive tables scroll internally')
     // 默认折叠：只有头行 + 纯文本预览，没有 markdown 正文，也没有「回复」。
     // （断言匹配渲染出的 class 属性——M9_CSS 样式文本里本来就含 ".m9-md" 字样。）
     assert.ok(!html.includes('class="m9-md'), 'collapsed channel renders previews, not markdown bodies')
@@ -2008,6 +2008,107 @@ await check('tenant migration: legacy inbox is re-provisioned and the old one su
   // Overview is clean again.
   const after = await call(`${BRIDGE_PREFIX}/overview`)
   assert.equal(after.payload.data.workspaces.find((r) => r.key === 'ws-a').legacy, false)
+})
+
+// ------------------------------------------------ stylesheet ownership (T-16)
+
+/**
+ * Minimal document for the stylesheet-ownership contract — only the surface
+ * `ensureMsg9Styles` + dsh's loader bookkeeping touch. Transcribed from
+ * dsh-taskboard-kit's T-15 tests (same loader, same failure).
+ */
+function fakeStyleDocument() {
+  const tags = []
+  const matches = (tag, selector) => {
+    let m
+    if (selector === 'style:not([data-plugin])') return tag.getAttribute('data-plugin') === null
+    if (selector === 'style[data-plugin]') return tag.getAttribute('data-plugin') !== null
+    if ((m = /^style\[data-plugin="([^"]*)"\]$/.exec(selector))) return tag.getAttribute('data-plugin') === m[1]
+    if ((m = /^style\[data-plugin-css="([^"]*)"\]$/.exec(selector))) return tag.getAttribute('data-plugin-css') === m[1]
+    throw new Error(`fakeStyleDocument: unsupported selector ${selector}`)
+  }
+  return {
+    tags,
+    head: { appendChild: (node) => (tags.push(node), node) },
+    createElement: () => {
+      const attrs = new Map()
+      const tag = {
+        textContent: '',
+        setAttribute: (name, value) => attrs.set(name, String(value)),
+        getAttribute: (name) => (attrs.has(name) ? attrs.get(name) : null),
+        remove: () => {
+          const at = tags.indexOf(tag)
+          if (at >= 0) tags.splice(at, 1)
+        },
+      }
+      return tag
+    },
+    querySelector: (selector) => tags.find((tag) => matches(tag, selector)) ?? null,
+    querySelectorAll: (selector) => tags.filter((tag) => matches(tag, selector)),
+  }
+}
+
+// The two loader primitives under test, transcribed from
+// @deepseek-ai/dsh-client-modules/lib/client.js (:494 claim, :196 remove).
+const loaderClaimStyles = (doc, id) => {
+  for (const el of doc.querySelectorAll('style:not([data-plugin])')) el.setAttribute('data-plugin', id)
+}
+const loaderRemoveOwnedStyles = (doc, id) => {
+  for (const el of doc.querySelectorAll('style[data-plugin]')) if (el.getAttribute('data-plugin') === id) el.remove()
+}
+
+await check('theme: M9_CSS is injected as a package-owned <head> tag, once, and heals (T-16)', () => {
+  const doc = fakeStyleDocument()
+  client.ensureMsg9Styles(doc)
+  assert.equal(doc.tags.length, 1, 'one tag')
+  const tag = doc.tags[0]
+  // Born owned: dsh's loader stamps `data-plugin` on every UNTAGGED <style>
+  // and deletes `style[data-plugin=<pkg>]` on that package's unload. A tag
+  // that is ours from birth can never be claimed by a stranger.
+  assert.equal(tag.getAttribute('data-plugin'), client.CLIENT_PLUGIN_ID, 'born with our package id')
+  assert.equal(client.CLIENT_PLUGIN_ID, 'dsh-msg9-kit', 'matches package.json (the loader compares the envelope id)')
+  assert.equal(tag.getAttribute('data-plugin-css'), client.CSS_TAG_ID, 'and the loader-inventory fingerprint')
+
+  // Idempotent: apply + every surface mount call it again.
+  client.ensureMsg9Styles(doc)
+  assert.equal(doc.tags.length, 1, 'second call is a no-op')
+  // Self-healing: if the tag ever disappears, the next call puts it back.
+  tag.remove()
+  client.ensureMsg9Styles(doc)
+  assert.equal(doc.tags.length, 1, 'a lost tag is re-injected on the next mount')
+  assert.ok(doc.tags[0].textContent.includes('.m9-btn'), 'the injected sheet carries the m9-* rules')
+
+  // No <style> may ride the React tree any more: that is exactly the shape the
+  // loader steals and later deletes behind React's back.
+  const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
+  store.setCwd(W.a)
+  const useSessions = (selector) => selector({ current: 'sess-a', byId: { 'sess-a': { cwd: W.a } } })
+  const html = renderToStaticMarkup(React.createElement(client.Msg9Panel, { store, useSessions }))
+  assert.ok(!html.includes('<style'), 'the panel does not render its own <style> tag')
+  const settingsHtml = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
+  assert.ok(!settingsHtml.includes('<style'), 'the settings section does not render its own <style> tag')
+})
+
+await check('theme: the dsh module loader can neither claim nor delete our stylesheet (T-16)', () => {
+  const doc = fakeStyleDocument()
+  client.ensureMsg9Styles(doc)
+
+  // A stranger module materializes → its claim pass books every unowned tag.
+  loaderClaimStyles(doc, 'some-other-plugin')
+  assert.equal(doc.tags[0].getAttribute('data-plugin'), client.CLIENT_PLUGIN_ID, 'ours keeps our id (never claimed by a stranger)')
+  // …and later reloads/unloads → it deletes what it believes it owns.
+  loaderRemoveOwnedStyles(doc, 'some-other-plugin')
+  assert.equal(doc.tags.length, 1, "a stranger's reload leaves our stylesheet in place")
+
+  // The old shape proves the mechanism: a <style> rendered inside the React
+  // tree is untagged, so it IS claimed by the next module and then deleted
+  // behind React's back — the failure dsh 点名 (msg_XQMZEol1YFJ3).
+  const reactOwned = doc.createElement('style')
+  doc.head.appendChild(reactOwned)
+  loaderClaimStyles(doc, 'some-other-plugin')
+  assert.equal(reactOwned.getAttribute('data-plugin'), 'some-other-plugin', 'an untagged tag IS stolen')
+  loaderRemoveOwnedStyles(doc, 'some-other-plugin')
+  assert.equal(doc.tags.includes(reactOwned), false, 'and then deleted — the old failure mode, reproduced')
 })
 
 server.closeAllConnections?.()
