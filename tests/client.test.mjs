@@ -69,8 +69,9 @@ const seen = { send: [], read: [], readBy: [], processed: [], contactAdd: [], co
 const identities = new Map([
   // 扁平租户：设置页「绑定 owner key」用
   ['msg9_tk_ui_1234567890', { domain: 'msg9.io', me: { id: 'own_ui', name: 'dsh-ui', mail_domain: 'msg9.io', quota: { max_agents: 50 } } }],
-  // 带 slug 的老租户（升级后的服务端形态）：域 = `<slug>.<mail_domain>`
-  ['msg9_tk_slug_1234567890', { domain: 'vme.msg9.io', me: { id: 'own_sl', name: 'slugged', slug: 'vme', mail_domain: 'msg9.io', address_domain: 'vme.msg9.io', quota: { max_agents: 50 } } }],
+  // 设置页「绑定 owner key」用的那一把：ORG `ice` 下的 pod `vme`
+  //（域 = `<pod>.<org>.<base>`，**必须带 org 段** —— 缺了就不是真实形态了）
+  ['msg9_tk_slug_1234567890', { domain: 'vme.ice.msg9.io', me: { id: 'own_sl', name: 'slugged', slug: 'vme', mail_domain: 'msg9.io', address_domain: 'vme.ice.msg9.io', quota: { max_agents: 50 } } }],
 ])
 
 /**
@@ -405,6 +406,9 @@ await writeFile(process.env.MSG9_STATE_FILE, `${JSON.stringify({
       'ws-a': 'vme',
       [`cwd:${W.t}`]: 'vme',
       [`cwd:${W.taken}`]: 'vme',
+      // ws-b 的信箱是旧的**扁平**地址，人工指定它属于 pod `kappa`
+      // ⇒ P1-5 迁移它时，目标 pod（kappa）必须 ≠ 本实例的 pod（vme）。
+      'ws-b': 'kappa',
     },
   },
   workspaces: {
@@ -418,11 +422,13 @@ await writeFile(process.env.MSG9_STATE_FILE, `${JSON.stringify({
 // 新模型下 `provision()` 用**目标 pod 的 key** 建 agent，拿不到就明确报错。
 //
 // 本实例自己的 pod：`vme`（key 落在 `tenants/vme-ice.key`，正是上面 pod_label
-// 指的位置）。它的域是 `vme.msg9.io` —— 带 slug 的老租户升级成 pod 后的形态；
-// tenant-mode / migrate 那几条用例钉的就是这个域（夹具沿用旧租户域，不带 org 段）。
-await seedPodKey('vme', 'msg9_tk_smoketest0123456789', 'vme.msg9.io')
+// 指的位置）。域按真实 ORG 形态写全：`<pod>.<org>.<base>` = `vme.ice.msg9.io`。
+await seedPodKey('vme', 'msg9_tk_smoketest0123456789', 'vme.ice.msg9.io')
 // 被测 workspace ws-c 的项目 pod：`gamma` —— 新模型要求的正是这一把 key。
 await seedPodKey('gamma', 'msg9_tk_gamma_ice', 'gamma.ice.msg9.io')
+// ws-b 在夹具里被人工指定到 pod `kappa`（≠ 本实例的 `vme`）：P1-5 用它验
+// 「迁移走的是**目标 pod 的** key」。它的旧信箱是扁平的 `dsh-beta-3c4d@msg9.io`。
+await seedPodKey('kappa', 'msg9_tk_kappa_ice', 'kappa.ice.msg9.io')
 
 // ------------------------------------------------------------- fake dsh host
 
@@ -2008,7 +2014,7 @@ await check('tenant mode: setup stores the slug and the preview drops the hash',
   // 不再拿 workspace slug 兜底 —— 项目身份由 Pod 段承载。
   const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=${encodeURIComponent(W.t)}`)
   assert.equal(overview.payload.data.owner.slug, 'vme')
-  assert.equal(overview.payload.data.current.planned_address, 'dsh@vme.msg9.io',
+  assert.equal(overview.payload.data.current.planned_address, 'dsh@vme.ice.msg9.io',
     '规范形式 = harness 名 @ 项目 Pod 域')
 })
 
@@ -2016,7 +2022,7 @@ await check('tenant mode: 开通用的是 harness 名（不是 workspace 名）'
   const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.t, title: 'tenantws' } })
   assert.equal(payload.data.provisioned, true)
   // 规范地址 = <harness 名>@<项目 Pod>.<org>：这里 harness 是 dsh，pod 域是 vme
-  assert.equal(payload.data.address, 'dsh@vme.msg9.io', 'harness 名做本地部分，项目身份交给 Pod')
+  assert.equal(payload.data.address, 'dsh@vme.ice.msg9.io', 'harness 名做本地部分，项目身份交给 Pod')
   assert.equal(seen.provisioned[seen.provisioned.length - 1], 'dsh')
 })
 
@@ -2026,13 +2032,13 @@ await check('tenant mode: 撞名时退到【可读后缀】dsh-2，不再用带�
   // 旧实现退化成 <workspace-slug>-<hash4>（dsh-jev-8221 / dsh-ws-04fe）—— 已废弃。
   // 真实服务端按**域**判重：`dsh` 在 vme 域里已被上一条用例占掉。
   // （旧夹具有一个全局冲突集，正好抹掉"按域判重"这半个模型。）
-  occupy('vme.msg9.io', ['dsh'])
+  occupy('vme.ice.msg9.io', ['dsh'])
   const before = seen.provisioned.length
   const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.taken, title: 'taken' } })
   assert.equal(payload.data.provisioned, true)
   const attempts = seen.provisioned.slice(before)
   assert.deepEqual(attempts, ['dsh', 'dsh-2'], '一个冲突，一次重试；后缀是可读编号')
-  assert.equal(payload.data.address, 'dsh-2@vme.msg9.io')
+  assert.equal(payload.data.address, 'dsh-2@vme.ice.msg9.io')
   assert.doesNotMatch(payload.data.address, /-[0-9a-f]{4}@/, '不得再出现哈希后缀')
   clearOccupied()
 })
@@ -2086,7 +2092,7 @@ await check('tenant migration: legacy inbox is re-provisioned and the old one su
   assert.equal(status, 200)
   assert.equal(payload.data.old_address, 'dsh-alpha-1a2b@msg9.io')
   // 2026-09-30 规则：迁移后的新地址 = harness 名 @ 项目 Pod 域（不再是 workspace slug）
-  assert.equal(payload.data.new_address, 'dsh@vme.msg9.io', payload.data.new_address)
+  assert.equal(payload.data.new_address, 'dsh@vme.ice.msg9.io', payload.data.new_address)
   assert.equal(payload.data.old_disabled, true)
   assert.equal(seen.provisioned[before], 'dsh', 'tenant-form address requested')
   assert.ok(seen.disabled.includes('dsh-alpha-1a2b@msg9.io'), 'old inbox suspended with the old key')
@@ -2212,6 +2218,38 @@ await check('P1-4：写 pod key 覆盖旧值必须先留 .bak（绝不静默覆�
   // 清理：别把 zeta 留在 tenants/ 里影响"多把 key 时不替调用方猜"那类判据
   for (const name of await countBackups()) await rm(join(dir, name), { force: true })
   await rm(path, { force: true })
+})
+
+await check('P1-5：迁移走的也是【目标 pod 自己的】租户 key（migrateInbox 与 provision 共用一份解析）', async () => {
+  // 防的是什么：`migrateInbox()` 一度**自己**拿 `ownerContext()` 的 key
+  // （= 本实例自己那个 pod 的）去建 agent ⇒ 同一个缺陷在迁移路径上又活了一遍。
+  // 当时它没被抓住，是因为夹具把"本实例的 pod"设成了被测 workspace 的 pod ——
+  // **通过 ≠ 用对了 key**。所以这里刻意挑一个 pod **≠** 本实例 pod 的 workspace：
+  // `ws-b`（人工指定到 pod `kappa`，本实例是 `vme`），且它的旧信箱是扁平地址。
+  const instanceKey = 'msg9_tk_smoketest0123456789'
+  const instanceDomain = 'vme.ice.msg9.io'
+  const { status, payload } = await call(`${BRIDGE_PREFIX}/migrate`, {
+    method: 'POST',
+    body: { key: 'ws-b', old_owner_key: 'msg9_sk_b' },
+  })
+  assert.equal(status, 200, JSON.stringify(payload))
+  assert.equal(payload.data.old_address, 'dsh-beta-3c4d@msg9.io')
+  // 新地址必须落在**目标 pod（kappa）**的域里，而不是本实例（vme）的域里
+  assert.equal(payload.data.new_address, 'dsh@kappa.ice.msg9.io', payload.data.new_address)
+  assert.notEqual(payload.data.new_address.split('@')[1], instanceDomain, '不得落在本实例的域里')
+  // 服务端收到的是目标 pod 的 token
+  assert.equal(seen.ownerAgentAuth.at(-1), 'msg9_tk_kappa_ice', 'POST /owner/agents 用的是目标 pod 的 key')
+  assert.notEqual(seen.ownerAgentAuth.at(-1), instanceKey, '绝不是本实例的 token')
+  // 顺手确认迁移本身的动作序列没被这次改动带偏（v1.9 顺序：转发 → 换记录 → 搬历史 → 释放）
+  assert.equal(payload.data.old_disabled, true)
+  assert.equal(payload.data.forwarding, true)
+  assert.equal(payload.data.moved_mail, 2)
+  assert.equal(seen.forwarding.at(-1).target, payload.data.new_address)
+  assert.deepEqual(seen.moveMail.at(-1), { address: 'dsh-beta-3c4d@msg9.io', to: payload.data.new_address })
+  // 凭据仓里 ws-b 已经指向新信箱（不是"state 换了、凭据没换"的半吊子状态）
+  const state = JSON.parse(await readFile(process.env.MSG9_STATE_FILE, 'utf8'))
+  const creds = await readProjectCredentials(state.workspaces['ws-b'].project_key)
+  assert.equal(creds.address, payload.data.new_address)
 })
 
 // ------------------------------------------------ stylesheet ownership (T-16)
