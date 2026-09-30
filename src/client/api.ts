@@ -106,9 +106,9 @@ export interface BridgeClient {
    * **只绑定，不开任何 Pod** —— 开通要另外点「开启」。
    */
   bindOrg(
-    input: { org_key: string; label: string; name?: string; api_url?: string; pod_label?: string },
+    input: { org_key: string; api_url?: string; pod_label?: string },
     signal?: AbortSignal,
-  ): Promise<{ label: string; api_url: string; pod_count: number }>
+  ): Promise<{ label: string; id?: string; name: string | null; domain: string | null; api_url: string; pod_count: number | null }>
   /** workspace 的开通状态（只读）：unconfigured / pod_closed / ready。 */
   podState(
     input: { key?: string; cwd?: string },
@@ -251,10 +251,14 @@ export function createBridge(options: BridgeOptions = {}): BridgeClient {
       '/setup',
       { method: 'POST', body: input, signal },
     ),
-    bindOrg: (input, signal) => request<{ label: string; api_url: string; pod_count: number }>(
-      '/org',
-      { method: 'POST', body: input, signal },
-    ),
+    bindOrg: (input, signal) => request<{
+      label: string
+      id?: string
+      name: string | null
+      domain: string | null
+      api_url: string
+      pod_count: number | null
+    }>('/org', { method: 'POST', body: input, signal }),
     podState: (input, signal) => request<{
       key: string
       state: string

@@ -191,7 +191,7 @@ export interface Msg9Store {
    * 绑定 ORG key（`msg9_ok_…`）—— **只绑定，不开任何 Pod**。
    * 开通要另外调 `openPod()`（对应面板上的「开启」按钮）。
    */
-  bindOrg(orgKey: string, label: string, apiUrl?: string): Promise<void>
+  bindOrg(orgKey: string, apiUrl?: string): Promise<void>
   /** 读当前 workspace 的开通状态（unconfigured / pod_closed / ready）。 */
   loadPodState(key?: string): Promise<void>
   /** 开启当前 workspace 的 Pod（ORG → Pod → Agent）。**唯一写路径。** */
@@ -972,20 +972,20 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
      * 与 `bindOwner` 的关键差别：**这条路径不触发任何 pod/agent 创建**，
      * 所以"录了 ORG key 但一个 Pod 都没开"是合法且默认的状态。
      */
-    async bindOrg(orgKey, label, apiUrl) {
+    async bindOrg(orgKey, apiUrl) {
       const key = orgKey.trim()
-      const slug = label.trim().toLowerCase()
-      if (!key || !slug) return
+      if (!key) return
       set({ orgForm: { busy: true, error: null } })
       try {
-        await bridge.bindOrg(apiUrl
-          ? { org_key: key, label: slug, api_url: apiUrl }
-          : { org_key: key, label: slug })
+        // label 由服务端读回（规范：ORG label 不可变，用户输入只会填错）
+        const result = await bridge.bindOrg(apiUrl
+          ? { org_key: key, api_url: apiUrl }
+          : { org_key: key })
         set({ orgForm: { busy: false, error: null } })
         notice('ok', L(
-          '已绑定 ORG「{label}」—— 现在可以逐个开通 Pod 了',
-          'ORG "{label}" bound — you can open pods now',
-          { label: slug },
+          '已绑定 ORG「{label}」（{domain}）—— 现在可以逐个开通 Pod 了',
+          'ORG "{label}" bound ({domain}) — you can open pods now',
+          { label: result.label, domain: result.domain ?? result.label },
         ))
         await refreshAll()
       } catch (error) {

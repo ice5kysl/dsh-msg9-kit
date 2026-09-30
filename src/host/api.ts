@@ -423,9 +423,35 @@ export interface OrgPodRow {
   created_at?: string
 }
 
-/** ORG 身份（校验 ORG key 用）。 */
-export function orgMe(apiUrl: string, orgKey: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
-  return msg9Request(apiUrl, '/api/v1/org/me', { apiKey: orgKey, signal })
+/** ORG 的元数据（`GET /api/v1/org`）。 */
+export interface OrgInfo {
+  id: string
+  name?: string
+  /** ORG label —— 地址里 `<org>` 那一段。**服务端定义，不可变**。 */
+  label: string
+  domain?: string
+  status?: string
+  platform?: string
+  max_pods?: number
+  [key: string]: unknown
+}
+
+/**
+ * 读 ORG 身份（校验 ORG key 用）**并取得它的 label**。
+ *
+ * ⚠️ 端点必须是 `/api/v1/org`（`/org/me` 是 404）。
+ * ⚠️ **label 不由用户输入**：规范 `address-format.md` §2 明确 ORG label
+ * 「**不可变**」，且与顶层租户 slug 共享命名空间 ——
+ * 它在 msg9 上建 ORG 时就定了，插件只能**读**它。让用户手填是错的
+ * （会填错、会与真实域名不符，进而算出错的 pod 域名）。
+ */
+export async function orgInfo(apiUrl: string, orgKey: string, signal?: AbortSignal): Promise<OrgInfo> {
+  const data = await msg9Request<{ org?: OrgInfo }>(apiUrl, '/api/v1/org', { apiKey: orgKey, signal })
+  const org = data?.org
+  if (!org?.label) {
+    throw new Error('msg9 未返回 ORG label（GET /api/v1/org 的 data.org.label 为空）')
+  }
+  return org
 }
 
 /** 列 ORG 下的 pod。**只读**：用于"开启"前的存在性探测与面板呈现。 */

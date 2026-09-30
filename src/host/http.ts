@@ -48,6 +48,7 @@ import {
   ownerOrgAgents,
   ownerListAgents,
   ownerMe,
+  orgInfo,
   orgListPods,
   resolveAddress,
   sendMessage,
@@ -57,6 +58,7 @@ import { derivePodLabel, ensureInbox, ensureSigningKey, maskKey, migrateInbox, o
 import { credentialsMigrated, readOrgKey, resolveCredentials, saveOwner, writeOrgKey } from './credentials.ts'
 import { defaultApiUrl, getNotifyPaused, isTenantOwner, loadState, saveState, setMessageMark, setNotifyPaused, stateFilePath, withStateLock, type LiveInbox, type OwnerState, type State } from './store.ts'
 import type { OverviewView, PodStateView, WorkspaceView } from '../shared/types.ts'
+import type { OrgInfo } from './api.ts'
 import {
   deriveAddress,
   isValidLocalPart,
@@ -85,6 +87,7 @@ export interface BridgeApi {
   ownerAccountAgents: typeof ownerAccountAgents
   ownerOrgAgents: typeof ownerOrgAgents
   /** ORG 级：列 pod（只读；"开启"前的存在性探测）。 */
+  orgInfo: typeof orgInfo
   orgListPods: typeof orgListPods
   listGroups: typeof listGroups
   getGroup: typeof getGroup
@@ -274,6 +277,7 @@ export function defaultBridgeDeps(ctx: Context, override: Partial<BridgeApi> = {
       ownerListAgents,
       ownerAccountAgents,
       ownerOrgAgents,
+      orgInfo,
       orgListPods,
       listGroups,
       getGroup,
@@ -1096,38 +1100,54 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     // 主人 2026-09-30 定的形态：设置里填 ORG key；**默认不开 Pod**；
     // 手工点「开启」才走 ORG → Pod → Agent 这条链。
 
-    // 绑定 ORG key：先**只读校验**（org/me + 列 pod），通过才落盘。
+    // 绑定 ORG key：**label 由服务端读取，不由用户输入**。
+    //
+    // 规范 `address-format.md` §2：ORG label「**不可变**」，且与顶层租户 slug
+    // 共享命名空间 —— 它在 msg9 上建 ORG 时就定了。让用户手填会填错，
+    // 进而算出错的 pod 域名（`<pod>.<填错的 label>.<base>`）。
+    // 所以这里只收 key，label 从 `GET /api/v1/org` 读回来。
     if (method === 'POST' && path === `${BRIDGE_PREFIX}/org`) {
       const body = await readJsonBody(req)
       const orgKey = str(body.org_key)
-      const label = str(body.label) ?? ''
       if (!orgKey) throw new BridgeError(400, 'missing-org-key', 'field "org_key" is required')
-      if (!/^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$/.test(label)) {
-        throw new BridgeError(400, 'invalid-org-label', `"${label}" is not a valid ORG label (3-30 chars, a-z0-9- inside)`)
-      }
       const apiUrl = (str(body.api_url) || defaultApiUrl()).replace(/\/+$/, '')
-      // 校验：用只读端点，绝不拿写接口试形状（本机误建过 probe-x）
-      let pods: unknown[]
+      // 校验 + 取元数据：只读端点，绝不拿写接口试形状（本机误建过 probe-x）
+      let info: OrgInfo
       try {
-        pods = await deps.api.orgListPods(apiUrl, orgKey, signal)
+        info = await deps.api.orgInfo(apiUrl, orgKey, signal)
       } catch (error) {
         throw new BridgeError(
           400,
           'org-key-rejected',
-          `ORG key 校验失败（${(error as Error)?.message ?? String(error)}）。请确认它是 msg9_ok_… 开头的 ORG key，且具备 pod:read 权限。`,
+          `ORG key 校验失败（${(error as Error)?.message ?? String(error)}）。`
+          + '请确认它是 msg9_ok_… 开头的 ORG key。',
         )
       }
-      await writeOrgKey(label, orgKey)
+      // 顺带数一下该 ORG 下已有多少 pod（只读；失败不影响绑定）
+      const podCount = await deps.api
+        .orgListPods(apiUrl, orgKey, signal)
+        .then((pods) => pods.length)
+        .catch(() => null)
+      await writeOrgKey(info.label, orgKey)
       await deps.updateState((state) => {
         state.org = {
-          label,
+          label: info.label,
+          id: info.id,
+          ...(info.name ? { name: info.name } : {}),
           api_url: apiUrl,
           verified_at: new Date().toISOString(),
-          ...(str(body.name) ? { name: str(body.name) } : {}),
           ...(str(body.pod_label) ? { pod_label: str(body.pod_label) } : {}),
         }
       })
-      return ok(res, { label, api_url: apiUrl, pod_count: pods.length })
+      invalidateUnreadCache()
+      return ok(res, {
+        label: info.label,
+        id: info.id,
+        name: info.name ?? null,
+        domain: info.domain ?? null,
+        api_url: apiUrl,
+        pod_count: podCount,
+      })
     }
 
     // 开启 Pod（幂等）：ORG → Pod → Agent key。**这是本方案唯一的写路径。**

@@ -118,7 +118,6 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
  */
 function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
   const [orgKey, setOrgKey] = useState('')
-  const [label, setLabel] = useState('')
   const [apiUrl, setApiUrl] = useState('')
   const busy = state.orgForm.busy
   const bound = state.org
@@ -175,8 +174,8 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
             style={styles.orgForm}
             onSubmit={(event) => {
               event.preventDefault()
-              if (busy || !orgKey.trim() || !label.trim()) return
-              void store.bindOrg(orgKey, label, apiUrl.trim() || undefined)
+              if (busy || !orgKey.trim()) return
+              void store.bindOrg(orgKey, apiUrl.trim() || undefined)
             }}
           >
             <label style={styles.orgField}>
@@ -191,17 +190,8 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
                 onChange={(event) => setOrgKey(event.target.value)}
               />
             </label>
-            <label style={styles.orgField}>
-              {L('ORG 域名前缀（label）', 'ORG label')}
-              <input
-                className="m9-input"
-                value={label}
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="ice"
-                onChange={(event) => setLabel(event.target.value.toLowerCase())}
-              />
-            </label>
+            {/* ORG label 不在这里填：规范说它「不可变」，是建 ORG 时定的，
+                插件从 GET /api/v1/org 读回来。让用户填只会填错。 */}
             <label style={styles.orgField}>
               {L('API 地址（可选，自建 msg9 时填）', 'API base (optional — self-hosted msg9)')}
               <input
@@ -217,7 +207,7 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
               <button
                 type="submit"
                 className="m9-btn m9-btn-primary"
-                disabled={busy || !orgKey.trim() || !label.trim()}
+                disabled={busy || !orgKey.trim()}
               >
                 {busy ? L('校验中…', 'Checking…') : L('绑定 ORG', 'Bind ORG')}
               </button>
