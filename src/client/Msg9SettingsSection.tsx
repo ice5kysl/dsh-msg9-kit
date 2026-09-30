@@ -565,8 +565,11 @@ function WorkspaceRow({
                 'Local record only: address, key, cursor, watch baseline and read marks all move with it. The remote inbox, credential files and the dsh registry are untouched.',
               )}
             </div>
-            {relink.error && <span style={styles.warn}>{relink.error}</span>}
-            {relink.targets === null
+            {/* 报错时只显示报错；没报错才谈"有没有候选" —— 否则两段挤在一起，
+                读者分不清哪个是原因、哪个是结果（截图里就出现过）。 */}
+            {relink.error
+              ? <span style={styles.warn}>{relink.error}</span>
+              : relink.targets === null
               ? <span style={styles.dim}>{L('正在读取工作区列表…', 'Loading workspaces…')}</span>
               : relink.targets.length === 0
                 ? (
@@ -686,8 +689,23 @@ function WorkspaceRow({
             onClick={() => {
               setRelink({ open: true, targets: null, pick: '', error: null })
               void store.relinkTargets(row.key)
-                .then((targets) => setRelink((prev) => ({ ...prev, targets })))
-                .catch((error: unknown) => setRelink((prev) => ({ ...prev, targets: [], error: String(error) })))
+                .then((targets) => setRelink((prev) => ({ ...prev, targets, error: null })))
+                .catch((error: unknown) => {
+                  // ⚠️ 客户端 bundle 会热更新，**宿主代码不会**：插件升级后如果没
+                  //    重启 dsh web，新路由在宿主侧还不存在，旧宿主会回
+                  //    `no route for GET …`。这条提示专门治那个"看不懂的报错"。
+                  const text = String(error)
+                  setRelink((prev) => ({
+                    ...prev,
+                    targets: [],
+                    error: /no route for/i.test(text)
+                      ? L(
+                          '宿主还在跑旧代码（新接口它还没有）。重启 dsh web 后再试 —— 客户端 bundle 会热更新，宿主不会。',
+                          'The host is still running older code (it lacks this route). Restart dsh web — client bundles hot-reload, host code does not.',
+                        )
+                      : text,
+                  }))
+                })
             }}
           >
             {L('挂到…', 'Relink…')}
