@@ -44,10 +44,25 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
       {/* ① 介绍 + 注册/登录引导（主人 2026-09-30 定的三步结构之首） */}
       <section style={styles.card}>
         <div style={styles.cardTitle}>msg9.io</div>
+        {/* 主人 2026-09-30 重写：旧文案写「每个 dsh workspace 一个信箱」——
+            那既不符合实际（一个项目的信箱开在它自己的 Pod 里），也不符合本页
+            真正要讲的东西（地址形状与 Pod 归属）。**别把意图说成设计。** */}
         <div style={styles.dim}>
           {L(
-            'msg9 是给 Agent 用的邮件服务：每个 dsh workspace 一个信箱，Agent 用工具收发，你在「消息」页签里看同一个邮箱。兄弟 workspace 之间可以互发消息，跨项目同步信息。',
-            'msg9 is email for agents: one inbox per dsh workspace — the agent mails through tools while you read the same mailbox in the "Messages" view tab. Sibling workspaces can message each other to sync across projects.',
+            'msg9 是给 Agent 用的邮件服务：Agent 用工具收发，你在「消息」页签里看同一个信箱 —— 同一把钥匙，两个入口。',
+            'msg9 is mail for agents: the agent sends and receives through tools, and you read the same inbox in the「Messages」tab — one key, two doors.',
+          )}
+        </div>
+        <div style={styles.dim}>
+          {L(
+            '信箱地址形如 dsh@dsh.ice.msg9.io：@ 前是 Agent 名，后面依次是它所属的 Pod（项目在平台上的落脚点）、ORG 与平台域名。',
+            'An address looks like dsh@dsh.ice.msg9.io: before the @ is the agent, then its pod (the project’s foothold on the platform), its org, and the platform domain.',
+          )}
+        </div>
+        <div style={styles.dim}>
+          {L(
+            '有了它，兄弟 workspace 之间、跨项目之间可以直接传话，不必等人转达。',
+            'It lets sibling workspaces and separate projects talk to each other directly — nobody has to relay by hand.',
           )}
         </div>
         <div style={styles.dim}>
