@@ -1835,7 +1835,7 @@ await check('settings section lists inboxes under another pod (read-only, no mig
   store.setCwd('/work/a')
   await store.refreshAll()
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
-  assert.ok(html.includes('Opened under another pod'), html)
+  assert.ok(html.includes('Held by another pod'), html)
   assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'the misplaced address is shown')
   // 🔴 关键：**不得**再出现「一键迁移」——把别人的项目的信箱一起搬走是错的。
   assert.ok(!html.includes('Migrate'), 'no one-click migrate button')

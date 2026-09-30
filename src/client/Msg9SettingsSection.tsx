@@ -466,13 +466,20 @@ function PlacementCard({ state }: { state: Msg9State }): JSX.Element | null {
   return (
     <section style={styles.card}>
       <div style={styles.cardTitle}>
-        {L('开在别的 Pod 下（{n}）', 'Opened under another pod ({n})', { n: rows.length })}
+        {L('归属在其它 Pod（{n}）', 'Held by another pod ({n})', { n: rows.length })}
       </div>
       <div style={styles.dim}>
         {L(
-          '这些信箱的地址落在别的 Pod 里（不是本实例自己的域）。'
-          + '地址本身仍然可用，只是归属上不属于本项目 —— 是否迁移、迁去哪个 Pod，取决于那个 workspace 属于哪个项目，请自行判断。',
-          'These inboxes live under another pod (not this instance\'s own domain). They keep working; only the ownership is off. Whether to move them — and to which pod — depends on which project that workspace belongs to, so it is left to you.',
+          '这些信箱开在与本实例（{self}）不同的 Pod 下。'
+          + '⚠️ 这【不违反规范】：规范只要求地址形如 <agent>@<pod>.<org>.<base>，'
+          + '并没有规定哪个 workspace 必须用哪个 Pod（address-format.md §3：'
+          + '「项目即 pod」只是推荐用法之一）。只要那些 Pod 属于你的 ORG 就合规 —— '
+          + '这里只是把归属列出来，供你判断是否需要归拢。',
+          'These inboxes live under a different pod than this instance ({self}). '
+          + '⚠️ That is NOT a violation: the spec only requires <agent>@<pod>.<org>.<base> and does not '
+          + 'mandate which pod a workspace must use. As long as those pods belong to your ORG, it is fine. '
+          + 'Listed here only so you can see the grouping.',
+          { self: selfDomain ?? '—' },
         )}
       </div>
       <ul style={styles.list}>
@@ -489,9 +496,7 @@ function PlacementCard({ state }: { state: Msg9State }): JSX.Element | null {
                 <div style={styles.layerRow}>
                   <span style={styles.layerTag}>{L('归属', 'pod')}</span>
                   <code style={styles.code}>{row.pod.pod_label}</code>
-                  <span style={styles.dim}>
-                    {L('（该 pod 不是此 workspace 的）', '(not this workspace\'s pod)')}
-                  </span>
+                  <span style={styles.dim}>{L('（与本实例不同的 Pod）', '(a different pod)')}</span>
                 </div>
               )}
             </div>
@@ -500,8 +505,10 @@ function PlacementCard({ state }: { state: Msg9State }): JSX.Element | null {
       </ul>
       <div style={styles.dim}>
         {L(
-          '注：这里【没有】迁移按钮。旧版本的「一键迁到当前域」会把这些信箱批量搬进本项目的 Pod —— 其中有些属于别的项目（例如 msg9、WhyMyPhone 自己的信箱），那一步不该由本项目代做。',
-          'Note: there is no migrate button here on purpose. The old one-click migration would have swept these into this project\'s pod, including inboxes that belong to other projects.',
+          '注：这里【没有】迁移按钮。旧版的「一键迁到当前域」会把这些信箱批量搬进本实例的 Pod —— '
+          + '而该不该搬、搬去哪个 Pod，取决于每个 workspace 属于哪个项目，那不是能批量决定的动作。',
+          'Note: no migrate button on purpose. The old one-click migration would sweep these into this '
+          + "instance's pod; whether to move one, and to which pod, depends on each workspace's project.",
         )}
       </div>
     </section>

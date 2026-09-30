@@ -521,14 +521,41 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         })
       }
     }
+    /**
+     * 从地址反推它**实际所在**的 pod label（规范 `<agent>@<pod>.<org>.<base>`）。
+     *
+     * 返回 null = 该地址不属于任何 pod（扁平域 `x@msg9.io`，或 ORG 的 Default Pod
+     * `x@ice.msg9.io`）。
+     *
+     * ⚠️ 为什么必须从地址反推：`derivePodLabel()` 给的是**将来开通时的候选名**
+     *    （按 workspace 标题/目录名推导）。已开通的行如果拿它当"所在 pod"，
+     *    就会显示一个不存在的 pod 名 —— 本机实测：Diansuan 的地址是
+     *    `diansuan@dsh.ice.msg9.io`（在 pod `dsh` 里），却被显示成 pod `diansuan`，
+     *    于是 pod 用量查不到、永远显示「未探测到」。**地址是既成事实，候选名不是。**
+     */
+    const podLabelFromAddress = (address: string | null, orgLabel: string | null | undefined): string | null => {
+      if (!address || !orgLabel) return null
+      const at = address.indexOf('@')
+      if (at < 0) return null
+      const domain = address.slice(at + 1)
+      const marker = `.${orgLabel}.`
+      const idx = domain.indexOf(marker)
+      if (idx <= 0) return null // 没有 `.org.` 段，或 pod 段为空 ⇒ 不属于任何 pod
+      return domain.slice(0, idx) || null
+    }
+
     const podFor = (workspace: CurrentWorkspace, address: string | null, domain: string | null): PodStateView => {
       const custom = Boolean(state.org?.pod_labels?.[workspace.key])
-      const label = custom ? state.org!.pod_labels![workspace.key]! : deps.derivePodLabel(workspace)
+      // 已开通 ⇒ 以地址为准（既成事实）；未开通 ⇒ 用推导的候选名（可被人工覆盖）。
+      const fromAddress = podLabelFromAddress(address, orgMeta?.label)
+      const label = fromAddress
+        ?? (custom ? state.org!.pod_labels![workspace.key]! : deps.derivePodLabel(workspace))
       const stats = podStats.get(label)
       return {
         state: address ? 'ready' : (orgReady ? 'pod_closed' : 'unconfigured'),
         pod_label: label,
-        custom,
+        // 「已自定义」只在"还没开通、且用户改过候选名"时有意义
+        custom: !fromAddress && custom,
         domain,
         agents: stats?.agents ?? null,
         max_agents: stats?.max ?? null,
@@ -539,38 +566,58 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
      * 一条记录的健康判断（只读）。
      *
      * 两类问题**必须被标出来**，因为从地址本身看不出来：
-     *   ① **僵尸**：`path` 已不存在（仓库搬走了，记录还留着）；
+     *   ① **僵尸**：`path` 已不存在（仓库搬走了 / 改名了，记录还留着）；
      *   ② **重复**：两条记录指向同一个地址 —— 我 09-30 修信箱时就制造过一条
      *      （`dsh-42b65c` 与 `dsh-c3330f` 撞到了 `dsh@dsh.ice.msg9.io`）。
      *
-     * `removable` 的判据：**移除它不会让某个地址失去唯一的持有者**。
-     * 否则那个信箱就没人管了（游标、转发、key 都在记录里）。
+     * `removable` 的判据：**移除之后，这个地址还得有人管** ——
+     * 而且是"**目录还在**的人"管。
+     *
+     * ⚠️ 这里有个坑（我第一版就踩了）：只数"还有几条记录"是不够的。
+     *    两条重复里若一条是僵尸，则删掉**活着的那条**会只剩僵尸持有该地址 ——
+     *    记录还在、目录没了，那个信箱实际上就没人管了。所以必须看
+     *    "剩下的持有者里有没有目录仍然存在的"。
      */
-    const addressCount = new Map<string, number>()
+    const byAddress = new Map<string, { key: string; pathMissing: boolean }[]>()
     for (const [key, inbox] of Object.entries(state.workspaces)) {
-      const resolved = resolvedByKey.get(key)
-      const addr = resolved?.address ?? inbox.address ?? null
-      if (addr) addressCount.set(addr, (addressCount.get(addr) ?? 0) + 1)
+      const addr = resolvedByKey.get(key)?.address ?? inbox.address ?? null
+      if (!addr) continue
+      const p = inbox.path ?? ''
+      byAddress.set(addr, [...(byAddress.get(addr) ?? []), {
+        key,
+        pathMissing: Boolean(p) && !existsSync(p),
+      }])
     }
-    const healthFor = (address: string | null, path: string): WorkspaceHealth => {
+    const healthFor = (key: string, address: string | null, path: string): WorkspaceHealth => {
       const pathMissing = Boolean(path) && !existsSync(path)
-      const dupCount = address ? (addressCount.get(address) ?? 0) : 0
-      const duplicateOf = address && dupCount > 1 ? address : null
-      // 该地址只有它一个持有者 ⇒ 移除会孤立这个信箱 —— 除非它本来就是僵尸
-      // （目录都没了，那条记录已无实际用途，留着才是问题）。
-      const soleHolder = Boolean(address) && dupCount === 1
-      const removable = !soleHolder || pathMissing
+      const holders = address ? (byAddress.get(address) ?? []) : []
+      const others = holders.filter((h) => h.key !== key)
+      const duplicateOf = holders.length > 1 ? address : null
+      // 移除后是否还有"目录存在"的持有者
+      const liveRemains = others.some((h) => !h.pathMissing)
+      // 僵尸记录：目录都没了，留着也没法用 ⇒ 允许移除（即使它是唯一持有者，
+      // 移除后只是失去对该远端信箱的本地访问，不会删掉它）。
+      // 非僵尸：必须确认移除后还有活着的持有者。
+      const removable = pathMissing ? true : liveRemains
+      let reason: string | undefined
+      if (!removable) {
+        reason = holders.length > 1
+          ? L(
+              '另一条同址记录指向的目录已不存在；删掉本条会让 {address} 只剩那条无效记录。请先删那一条。',
+              'The other record for {address} points at a missing directory; removing this one would leave only that dead record. Remove that one first.',
+              { address: address ?? '' },
+            )
+          : L(
+              '这是地址 {address} 的唯一记录，移除后该信箱将不再被管理。',
+              'This is the only record for {address}; removing it leaves that inbox unmanaged.',
+              { address: address ?? '' },
+            )
+      }
       return {
         pathMissing,
         duplicateOf,
         removable,
-        ...(removable ? {} : {
-          reason: L(
-            '这是地址 {address} 的唯一记录，移除后该信箱将不再被管理。',
-            'This is the only record for {address}; removing it leaves that inbox unmanaged.',
-            { address: address ?? '' },
-          ),
-        }),
+        ...(reason ? { reason } : {}),
       }
     }
 
@@ -587,7 +634,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         cursor: null,
         current: workspace.key === currentKey,
         pod: podFor(workspace, null, null),
-        health: healthFor(null, workspace.path),
+        health: healthFor(workspace.key, null, workspace.path),
       })
     }
     for (const [key, inbox] of Object.entries(state.workspaces)) {
@@ -614,7 +661,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         // 已开通 ⇒ ready；pod 域取地址里 `@` 之后那一段（真实值，不是推导值）。
         pod: podFor({ key, title, path }, address, address ? address.slice(address.indexOf('@') + 1) : null),
         pod_domain: address ? address.slice(address.indexOf('@') + 1) : null,
-        health: healthFor(address, path),
+        health: healthFor(key, address, path),
       })
     }
 
