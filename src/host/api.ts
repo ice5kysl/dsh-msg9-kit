@@ -160,6 +160,13 @@ export interface OwnerAgentRow {
 
 // ---------------------------------------------------------------- L0 (agent)
 
+/**
+ * @deprecated 公开自助注册（`POST /api/v1/register`）**已不再被调用**。
+ *
+ * 平台侧该端点要 **user JWT**，本插件从不带 Authorization ⇒ 必然 401。
+ * 调用点已改为**响亮抛错**（见 `service.ts` 的 provision）。
+ * 保留此函数只为留住端点形态做参照 —— **不要重新接上它**。
+ */
 export function registerAgent(apiUrl: string, address: string, publicKey?: string, profile?: AgentProfile, signal?: AbortSignal): Promise<RegisteredAgent> {
   const body: Record<string, unknown> = { requested_address: address }
   if (publicKey) body.public_key = publicKey

@@ -15,7 +15,7 @@
  */
 
 import { build } from 'esbuild'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -30,8 +30,21 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const clientExternals = ['react', 'react/jsx-runtime']
 
 async function main() {
-  rmSync(join(root, 'lib'), { recursive: true, force: true })
-  mkdirSync(join(root, 'lib'), { recursive: true })
+  // ⚠️ **先构建到暂存目录，全部成功后才换上去**。
+  //
+  // 原实现是 `rm -rf lib` 再构建 —— 于是**构建一失败，lib/ 就空了**。
+  // 而部署方（`~/.dsh/profiles/web/node_modules/dsh-msg9-kit`）是指向本仓的**符号链接**，
+  // 直接吃我们的 `lib/` ⇒ **一次失败的构建会让正在跑的插件当场坏掉**。
+  // （2026-09-30 我在做一次"蓄意破坏验证"时真踩到了：打了个语法错的补丁 →
+  //  构建失败 → `lib/index.js` 消失 → 后续测试跑的是"没有产物"的状态。）
+  //
+  // 换法保留旧目录直到新目录就位：中途被打断时，老产物还在 `lib.previous/`
+  // 可以手工挪回来（而不是凭空消失）。
+  const live = join(root, 'lib')
+  const stage = join(root, 'lib.staging')
+  const previous = join(root, 'lib.previous')
+  rmSync(stage, { recursive: true, force: true })
+  mkdirSync(stage, { recursive: true })
 
   // ---- host face ---------------------------------------------------------
   await build({
@@ -40,7 +53,7 @@ async function main() {
     format: 'esm',
     platform: 'node',
     target: 'node20',
-    outfile: join(root, 'lib/index.js'),
+    outfile: join(stage, 'index.js'),
     packages: 'external',
     logLevel: 'info',
   })
@@ -48,7 +61,7 @@ async function main() {
   // ---- browser face ------------------------------------------------------
   const head = `window.__ModuleLoader__.load({\n\tid: ${JSON.stringify(pkg.name)},\n\tfactory: (require) => {\n\t\tvar module = { exports: {} };\n\t\tvar exports = module.exports;\n\t\tObject.defineProperty(exports, Symbol.toStringTag, { value: "Module" });\n`
   const tail = `\n\t\treturn module.exports;\n\t}\n});\n`
-  const bodyFile = join(root, 'lib/.client.body.js')
+  const bodyFile = join(stage, '.client.body.js')
   await build({
     entryPoints: [join(root, 'src/client/index.ts')],
     bundle: true,
@@ -66,13 +79,22 @@ async function main() {
     logLevel: 'info',
   })
 
-  writeFileSync(join(root, 'lib/client.js'), readFileSync(bodyFile, 'utf8'))
+  writeFileSync(join(stage, 'client.js'), readFileSync(bodyFile, 'utf8'))
   rmSync(bodyFile, { force: true })
+
+  // ---- 产物就位（到这里说明两面都构建成功）-------------------------------
+  rmSync(previous, { recursive: true, force: true })
+  if (existsSync(live)) renameSync(live, previous)
+  renameSync(stage, live)
+  rmSync(previous, { recursive: true, force: true })
 
   console.log('[build] lib/index.js + lib/client.js written')
 }
 
 main().catch((error) => {
   console.error(error)
+  // 失败时**不动 lib/**（暂存目录里的半成品直接丢掉）
+  rmSync(join(root, 'lib.staging'), { recursive: true, force: true })
+  console.error('[build] 失败：lib/ 未被改动（旧产物仍在）')
   process.exitCode = 1
 })

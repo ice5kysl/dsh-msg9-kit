@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
-import { orgCreatePod, orgListPods, ownerCreateAgents, ownerDisableAgent, ownerMe, ownerMoveMail, registerAgent, setForwarding, setSigningKey, type AgentProfile, type OrgPodRow, type RegisteredAgent } from './api.ts'
+import { orgCreatePod, orgListPods, ownerCreateAgents, ownerDisableAgent, ownerMe, ownerMoveMail, setForwarding, setSigningKey, type AgentProfile, type OrgPodRow, type RegisteredAgent } from './api.ts'
 import {
   allocateProjectKey,
   ensureCredentialsMigrated,
@@ -238,9 +238,29 @@ async function provision(
   //   `ownerForWorkspace()` —— `migrateInbox` 共用同一份，见那里的注释。
   const ownerForKey = await ownerForWorkspace(workspace, owner, apiUrl, orgLabel)
 
-  const agent: RegisteredAgent = ownerForKey?.api_key
-    ? await provisionUnderOwner(apiUrl, ownerForKey, workspace, profile, preferredAddress)
-    : await registerAgent(apiUrl, deriveAddress(workspace), undefined, profile)
+  if (!ownerForKey?.api_key) {
+    // 走到这里 = `allowSelfRegister` 被显式打开（生产路径不会；见上面的守卫）。
+    //
+    // **这里以前直接调公开自助注册（`registerAgent`）。已改成响亮抛错**，
+    // 理由（msg9 侧 2026-09-30 核对后也认同这个形态）：
+    //   平台侧 `/api/v1/register` 要 **user JWT**（`middleware.UserAuthWithEpoch`），
+    //   而我们**从不带 Authorization** ⇒ 那条路**必然 401**。
+    //   ⇒ 与其发一个注定失败的请求，不如让"不该走到"变成**一条明确的错**：
+    //     靠"记得它没用"来维持一段死代码，与"看起来在跑其实没跑"是同一族病。
+    throw new Error(L(
+      '自助注册（/api/v1/register）已停用：该接口需要 user JWT，本插件无法提供。'
+      + '请配置 ORG key，并取得该项目 Pod 的租户 key 后重试。',
+      'Self-registration is retired: /api/v1/register requires a user JWT that this plugin cannot provide. '
+      + "Configure an ORG key and obtain this project's pod tenant key, then retry.",
+    ))
+  }
+  const agent: RegisteredAgent = await provisionUnderOwner(
+    apiUrl,
+    ownerForKey,
+    workspace,
+    profile,
+    preferredAddress,
+  )
 
   // 身份与密钥落 msg9 统一凭据仓（0600/0700）；state.json 只留热状态 +
   // project_key 引用，明文 key 与 signing seed 不进 state.json。

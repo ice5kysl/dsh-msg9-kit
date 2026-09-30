@@ -139,32 +139,38 @@ check('P0-b ★：未配置 pod key 时开通被拒（不会静默注册）', as
   await reset()
   const { readFile } = await import('node:fs/promises')
   const serviceSource = await readFile(new URL('../src/host/service.ts', import.meta.url), 'utf8')
+  // 扫之前**先剥掉注释**：注释里提到 `registerAgent` 是正常的（那正是在解释它为何被废），
+  // 不该因此误红。曾经就因为一句注释把这条测试弄红过。
+  const code = serviceSource
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n')
 
   // ① 拒绝分支存在，且给出可执行的下一步（不是一句"失败"）
   assert.match(serviceSource, /未配置 pod 租户 key，拒绝自动开通收件箱/)
   assert.match(serviceSource, /ORG key/, '应告诉用户填什么')
   assert.match(serviceSource, /设置 → 消息信箱/, '应告诉用户去哪儿填')
 
-  // ② 旧的公开自助注册必须只在显式允许时才可达 —— 否则静默降级会复活。
-  //    守卫写在三元条件的【判断处】（`!owner?.api_key && !allowSelfRegister`），
-  //    所以要连同它所在的作用域一起看，而不是只看 registerAgent 那一行。
+  // ② 旧的公开自助注册必须**彻底不可达** —— 不是"靠记得它没用"。
   //
-  //    ⚠️ 这里**不数固定行数**：守卫和调用之间隔着「地址的 pod 必须与 key 的
-  //    pod 一致」那段注释和 ORG 分支，注释一长窗口就假红（2026-09-30 真发生）。
-  //    改成按**同一个函数体**取窗口，并直接钉住守卫的写法本身 ——
-  //    比"窗口里有 allowSelfRegister 字样"更严：守卫被删/被改都会红。
-  const lines = serviceSource.split('\n')
-  const selfRegisterIndex = lines.findIndex((line) => line.includes('await registerAgent'))
-  assert.ok(selfRegisterIndex >= 0, 'registerAgent 调用应当仍在（作为显式路径）')
-  const scopeStart = lines.findLastIndex(
-    (line, index) => index < selfRegisterIndex && line.includes('async function provision('),
-  )
-  assert.ok(scopeStart >= 0, 'registerAgent 应当仍在 provision() 里')
-  const guardWindow = lines.slice(scopeStart, selfRegisterIndex + 1).join('\n')
+  //    ⚠️ 这里**不数固定行数**（守卫与调用之间的注释一长窗口就假红，2026-09-30 真发生），
+  //    改为直接钉住两件事：
+  //      (a) 守卫的写法本身还在（被删/被改都会红）；
+  //      (b) **不再调用 `registerAgent`** —— 调用点已改为响亮抛错，
+  //          因为 `/api/v1/register` 要 user JWT、我们从不带 ⇒ 必然 401。
+  //          "不该走到" 应当是一条明确的错，而不是一段没人记得的死代码。
   assert.match(
-    guardWindow,
+    code,
     /if \(!owner\?\.api_key && !allowSelfRegister\)/,
-    'registerAgent 必须在 `!allowSelfRegister` 守卫的同一函数体内，否则静默降级会复活',
+    '未配置时的守卫必须还在，否则静默降级会复活',
+  )
+  assert.ok(
+    !/await registerAgent/.test(code),
+    '不得再调用 registerAgent：这条回退已废弃，应改为响亮抛错',
+  )
+  assert.match(
+    code,
+    /自助注册（\/api\/v1\/register）已停用/,
+    '走到自助注册分支时必须【明确报错】并说清为什么走不通',
   )
 })
 
