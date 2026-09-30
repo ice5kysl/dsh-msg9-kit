@@ -52,6 +52,18 @@ export interface StoredOwnerState {
    * the server has none (flat namespace).
    */
   address_domain?: string | null
+  /**
+   * pod label（ORG 模型：`<agent>@<pod>.<org>.<base>` 里的 `<pod>`）。
+   * `owner/me` 已回该字段；用于推导 `tenants/<pod>-<org>.key` 的文件名
+   * （规范 `address-format.md` §5）。
+   */
+  pod_label?: string | null
+  /**
+   * ORG label（地址里的 `<org>`）。与 `pod_label` 合起来定位 pod key 文件名。
+   * 注意：这与 ORG **key**（`msg9_ok_…`，平台级凭证）不是一回事 ——
+   * 后者只用于开通 pod，**不参与收发**（`12-org-pods.md` §4）。
+   */
+  org_label?: string | null
   /** 凭据迁入 ~/.msg9 的时间（遗留字段清理完成的标记）。 */
   migrated_at?: string
   /** 迁移前遗留的 owner key：惰性迁往 ~/.msg9/tenants/dsh.key 后删除。 */
@@ -136,11 +148,42 @@ export interface MessageMark {
 
 export interface State {
   owner?: StoredOwnerState
+  /**
+   * ORG 级配置（主人 2026-09-30 定的形态：设置里填 ORG key，默认不开 Pod）。
+   *
+   * 只存**指向性元数据**；ORG key 本体在 `~/.msg9/orgs/<label>.key`（0600）——
+   * 与 owner key / agent key 同样的纪律：明文 key 不进 state.json。
+   */
+  org?: StoredOrgState
   workspaces: Record<string, WorkspaceInbox>
   /** Global notification mute: the watcher keeps its cursors advancing (no
    * backlog replay) but never wakes/injects sessions. The panel badge keeps
    * working. Toggled from the panel bell or msg9_notify. */
   notify_paused?: boolean
+}
+
+/** ORG 绑定的元数据（key 本体不在 state.json 里）。 */
+export interface StoredOrgState {
+  /** ORG label（地址 `<org>` 那一段），也是 key 文件名。 */
+  label: string
+  /** ORG id（`org_…`），服务端返回，便于对账。 */
+  id?: string
+  /** ORG 显示名。 */
+  name?: string
+  /** API 基址（默认走 `defaultApiUrl()`）。 */
+  api_url?: string
+  /** 该 ORG 下本项目要用的默认 pod label（不填则由 workspace 推导）。 */
+  pod_label?: string
+  /**
+   * 每个 workspace 的 pod label 覆盖（主人 2026-09-30：
+   * 「免得自动生成的 pod slug 很乱」⇒ 允许人工改）。
+   *
+   * 键是 workspace key，值是 pod label。**只影响"还没开的 Pod"**——
+   * 已开 Pod 的 label 是既成事实（地址已经发出去了，改 label 等于换地址）。
+   */
+  pod_labels?: Record<string, string>
+  /** 校验通过的时间。 */
+  verified_at?: string
 }
 
 /** Absolute path of the state file. */
@@ -172,6 +215,9 @@ export async function loadState(): Promise<State> {
     // notify_paused regression: mute survived until the next read).
     return {
       owner: parsed?.owner,
+      // ORG 绑定（2026-09-30 新增）。**必须在这里显式 re-hydrate**，
+      // 否则它会变成"写得进、读不出"的字段 —— 上面那条注释警告的正是这个。
+      org: parsed?.org,
       workspaces: parsed?.workspaces ?? {},
       notify_paused: parsed?.notify_paused === true,
     }

@@ -48,14 +48,15 @@ import {
   ownerOrgAgents,
   ownerListAgents,
   ownerMe,
+  orgListPods,
   resolveAddress,
   sendMessage,
   type InboxMessage,
 } from './api.ts'
-import { ensureInbox, ensureSigningKey, maskKey, migrateInbox, ownerContext, type InboxContext } from './service.ts'
-import { credentialsMigrated, resolveCredentials, saveOwner } from './credentials.ts'
-import { defaultApiUrl, getNotifyPaused, isTenantOwner, loadState, setMessageMark, setNotifyPaused, stateFilePath, type LiveInbox, type OwnerState, type State } from './store.ts'
-import type { OverviewView, WorkspaceView } from '../shared/types.ts'
+import { derivePodLabel, ensureInbox, ensureSigningKey, maskKey, migrateInbox, openPod, ownerContext, podState, type InboxContext } from './service.ts'
+import { credentialsMigrated, readOrgKey, resolveCredentials, saveOwner, writeOrgKey } from './credentials.ts'
+import { defaultApiUrl, getNotifyPaused, isTenantOwner, loadState, saveState, setMessageMark, setNotifyPaused, stateFilePath, withStateLock, type LiveInbox, type OwnerState, type State } from './store.ts'
+import type { OverviewView, PodStateView, WorkspaceView } from '../shared/types.ts'
 import {
   deriveAddress,
   isValidLocalPart,
@@ -83,9 +84,25 @@ export interface BridgeApi {
   ownerListAgents: typeof ownerListAgents
   ownerAccountAgents: typeof ownerAccountAgents
   ownerOrgAgents: typeof ownerOrgAgents
+  /** ORG 级：列 pod（只读；"开启"前的存在性探测）。 */
+  orgListPods: typeof orgListPods
   listGroups: typeof listGroups
   getGroup: typeof getGroup
   groupMessages: typeof groupMessages
+}
+
+/**
+ * service.openPod 的返回形状（只列 bridge 透传用到的字段）。
+ * 刻意不 import service 的类型，避免 http ↔ service 的循环依赖。
+ */
+export interface OpenPodResultLike {
+  state: string
+  podCreated: boolean
+  podLabel?: string
+  orgLabel?: string
+  addressDomain?: string
+  existingAgents?: number
+  note?: string
 }
 
 /** Everything the bridge reads from the host (injectable). */
@@ -95,6 +112,14 @@ export interface BridgeDeps {
   stateFilePath(): string
   defaultApiUrl(): string
   ensureInbox(workspace: CurrentWorkspace, signal?: AbortSignal, preferred?: string): Promise<InboxContext>
+  /** 开启 Pod（ORG → Pod → Agent）。由 service.openPod 实现。 */
+  openPod(workspace: CurrentWorkspace, options?: { podLabel?: string }): Promise<OpenPodResultLike>
+  /** 开通状态（只读）：unconfigured / pod_closed / ready。 */
+  podState(workspace: CurrentWorkspace): Promise<string>
+  /** 推导本 workspace 的 pod label（面板预览用，与实际开启路径同一个函数）。 */
+  derivePodLabel(workspace: CurrentWorkspace): string
+  /** state 的原子更新（ORG 绑定等元数据）。 */
+  updateState(mutate: (state: State) => void): Promise<void>
   listWorkspaces(): CurrentWorkspace[]
   matchWorkspaceByPath(cwd: string | undefined): CurrentWorkspace | undefined
   log(message: string): void
@@ -249,6 +274,7 @@ export function defaultBridgeDeps(ctx: Context, override: Partial<BridgeApi> = {
       ownerListAgents,
       ownerAccountAgents,
       ownerOrgAgents,
+      orgListPods,
       listGroups,
       getGroup,
       groupMessages,
@@ -258,6 +284,15 @@ export function defaultBridgeDeps(ctx: Context, override: Partial<BridgeApi> = {
     stateFilePath,
     defaultApiUrl,
     ensureInbox,
+    openPod,
+    podState,
+    derivePodLabel,
+    // ORG 绑定等元数据的原子更新（走同一把 state 锁，避免与别的写互相覆盖）。
+    updateState: (mutate) => withStateLock(async () => {
+      const next = await loadState()
+      mutate(next)
+      await saveState(next)
+    }),
     listWorkspaces: () => listWorkspaces(ctx),
     matchWorkspaceByPath: (cwd) => matchWorkspaceByPath(ctx, cwd),
     log: (message) => {
@@ -461,6 +496,22 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     }
     const rows = new Map<string, WorkspaceView>()
 
+    // 三态开通状态（主人 2026-09-30）：整个 overview 只探测一次 ORG 是否有 key，
+    // 免得每个 workspace 行都去读一遍凭据仓。
+    const orgMeta = state.org
+    const orgKey = orgMeta?.label ? await readOrgKey(orgMeta.label).catch(() => undefined) : undefined
+    const orgReady = Boolean(orgKey?.key)
+    const podFor = (workspace: CurrentWorkspace, address: string | null, domain: string | null): PodStateView => {
+      const custom = Boolean(state.org?.pod_labels?.[workspace.key])
+      const label = custom ? state.org!.pod_labels![workspace.key]! : deps.derivePodLabel(workspace)
+      return {
+        state: address ? 'ready' : (orgReady ? 'pod_closed' : 'unconfigured'),
+        pod_label: label,
+        custom,
+        domain,
+      }
+    }
+
     for (const workspace of deps.listWorkspaces()) {
       rows.set(workspace.key, {
         key: workspace.key,
@@ -473,6 +524,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         provisioned: false,
         cursor: null,
         current: workspace.key === currentKey,
+        pod: podFor(workspace, null, null),
       })
     }
     for (const [key, inbox] of Object.entries(state.workspaces)) {
@@ -482,18 +534,23 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       // Legacy = provisioned under a previous tenant: the address lives
       // outside the current tenant domain and should be migrated.
       const legacy = Boolean(resolved && tenantMode && address && !address.endsWith(`@${domain}`))
+      const title = inbox.title || existing?.title || key
+      const path = inbox.path || existing?.path || ''
       rows.set(key, {
         key,
-        title: inbox.title || existing?.title || key,
-        path: inbox.path || existing?.path || '',
+        title,
+        path,
         address,
         planned_address: resolved
-          ? (legacy ? planned({ key, title: inbox.title || existing?.title || key, path: inbox.path || existing?.path || '' }) : null)
+          ? (legacy ? planned({ key, title, path }) : null)
           : (existing?.planned_address ?? null),
         provisioned: Boolean(resolved),
         legacy,
         cursor: inbox.cursor ?? null,
         current: key === currentKey,
+        // 已开通 ⇒ ready；pod 域取地址里 `@` 之后那一段（真实值，不是推导值）。
+        pod: podFor({ key, title, path }, address, address ? address.slice(address.indexOf('@') + 1) : null),
+        pod_domain: address ? address.slice(address.indexOf('@') + 1) : null,
       })
     }
 
@@ -550,12 +607,42 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         mail_domain: owner.mail_domain ?? null,
         address_domain: owner.address_domain ?? null,
       } : null,
+      org: await orgView(),
       api_url: owner?.api_url || apiUrl,
       state_file: deps.stateFilePath(),
       // 在 workspaceViews 之后取：解析过程可能刚完成惰性迁移。
       credentials_migrated: await credentialsMigrated(),
       current: workspaces.find((row) => row.current) ?? null,
       workspaces,
+    }
+  }
+
+  /**
+   * ORG 绑定的只读视图。**不返回 key 本体**，只给打码形式，
+   * 让用户能确认"绑的是哪把"。
+   *
+   * pod_count 用**只读探测**拿（列 pod）；探测失败**不让 overview 失败** ——
+   * 面板仍要能显示"已绑定 ORG"，只是数量未知（否则一次网络抖动会让整个设置页报错）。
+   */
+  async function orgView(): Promise<OverviewView['org']> {
+    const state = await deps.loadState()
+    const meta = state.org
+    if (!meta?.label) return null
+    const resolved = await readOrgKey(meta.label).catch(() => undefined)
+    let podCount: number | null = null
+    if (resolved?.key) {
+      podCount = await deps.api
+        .orgListPods(meta.api_url || defaultApiUrl(), resolved.key)
+        .then((pods) => pods.length)
+        .catch(() => null)
+    }
+    return {
+      label: meta.label,
+      id: meta.id ?? null,
+      name: meta.name ?? null,
+      masked: resolved?.key ? maskKey(resolved.key) : '—',
+      verified_at: meta.verified_at ?? null,
+      pod_count: podCount,
     }
   }
 
@@ -1002,6 +1089,81 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       )
       if (provisioned) invalidateUnreadCache()
       return ok(res, { key: workspace.key, address: inbox.address, provisioned })
+    }
+
+    // ------------------------------------------------------------ ORG 级
+    //
+    // 主人 2026-09-30 定的形态：设置里填 ORG key；**默认不开 Pod**；
+    // 手工点「开启」才走 ORG → Pod → Agent 这条链。
+
+    // 绑定 ORG key：先**只读校验**（org/me + 列 pod），通过才落盘。
+    if (method === 'POST' && path === `${BRIDGE_PREFIX}/org`) {
+      const body = await readJsonBody(req)
+      const orgKey = str(body.org_key)
+      const label = str(body.label) ?? ''
+      if (!orgKey) throw new BridgeError(400, 'missing-org-key', 'field "org_key" is required')
+      if (!/^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$/.test(label)) {
+        throw new BridgeError(400, 'invalid-org-label', `"${label}" is not a valid ORG label (3-30 chars, a-z0-9- inside)`)
+      }
+      const apiUrl = (str(body.api_url) || defaultApiUrl()).replace(/\/+$/, '')
+      // 校验：用只读端点，绝不拿写接口试形状（本机误建过 probe-x）
+      let pods: unknown[]
+      try {
+        pods = await deps.api.orgListPods(apiUrl, orgKey, signal)
+      } catch (error) {
+        throw new BridgeError(
+          400,
+          'org-key-rejected',
+          `ORG key 校验失败（${(error as Error)?.message ?? String(error)}）。请确认它是 msg9_ok_… 开头的 ORG key，且具备 pod:read 权限。`,
+        )
+      }
+      await writeOrgKey(label, orgKey)
+      await deps.updateState((state) => {
+        state.org = {
+          label,
+          api_url: apiUrl,
+          verified_at: new Date().toISOString(),
+          ...(str(body.name) ? { name: str(body.name) } : {}),
+          ...(str(body.pod_label) ? { pod_label: str(body.pod_label) } : {}),
+        }
+      })
+      return ok(res, { label, api_url: apiUrl, pod_count: pods.length })
+    }
+
+    // 开启 Pod（幂等）：ORG → Pod → Agent key。**这是本方案唯一的写路径。**
+    if (method === 'POST' && path === `${BRIDGE_PREFIX}/open-pod`) {
+      const body = await readJsonBody(req)
+      const key = str(body.key)
+      const cwd = str(body.cwd)
+      const state = await deps.loadState()
+      const known = key ? state.workspaces[key] : undefined
+      const workspace = (key ? deps.listWorkspaces().find((row) => row.key === key) : undefined)
+        ?? (key && known ? { key, title: known.title, path: known.path } : undefined)
+        ?? deps.matchWorkspaceByPath(cwd)
+      if (!workspace) throw new BridgeError(400, 'missing-workspace', 'field "key" (workspace) or "cwd" is required')
+      const preferredLabel = str(body.pod_label)
+      const result = await deps.openPod(workspace, preferredLabel ? { podLabel: preferredLabel } : undefined)
+      invalidateUnreadCache()
+      return ok(res, { key: workspace.key, ...result })
+    }
+
+    // 开通状态（只读；面板据此决定显示"未配置"/"未开启"/"已开通"）
+    if (method === 'GET' && path === `${BRIDGE_PREFIX}/pod-state`) {
+      const url2 = new URL(req.url ?? '/', 'http://localhost')
+      const cwd = url2.searchParams.get('cwd') ?? undefined
+      const key = url2.searchParams.get('key') ?? undefined
+      const state = await deps.loadState()
+      const known = key ? state.workspaces[key] : undefined
+      const workspace = (key ? deps.listWorkspaces().find((row) => row.key === key) : undefined)
+        ?? (key && known ? { key, title: known.title, path: known.path } : undefined)
+        ?? deps.matchWorkspaceByPath(cwd)
+      if (!workspace) throw new BridgeError(400, 'missing-workspace', 'query "key" or "cwd" is required')
+      return ok(res, {
+        key: workspace.key,
+        state: await deps.podState(workspace),
+        planned_pod_label: deps.derivePodLabel(workspace),
+        org: state.org ? { label: state.org.label, name: state.org.name ?? null } : null,
+      })
     }
 
     if (method === 'POST' && path === `${BRIDGE_PREFIX}/resolve`) {

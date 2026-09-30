@@ -53,20 +53,28 @@ export const inject = ['tools', 'commands', 'sessions'] as const
 // logic are part of the package's public surface, so they can be driven
 // without a cordis host.
 export { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, invalidateUnreadCache, createBridgeEventBus } from './http.ts'
-export { ensureInbox, migrateInbox, ownerContext, resolveInbox } from './service.ts'
+export { derivePodLabel, ensureInbox, migrateInbox, openPod, ownerContext, podState, resolveInbox } from './service.ts'
 export {
   credentialsMigrated,
   deriveProjectKey,
   ensureCredentialsMigrated,
   msg9Home,
+  orgKeyPath,
   projectYamlPath,
+  readOrgKey,
   readProjectCredentials,
   readSigningSeed,
+  readTenantKey,
+  readTenantKeyWithSource,
+  removeOrgKey,
+  writeOrgKey,
   resolveCredentials,
   resolveOwner,
   saveOwner,
   signingYamlPath,
+  TenantKeyAmbiguousError,
   tenantKeyPath,
+  writeTenantKey,
 } from './credentials.ts'
 export { listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
 export { loadState, stateFilePath, upsertWorkspaceInbox, withStateLock } from './store.ts'

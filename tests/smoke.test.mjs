@@ -8,7 +8,7 @@
  *   - each workspace is provisioned once (owner path), keyed by workspace id
  *   - msg9_peers lists the sibling workspaces
  *   - a workspace can send to a sibling
- *   - with no owner, a workspace falls back to public registration
+ *   - with no owner key, provisioning is REFUSED (no silent self-registration)
  *   - cursors advance on a normal pull and stay put on an explicit `since`
  *
  * Run: npm test   (or: node tests/smoke.test.mjs)
@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -469,18 +469,30 @@ await check('msg9_status verify=true validates the workspace key', async () => {
   assert.ok(text.includes('signing: on'), text) // N1: the signature state is exposed
 })
 
-await check('without an owner, a new workspace falls back to public registration', async () => {
+// 2026-09-30 改：旧行为是"无 owner ⇒ 静默公开注册"，那正是主人拍板要拿掉的
+// （本机 9 个身份因此堆进了与项目无关的域）。现在无 pod key 必须【拒绝开通】，
+// 且【不产生任何凭据】。这条测试因此反过来盯同一个点：证伪"静默降级复活"。
+await check('without an owner key, provisioning is REFUSED (no silent self-registration)', async () => {
   const saved = await readState()
   delete saved.owner
   await writeState(saved)
-  // owner key 在凭据仓里：要让"未配置 owner"成立，tenants/dsh.key 也得删掉。
-  await rm(join(process.env.MSG9_HOME, 'tenants', 'dsh.key'), { force: true })
+  // owner key 在凭据仓里：要让"未配置 pod key"成立，tenants/ 下的 key 也得清掉。
+  const tenantsDirPath = join(process.env.MSG9_HOME, 'tenants')
+  for (const name of await readdir(tenantsDirPath).catch(() => [])) {
+    if (name.endsWith('.key')) await rm(join(tenantsDirPath, name), { force: true })
+  }
   const before = seen.register
+  // 未开通的 workspace：工具必须给出可执行的指引，而不是偷偷注册一个身份
+  // 未开通的 workspace：工具必须给出可执行的指引，而不是偷偷注册一个身份。
+  // 工具层的约定是【把错误转成文本返回】（见 errorText），不抛异常 ——
+  // 所以这里断言返回文本，而不是 try/catch。
   const text = await tool('msg9_inbox').execute({}, exec('sess-c'))
-  assert.ok(text.includes('[c]'), text)
-  assert.equal(seen.register, before + 1)
-  const creds = (await resolveCredentials('cwd:/work/c'))
-  assert.ok(creds.api_key.startsWith('msg9_sk_pub_'), creds.api_key)
+  assert.match(text, /拒绝自动开通收件箱/, '应当明确拒绝，而不是静默开通')
+  assert.match(text, /ORG key/, '应当告诉用户填什么（可执行的下一步）')
+  assert.match(text, /设置 → 消息信箱/, '应当告诉用户去哪儿填')
+  assert.equal(seen.register, before, '不得发生任何公开自助注册')
+  const creds = await resolveCredentials('cwd:/work/c').catch(() => undefined)
+  assert.equal(creds, undefined, '拒绝之后不得留下任何 agent 凭据')
 })
 
 await check('msg9_outbox lists what the workspace sent', async () => {

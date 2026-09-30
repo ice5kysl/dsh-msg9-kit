@@ -399,6 +399,64 @@ export function listDirectory(
 
 // ---------------------------------------------------------------- L1 (owner)
 
+// ------------------------------------------------------------- L0.5 (ORG)
+//
+// ORG 是「域 + 平台级凭证 + 平台级配额」的持有者，Pod 就是现有租户（owner），
+// agent 不变（`12-org-pods.md` §0）。凭证阶梯：
+//
+//   msg9_ok_（ORG 开通） → msg9_tk_（pod 建 inbox） → msg9_sk_（分身收发）
+//
+// ⚠️ ORG key 是**平台级对接凭证**：它能建 pod、拿 pod 根 key、读用量，
+// **但不能发消息** —— 发信仍需具体 agent 的 key（同 §4）。
+
+/** 一把 ORG 下的 pod（= 一个租户/owner）。 */
+export interface OrgPodRow {
+  id: string
+  name?: string
+  pod_label: string
+  status: string
+  /** 该 pod 的地址域，如 `dsh.ice.msg9.io`。 */
+  address_domain: string
+  max_agents?: number
+  /** 已经开在该 pod 下的 agent 数。 */
+  agents?: number
+  created_at?: string
+}
+
+/** ORG 身份（校验 ORG key 用）。 */
+export function orgMe(apiUrl: string, orgKey: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  return msg9Request(apiUrl, '/api/v1/org/me', { apiKey: orgKey, signal })
+}
+
+/** 列 ORG 下的 pod。**只读**：用于"开启"前的存在性探测与面板呈现。 */
+export async function orgListPods(apiUrl: string, orgKey: string, signal?: AbortSignal): Promise<OrgPodRow[]> {
+  const data = await msg9Request<{ pods?: OrgPodRow[] }>(apiUrl, '/api/v1/org/pods', { apiKey: orgKey, signal })
+  return data?.pods ?? []
+}
+
+/**
+ * 在 ORG 下创建一个 pod（**写操作**，每个 pod 只在"开启"时建一次）。
+ *
+ * 成功返回的 `api_key` 就是该 pod 的租户 key（`msg9_tk_…`），
+ * **服务端只显示一次** ⇒ 调用方必须立即落盘（`tenants/<pod>-<org>.key`, 0600）。
+ *
+ * ⚠️ `label` 必须满足 3–30 字符的 DNS 标签（`NormalizePodLabel`）；
+ * 语法不合法会被拒（`40020 tenant slug is invalid`）。
+ */
+export function orgCreatePod(
+  apiUrl: string,
+  orgKey: string,
+  input: { label: string; name?: string },
+  signal?: AbortSignal,
+): Promise<{ api_key: string; notice?: string; pod?: OrgPodRow }> {
+  return msg9Request(apiUrl, '/api/v1/org/pods', {
+    method: 'POST',
+    apiKey: orgKey,
+    signal,
+    body: { label: input.label, ...(input.name ? { name: input.name } : {}) },
+  })
+}
+
 /** Who am I as an owner? Validates the owner key. */
 export function ownerMe(apiUrl: string, ownerKey: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
   return msg9Request(apiUrl, '/api/v1/owner/me', { apiKey: ownerKey, signal })

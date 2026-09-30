@@ -101,6 +101,33 @@ export interface BridgeClient {
     input: { owner_key: string; api_url?: string },
     signal?: AbortSignal,
   ): Promise<{ owner: OwnerView; api_url: string }>
+  /**
+   * 绑定 ORG key（`msg9_ok_…`）。这是主人 2026-09-30 定的入口：
+   * **只绑定，不开任何 Pod** —— 开通要另外点「开启」。
+   */
+  bindOrg(
+    input: { org_key: string; label: string; name?: string; api_url?: string; pod_label?: string },
+    signal?: AbortSignal,
+  ): Promise<{ label: string; api_url: string; pod_count: number }>
+  /** workspace 的开通状态（只读）：unconfigured / pod_closed / ready。 */
+  podState(
+    input: { key?: string; cwd?: string },
+    signal?: AbortSignal,
+  ): Promise<{ key: string; state: string; planned_pod_label: string; org: { label: string; name: string | null } | null }>
+  /** 开启 Pod（幂等）：ORG → Pod → Agent key。**唯一的写路径。** */
+  openPod(
+    input: { key?: string; cwd?: string; pod_label?: string },
+    signal?: AbortSignal,
+  ): Promise<{
+    key: string
+    state: string
+    podCreated: boolean
+    podLabel?: string
+    orgLabel?: string
+    addressDomain?: string
+    existingAgents?: number
+    note?: string
+  }>
   resolve(address: string, signal?: AbortSignal): Promise<{ record: Record<string, unknown> }>
 }
 
@@ -224,6 +251,26 @@ export function createBridge(options: BridgeOptions = {}): BridgeClient {
       '/setup',
       { method: 'POST', body: input, signal },
     ),
+    bindOrg: (input, signal) => request<{ label: string; api_url: string; pod_count: number }>(
+      '/org',
+      { method: 'POST', body: input, signal },
+    ),
+    podState: (input, signal) => request<{
+      key: string
+      state: string
+      planned_pod_label: string
+      org: { label: string; name: string | null } | null
+    }>(`/pod-state${query({ key: input.key, cwd: input.cwd })}`, { signal }),
+    openPod: (input, signal) => request<{
+      key: string
+      state: string
+      podCreated: boolean
+      podLabel?: string
+      orgLabel?: string
+      addressDomain?: string
+      existingAgents?: number
+      note?: string
+    }>('/open-pod', { method: 'POST', body: input, signal }),
     resolve: (address, signal) => request<{ record: Record<string, unknown> }>(
       '/resolve',
       { method: 'POST', body: { address }, signal },

@@ -18,6 +18,7 @@ import type {
   MessageRow,
   MessagesView,
   MigrateResult,
+  OrgView,
   OwnerView,
   PeerRow,
   WorkspaceView,
@@ -54,6 +55,18 @@ export interface Msg9State {
   owner: OwnerView | null
   /** First-run tenant binding: until this is done the panel asks for the token. */
   setup: { busy: boolean; error: string | null; dismissed: boolean }
+  /**
+   * ORG 绑定（主人 2026-09-30 的形态）：填 ORG key → 默认不开 Pod → 手工开通。
+   * `null` = 还没绑（设置页显示"引导录入"态）。
+   *
+   * ⚠️ 这里就是设置页第 2 步（录入 ORG key）的数据源。
+   * **每个 workspace 的开通状态在 `workspaces[].pod` 里**，不在这一层。
+   */
+  org: OrgView | null
+  /** ORG key 绑定的进行中/错误状态（与 setup 共用表单生命周期）。 */
+  orgForm: { busy: boolean; error: string | null }
+  /** 「开通」按钮的进行中/错误状态（按 workspace key 索引）。 */
+  opening: Record<string, { busy: boolean; error: string | null }>
   apiUrl: string
   stateFile: string
   workspaces: WorkspaceView[]
@@ -174,7 +187,16 @@ export interface Msg9Store {
   migrate(key: string, oldOwnerKey?: string): Promise<MigrateResult | null>
   /** Bind this dsh instance to a msg9 tenant (owner key) and reload everything. */
   bindOwner(ownerKey: string, apiUrl?: string): Promise<void>
-  /** Skip binding for now: fall back to per-workspace public registration. */
+  /**
+   * 绑定 ORG key（`msg9_ok_…`）—— **只绑定，不开任何 Pod**。
+   * 开通要另外调 `openPod()`（对应面板上的「开启」按钮）。
+   */
+  bindOrg(orgKey: string, label: string, apiUrl?: string): Promise<void>
+  /** 读当前 workspace 的开通状态（unconfigured / pod_closed / ready）。 */
+  loadPodState(key?: string): Promise<void>
+  /** 开启当前 workspace 的 Pod（ORG → Pod → Agent）。**唯一写路径。** */
+  openPod(key?: string): Promise<void>
+  /** Skip binding for now. */
   dismissSetup(): void
 }
 
@@ -189,7 +211,10 @@ const INITIAL: Msg9State = {
   notice: null,
   cwd: null,
   owner: null,
+  org: null,
+  opening: {},
   setup: { busy: false, error: null, dismissed: false },
+  orgForm: { busy: false, error: null },
   apiUrl: '',
   stateFile: '',
   workspaces: [],
@@ -318,6 +343,7 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
         status: 'ready',
         error: null,
         owner: view.owner,
+        org: view.org ?? null,
         apiUrl: view.api_url,
         stateFile: view.state_file,
         workspaces: view.workspaces,
@@ -938,6 +964,66 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
     },
     dismissSetup() {
       set({ setup: { ...state.setup, dismissed: true, error: null } })
+    },
+    /**
+     * 绑定 ORG key（`msg9_ok_…`）。**只绑定，不开任何 Pod** ——
+     * 开通是另一件事（`openPod`，对应每行的「开通」按钮）。
+     *
+     * 与 `bindOwner` 的关键差别：**这条路径不触发任何 pod/agent 创建**，
+     * 所以"录了 ORG key 但一个 Pod 都没开"是合法且默认的状态。
+     */
+    async bindOrg(orgKey, label, apiUrl) {
+      const key = orgKey.trim()
+      const slug = label.trim().toLowerCase()
+      if (!key || !slug) return
+      set({ orgForm: { busy: true, error: null } })
+      try {
+        await bridge.bindOrg(apiUrl
+          ? { org_key: key, label: slug, api_url: apiUrl }
+          : { org_key: key, label: slug })
+        set({ orgForm: { busy: false, error: null } })
+        notice('ok', L(
+          '已绑定 ORG「{label}」—— 现在可以逐个开通 Pod 了',
+          'ORG "{label}" bound — you can open pods now',
+          { label: slug },
+        ))
+        await refreshAll()
+      } catch (error) {
+        set({ orgForm: { busy: false, error: errorText(error) } })
+      }
+    },
+    /** 读某 workspace 的开通状态（只读；不写任何凭据）。 */
+    async loadPodState(key) {
+      try {
+        await bridge.podState({ key, cwd: state.cwd ?? undefined })
+        await refreshAll()
+      } catch {
+        /* 只读探测失败不打扰用户：overview 的 pod 行已能显示三态 */
+      }
+    },
+    /**
+     * 开通 Pod（ORG → Pod → Agent）。**唯一的写路径，幂等。**
+     *
+     * 不做乐观更新：等服务端返回再 refresh（与 store 其余写操作一致）。
+     * 这一步真的会在远端建资源，"看起来成功了"是不能接受的假象。
+     */
+    async openPod(key) {
+      const target = key ?? state.currentKey ?? undefined
+      const id = target ?? '__current__'
+      set({ opening: { ...state.opening, [id]: { busy: true, error: null } } })
+      try {
+        const result = await bridge.openPod({ key: target, cwd: state.cwd ?? undefined })
+        set({ opening: { ...state.opening, [id]: { busy: false, error: null } } })
+        notice('ok', result.podCreated
+          ? L('已开通 Pod「{pod}」（{domain}）', 'Pod "{pod}" opened ({domain})', {
+              pod: result.podLabel ?? '?', domain: result.addressDomain ?? '?',
+            })
+          : L('已复用现有 Pod「{pod}」', 'Reused existing pod "{pod}"', { pod: result.podLabel ?? '?' }))
+        await refreshAll()
+      } catch (error) {
+        set({ opening: { ...state.opening, [id]: { busy: false, error: errorText(error) } } })
+        notice('error', errorText(error))
+      }
     },
   }
 }

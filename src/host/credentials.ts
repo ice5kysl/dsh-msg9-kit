@@ -25,7 +25,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import {
@@ -51,6 +51,25 @@ function tenantsDir(): string {
 
 function projectsDir(): string {
   return join(msg9Home(), 'projects', 'dsh')
+}
+
+/**
+ * ORG key 的存放目录。
+ *
+ * ⚠️ 规范 `address-format.md` §5 只规定了 `tenants/`（pod key）与
+ * `projects/<harness>/`（agent 凭据），**没有给 ORG key 定位置** ——
+ * 因为 ORG 是"平台级凭证"，按设计不该发给终端 harness。
+ *
+ * 主人在（2026-09-30）要求"设置里填 ORG key"，所以本插件需要存它。
+ * 取名 `orgs/` 与 `tenants/`、`projects/` 并级，文件名 `<org>.key`，
+ * **同样 0600**，与其余凭据一致；并在 README 里标注这是我方扩展。
+ */
+function orgsDir(): string {
+  return join(msg9Home(), 'orgs')
+}
+
+export function orgKeyPath(orgLabel: string): string {
+  return join(orgsDir(), `${sanitizeKey(orgLabel)}.key`)
 }
 
 export function tenantKeyPath(): string {
@@ -229,19 +248,191 @@ export async function writeSigningSeed(projectKey: string, seed: string, options
   return true
 }
 
-export async function readTenantKey(): Promise<string | undefined> {
+/**
+ * 按规范解析 pod 租户 key（`address-format.md` §5 / `12-org-pods.md`）。
+ *
+ * 优先级（规范原文）：
+ *   ① `MSG9_TENANT_KEY=<路径>` / 显式指定
+ *   ② `tenants/<pod>-<org>.key`（新模型，pod 级）
+ *   ③ `tenants/<harness>.key`（**旧模型，存量**）
+ *   ④ `tenants/` 里唯一一把 `*.key`
+ *   **多把 key 且不显式指定 → 报错列候选，不替调用方猜。**
+ *
+ * ⚠️ 为什么这里要"报错"而不是"挑一把"（2026-09-30 事故）：
+ * 原实现硬编码 `tenants/dsh.key`，于是一次 `msg9_setup` 覆盖它就把**全机 24 个
+ * workspace 一起换了域**（DEF-001 静默覆盖，已复发 2 次）。规范写明"不会替你猜"——
+ * 本函数即该条的实现；旧 harness key 仍在时，只要同目录还有别的 key 就必须显式点名。
+ *
+ * @example 只有一把 key ⇒ 直接用它（存量平滑）；两把以上 ⇒ 抛 TenantKeyAmbiguousError
+ */
+export class TenantKeyAmbiguousError extends Error {
+  readonly candidates: string[]
+  constructor(candidates: string[]) {
+    super(
+      'msg9 租户 key 不唯一，拒绝替你猜（规范 address-format.md §5）。'
+      + `候选取自 ${tenantsDir()}/：${candidates.join(', ')}。`
+      + '请显式指定：env MSG9_TENANT_KEY=<路径>，或在设置里为该项目选定 pod key。',
+    )
+    this.name = 'TenantKeyAmbiguousError'
+    this.candidates = candidates
+  }
+}
+
+/** `tenants/` 下所有 `*.key`（`.bak` 等不参与匹配，规范明文）。 */
+async function listTenantKeyFiles(): Promise<string[]> {
+  let names: string[]
   try {
-    const key = (await readFile(tenantKeyPath(), 'utf8')).trim()
+    names = await readdir(tenantsDir())
+  } catch {
+    return []
+  }
+  return names
+    .filter((name) => name.endsWith('.key') && !name.includes('.bak'))
+    .sort()
+}
+
+/**
+ * 解析租户 key。返回 `{ key, source }`，`source` 用于面板/日志说明"这把 key 是谁"。
+ * 找不到返回 undefined（**不是错误**：未配置是合法状态，调用方据此走"未开启"）。
+ */
+export async function readTenantKeyWithSource(): Promise<{ key: string; source: string } | undefined> {
+  // ① 环境变量显式指定（规范第一优先级；永不落盘）
+  const envPath = process.env.MSG9_TENANT_KEY
+  if (envPath) {
+    try {
+      const key = (await readFile(envPath, 'utf8')).trim()
+      if (key) return { key, source: `MSG9_TENANT_KEY=${envPath}` }
+    } catch {
+      /* 显式指定但读不到：继续往下找，由候选报错兜底 */
+    }
+  }
+  const files = await listTenantKeyFiles()
+
+  // ② pod 模型：`tenants/<pod>-<org>.key`（当 state 里已知当前 pod 时优先）
+  //    规范示例：pod `msg9` + org `ice` ⇒ `tenants/msg9-ice.key`
+  const known = await knownTenantKeyName()
+  if (known && files.includes(known)) {
+    const key = await readTenantKeyFile(known)
+    if (key) return { key, source: `tenants/${known}` }
+  }
+
+  // ③ 旧 harness 模型：tenants/dsh.key（存量）
+  //    仅在【没有别的 key】时使用；有别的 key 就必须显式点名（规范"多把不猜"）。
+  const legacy = 'dsh.key'
+  if (files.length === 1 && files[0] === legacy) {
+    const key = await readTenantKeyFile(legacy)
+    if (key) return { key, source: `tenants/${legacy}（旧模型存量）` }
+  }
+
+  // ④ 唯一一把 ⇒ 用它；多把 ⇒ 报错列候选
+  if (files.length === 1) {
+    const key = await readTenantKeyFile(files[0]!)
+    if (key) return { key, source: `tenants/${files[0]}` }
+  }
+  if (files.length > 1) {
+    // 旧 key 也在候选里 —— 正是它当年"静默优先"把 agent 开进了旧租户。
+    throw new TenantKeyAmbiguousError(files)
+  }
+  return undefined
+}
+
+/** 读单个候选文件的内容（空白/读不到返回 undefined）。 */
+async function readTenantKeyFile(name: string): Promise<string | undefined> {
+  try {
+    const key = (await readFile(join(tenantsDir(), name), 'utf8')).trim()
     return key || undefined
   } catch {
     return undefined
   }
 }
 
-export async function writeTenantKey(key: string): Promise<void> {
+/**
+ * 当前实例已知的 pod key 文件名（`<pod>-<org>.key`）。
+ * 由 state 里的 owner 元数据推导；未知时返回 undefined（退回候选逻辑）。
+ */
+async function knownTenantKeyName(): Promise<string | undefined> {
+  const state = await loadState()
+  const label = state.owner?.pod_label
+  const org = state.owner?.org_label
+  if (!label || !org) return undefined
+  return `${sanitizeKey(label)}-${sanitizeKey(org)}.key`
+}
+
+/**
+ * 旧签名：只要 key、不要来源。**保留是为了不动既有调用点**，
+ * 但现在它会**在 key 不唯一时抛错**（旧行为是静默取 `dsh.key`）。
+ */
+export async function readTenantKey(): Promise<string | undefined> {
+  return (await readTenantKeyWithSource())?.key
+}
+
+/**
+ * 写 pod 租户 key。按规范写到 `tenants/<pod>-<org>.key`；
+ * 信息不足时退回旧路径（`dsh.key`）以保持存量兼容。
+ */
+export async function writeTenantKey(key: string, scope?: { podLabel?: string; orgLabel?: string }): Promise<void> {
   await ensureDir(tenantsDir())
-  await writeFile(tenantKeyPath(), `${key}\n`, { mode: 0o600 })
-  await chmod(tenantKeyPath(), 0o600).catch(() => {})
+  const name = scope?.podLabel && scope?.orgLabel
+    ? `${sanitizeKey(scope.podLabel)}-${sanitizeKey(scope.orgLabel)}.key`
+    : 'dsh.key'
+  const path = join(tenantsDir(), name)
+  await writeFile(path, `${key}\n`, { mode: 0o600 })
+  await chmod(path, 0o600).catch(() => {})
+}
+
+// ------------------------------------------------------------------ ORG key
+
+/**
+ * 读 ORG key（`~/.msg9/orgs/<org>.key`）。
+ *
+ * 与 pod key 不同，这里**不做"多把就报错"**：ORG 与项目是多对多的
+ * （一个 ORG 下可以有多个 pod；一台机器可以接多个 ORG），
+ * 所以"哪把 ORG key 用在哪"必须由**显式配置**（state.org.label）决定，而不是猜。
+ * 无显式配置时退回"唯一一把"，多把则返回 undefined 由调用方提示去设置里选。
+ */
+export async function readOrgKey(orgLabel?: string): Promise<{ key: string; label: string; source: string } | undefined> {
+  // ① 环境变量（测试/一次性用；永不落盘）
+  const envKey = process.env.MSG9_ORG_KEY
+  if (envKey) return { key: envKey, label: orgLabel ?? 'env', source: 'MSG9_ORG_KEY' }
+
+  // ② 显式指定 org ⇒ 精确读那一把
+  if (orgLabel) {
+    const path = orgKeyPath(orgLabel)
+    try {
+      const key = (await readFile(path, 'utf8')).trim()
+      if (key) return { key, label: orgLabel, source: `orgs/${sanitizeKey(orgLabel)}.key` }
+    } catch { /* 落到候选逻辑 */ }
+  }
+
+  // ③ 未指定 ⇒ 唯一一把才敢用；多把说明需要用户去设置里选
+  let names: string[]
+  try {
+    names = (await readdir(orgsDir())).filter((n) => n.endsWith('.key') && !n.includes('.bak')).sort()
+  } catch {
+    return undefined
+  }
+  if (names.length !== 1) return undefined
+  const name = names[0]!
+  try {
+    const key = (await readFile(join(orgsDir(), name), 'utf8')).trim()
+    if (!key) return undefined
+    return { key, label: name.replace(/\.key$/, ''), source: `orgs/${name}` }
+  } catch {
+    return undefined
+  }
+}
+
+/** 写 ORG key（0600）。`label` 用作文件名，也是 state 里的归属标识。 */
+export async function writeOrgKey(orgLabel: string, key: string): Promise<void> {
+  await ensureDir(orgsDir())
+  const path = orgKeyPath(orgLabel)
+  await writeFile(path, `${key}\n`, { mode: 0o600 })
+  await chmod(path, 0o600).catch(() => {})
+}
+
+/** 清掉 ORG key（用户改主意/换 ORG 时用）。 */
+export async function removeOrgKey(orgLabel: string): Promise<void> {
+  await rm(orgKeyPath(orgLabel), { force: true }).catch(() => {})
 }
 
 // --------------------------------------------------------------- 惰性迁移

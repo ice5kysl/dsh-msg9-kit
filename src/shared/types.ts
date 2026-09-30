@@ -8,6 +8,19 @@
  * @module dsh-msg9-kit/types
  */
 
+/** workspace 维度的开通状态（主人 2026-09-30 的三态模型）。 */
+export type PodState = 'unconfigured' | 'pod_closed' | 'ready'
+
+export interface PodStateView {
+  state: PodState
+  /** 将要用 / 正在用的 pod label（可能就是用户改过的那个）。 */
+  pod_label: string
+  /** 是否已被人工显式指定（面板据此显示「已自定义」并可恢复默认）。 */
+  custom: boolean
+  /** 已开 Pod 时的地址域（如 `dsh.ice.msg9.io`）。 */
+  domain?: string | null
+}
+
 /** One workspace row of the tenant table (never carries a key). */
 export interface WorkspaceView {
   key: string
@@ -22,6 +35,13 @@ export interface WorkspaceView {
   legacy?: boolean
   cursor: string | null
   current: boolean
+  /**
+   * 开通状态：`unconfigured` 没有 ORG key · `pod_closed` 有 ORG key 但未开 Pod（默认）·
+   * `ready` 已开通。面板据此决定那一行显示「开通」按钮还是地址。
+   */
+  pod?: PodStateView
+  /** 该 pod 的地址域（已开 Pod 时）；未开时为 null。 */
+  pod_domain?: string | null
 }
 
 /** The msg9 owner (tenant) behind this dsh instance. */
@@ -41,12 +61,32 @@ export interface OwnerView {
 /** `GET /dsh-msg9/overview` payload. */
 export interface OverviewView {
   owner: OwnerView | null
+  /**
+   * ORG 绑定（主人 2026-09-30 的形态）：填 ORG key → 默认不开 Pod → 手工开通。
+   * `null` = 还没绑 ORG key（面板显示"引导录入"态）。
+   */
+  org: OrgView | null
   api_url: string
   state_file: string
   /** state.json 已无任何明文凭据（全部迁入 ~/.msg9 凭据仓）。 */
   credentials_migrated?: boolean
   current: WorkspaceView | null
   workspaces: WorkspaceView[]
+}
+
+/** ORG 绑定的只读视图（**不含 key 本体**，只有打码形式）。 */
+export interface OrgView {
+  /** ORG label（地址里 `<org>` 那一段）。 */
+  label: string
+  /** ORG id（`org_…`）。 */
+  id?: string | null
+  name?: string | null
+  /** 打码后的 ORG key（`msg9_ok_…`），用于确认"绑的是哪把"。 */
+  masked: string
+  /** 校验通过的时间。 */
+  verified_at?: string | null
+  /** 该 ORG 下现有的 pod 数（只读探测结果；探测失败为 null）。 */
+  pod_count?: number | null
 }
 
 /** One message, as msg9 returns it (inbox and outbox share the shape). */

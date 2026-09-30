@@ -310,6 +310,9 @@ process.env.MSG9_API_URL = apiUrl
 // no inbox yet, so the panel's "open inbox" path has something to do.
 await writeFile(process.env.MSG9_STATE_FILE, `${JSON.stringify({
   owner: { api_key: 'msg9_tk_smoketest0123456789', api_url: apiUrl, id: 'own_1', name: 'dsh' },
+  // ORG 绑定（主人 2026-09-30 的形态）：设置页第 ② 步读的就是它。
+  // 只放元数据，**key 本体在凭据仓**（state.json 从不存明文 key）。
+  org: { label: 'ice', id: 'org_1', name: 'ICE', api_url: apiUrl, verified_at: '2026-09-30T00:00:00.000Z' },
   workspaces: {
     'ws-a': { address: 'dsh-alpha-1a2b@msg9.io', api_key: 'msg9_sk_a', api_url: apiUrl, title: 'alpha', path: '/work/a', cursor: 'C1' },
     'ws-b': { address: 'dsh-beta-3c4d@msg9.io', api_key: 'msg9_sk_b', api_url: apiUrl, title: 'beta', path: '/work/b' },
@@ -1099,7 +1102,7 @@ await check('panel renders the unprovisioned workspace as an explicit action', a
   assert.ok(!html.includes('dsh-cwd'), html)
 })
 
-await check('settings section renders the service intro, tenant and its open inboxes', async () => {
+await check('settings section renders the service intro, ORG binding and its open inboxes', async () => {
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
   store.setCwd('/work/a')
   await store.refreshAll()
@@ -1108,19 +1111,21 @@ await check('settings section renders the service intro, tenant and its open inb
 
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
   assert.ok(html.includes('msg9.io'), 'service intro shown')
-  // 标题去重：intro 卡只留一个 msg9.io 标题，不再多一个同名链接。
-  assert.equal(html.match(/>msg9\.io</g).length, 1, 'the msg9.io title is not duplicated')
-  assert.ok(html.includes('Tenant'), html)
+  // 主人 2026-09-30 定的三步结构：① 介绍+注册引导 ② 录入 ORG key ③ workspace 清单
+  assert.ok(html.includes('msg9.io'), '① 介绍块')
+  assert.ok(html.includes('ORG'), '② ORG 卡（录入 ORG key）')
+  assert.ok(html.includes('Workspaces & pods') || html.includes('Workspace'), '③ workspace 清单')
+  // 介绍块里应当有去主页的注册/登录链接（主人要求「可以留个链接去 msg9 主页」）
+  assert.ok(html.includes('https://msg9.io'), '注册/登录引导链接到 msg9 主页')
+  // 旧「Tenant」卡已被「ORG」卡取代（主人 2026-09-30 的三步结构）；
+  // 底层 owner 仍是同一个租户，其 name/id 照旧要显示。
   assert.ok(html.includes('dsh'), 'tenant name shown')
-  assert.ok(html.includes('own_1'), 'tenant id shown')
-  // ws-c was provisioned by the earlier bridge test, so all three are open.
-  assert.ok(html.includes('Open inboxes (3)'), html)
+  assert.ok(html.includes('org_1'), 'ORG id shown（ORG 卡取代了旧 Tenant 卡）')
+  // 三态：fake bridge 里 ws-c 已开通 ⇒ 清单应显示「已开通」
+  assert.ok(html.includes('Ready'), html)
   assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'first inbox listed')
   assert.ok(html.includes('dsh-beta-3c4d@msg9.io'), 'second inbox listed')
   assert.ok(html.includes('dsh-gamma-'), 'newly opened inbox listed too')
-  // Role column: the matching peer's yellow-pages description shows up.
-  assert.ok(html.includes('alpha workspace inbox'), html)
-  assert.ok(html.includes('code-review'), 'capabilities shown')
   // Per-inbox counts from /unread (the fake reports 3 unread of a 2-message box).
   assert.ok(html.includes('3 unread · 3 total'), html)
 })
@@ -1144,8 +1149,10 @@ await check('panel: the first paint shows a loading state, never a setup-form fl
   assert.ok(!html.includes('Skip for now'), 'no setup-form flash for an already-bound instance')
 
   const settings = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
-  assert.ok(settings.includes('Loading'), 'settings tenant card waits for the overview too')
+  assert.ok(settings.includes('Loading'), 'settings page waits for the overview too')
   assert.ok(!settings.includes('Skip for now'), 'no setup-form flash on the settings page either')
+  // 关键：overview 未回来时**不得**渲染「录入 ORG key」表单（否则已绑实例会闪一下）
+  assert.ok(!settings.includes('ORG key'), 'no ORG-key form flash before the overview lands')
 })
 
 await check('store: a failed write never rolls an old list back over the new view', async () => {
