@@ -192,8 +192,49 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
  * **未绑定 ORG 时，"开通"按钮不可用**（而不是点下去才报错）——
  * 让不可用的原因在界面上直接可见。
  */
+/**
+ * 一条记录的归类 —— **只用客观判据，不猜意图**。
+ *
+ *   missing      目录已不存在（仓库搬走 / 改名，记录成了残留）
+ *   problem      与其他记录共用同一个地址
+ *   noncompliant 地址没有 pod 归属（扁平域 / ORG 的 Default Pod），
+ *                或者它指向的 pod 在 ORG 里不存在（探测成功时才敢这么说）
+ *   ok           其余
+ *
+ * ⚠️ 刻意**不**把"开在别的 pod 下"算作不合规：规范
+ *    `address-format.md` §3 明说「项目即 pod」只是推荐用法之一，
+ *    只要求地址形如 <agent>@<pod>.<org>.<base>。归属与直觉一致与否，
+ *    取决于用户想要什么粒度 —— 那不是程序能替他判的。
+ * 优先级即上序，一行只进一个组。
+ */
+export function groupOf(row: Msg9State['workspaces'][number]): 'missing' | 'problem' | 'noncompliant' | 'ok' {
+  if (row.health?.pathMissing) return 'missing'
+  if (row.health?.duplicateOf) return 'problem'
+  if (row.provisioned && row.pod) {
+    if (row.pod.pod_form === false) return 'noncompliant'
+    if (row.pod.pod_exists === false) return 'noncompliant'
+  }
+  return 'ok'
+}
+
 function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
   const bound = Boolean(state.org)
+  const groups: { id: string; label: string; hint: string | null; warn: boolean }[] = [
+    { id: 'missing', label: L('不存在了的', 'Gone'), warn: true,
+      hint: L('目录已不存在（仓库搬走或改名了）', 'directory no longer exists') },
+    { id: 'problem', label: L('有问题的', 'Problems'), warn: true,
+      hint: L('多条记录指向同一个地址', 'several records share one address') },
+    { id: 'noncompliant', label: L('不合规的', 'Non-compliant'), warn: true,
+      hint: L('地址没有 Pod 归属，或指向 ORG 里不存在的 Pod', 'no pod ownership, or a pod missing from the ORG') },
+    { id: 'ok', label: L('合规的', 'Compliant'), warn: false, hint: null },
+  ]
+  const byGroup = new Map<string, Msg9State['workspaces']>()
+  for (const row of state.workspaces) {
+    const id = groupOf(row)
+    const bucket = byGroup.get(id)
+    if (bucket) bucket.push(row)
+    else byGroup.set(id, [row])
+  }
   return (
     <section style={styles.card}>
       <div style={styles.cardTitle}>
@@ -201,13 +242,28 @@ function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store })
       </div>
       {state.workspaces.length === 0 ? (
         <div style={styles.dim}>{L('还没有 workspace。', 'No workspaces yet.')}</div>
-      ) : (
-        <ul style={styles.list}>
-          {state.workspaces.map((row) => (
-            <WorkspaceRow key={row.key} row={row} state={state} store={store} orgBound={bound} />
-          ))}
-        </ul>
-      )}
+      ) : groups.map((group) => {
+        const rows = byGroup.get(group.id) ?? []
+        return (
+          <div key={group.id} style={styles.group}>
+            <div style={styles.groupHead}>
+              <span style={group.warn && rows.length > 0 ? styles.groupTitleWarn : styles.groupTitle}>
+                {L('{label}（{n}）', '{label} ({n})', { label: group.label, n: rows.length })}
+              </span>
+              {group.hint && <span style={styles.dim}>{group.hint}</span>}
+            </div>
+            {rows.length === 0
+              ? <div style={styles.groupEmpty}>{L('（无）', '(none)')}</div>
+              : (
+                <ul style={styles.list}>
+                  {rows.map((row) => (
+                    <WorkspaceRow key={row.key} row={row} state={state} store={store} orgBound={bound} />
+                  ))}
+                </ul>
+              )}
+          </div>
+        )
+      })}
       {/* 只在 overview 回来后才有意义：加载中时"是否绑了 ORG"还是未知数，
           此时提示"先绑定 ORG key"会误导（也可能早就绑过了）。 */}
       {state.status !== 'loading' && !bound && (
@@ -232,8 +288,6 @@ function WorkspaceRow({
 }): JSX.Element {
   const pod = row.pod
   const unread = state.unreadByKey[row.key] ?? 0
-  const mailboxSize = state.totalByKey[row.key]
-  const badge = badgeText(unread)
   const opening = state.opening[row.key] ?? { busy: false, error: null }
   const [editLabel, setEditLabel] = useState<string | null>(null)
   const [confirmRemove, setConfirmRemove] = useState(false)
@@ -248,9 +302,45 @@ function WorkspaceRow({
     <li style={styles.row}>
       <Mail size={14} style={styles.rowIcon} />
       <div style={styles.rowText}>
-        {/* 第 1 层：workspace 本身 */}
-        <div style={styles.rowTitle}>{row.title}</div>
+        {/* 行 1：workspace · Pod · 域 · 状态 · 用量（紧凑一行） */}
+        <div style={styles.lineRow}>
+          <span style={styles.rowTitle}>{row.title}</span>
+          {pod && (
+            <>
+              <span style={styles.dot}>·</span>
+              <span style={styles.dim}>{L('Pod', 'Pod')}</span>
+              <code style={styles.code}>{pod.pod_label}</code>
+              {pod.domain && (
+                <>
+                  <span style={styles.dot}>·</span>
+                  <code style={styles.code}>{pod.domain}</code>
+                </>
+              )}
+              <span style={pod.state === 'ready' ? styles.ok : styles.warn}>{stateText}</span>
+              <span style={styles.dim}>
+                {pod.agents === null || pod.agents === undefined
+                  ? L('agent —', 'agents —')
+                  : L('{n} / {max} 个信箱', '{n} / {max} inboxes', { n: pod.agents, max: pod.max_agents ?? '—' })}
+              </span>
+            </>
+          )}
+        </div>
+
+        {/* 行 2：目录 */}
         <div style={styles.path}>{row.path}</div>
+
+        {/* 行 3：Agent 信箱 + 未读。未读是**本信箱**的，不是 Pod 合计。 */}
+        {(row.address || unread > 0) && (
+          <div style={styles.lineRow}>
+            <span style={styles.layerTag}>{L('Agent', 'Agent')}</span>
+            {row.address
+              ? <code style={styles.code}>{row.address}</code>
+              : <span style={styles.dim}>{L('（未开通）', '(not open)')}</span>}
+            {unread > 0 && (
+              <span style={styles.unread}>{L('{n} 未读', '{n} unread', { n: unread })}</span>
+            )}
+          </div>
+        )}
 
         {/* 健康判断：僵尸 / 重复。**从地址看不出来，所以必须标出来。** */}
         {row.health?.pathMissing && (
@@ -265,37 +355,6 @@ function WorkspaceRow({
           <div style={styles.rowMeta}>
             <span style={styles.warn}>{L('⚠ 与另一条记录共用同一地址', '⚠ shares an address with another record')}</span>
             <code style={styles.code}>{row.health.duplicateOf}</code>
-          </div>
-        )}
-
-        {/* 第 2 层：Pod —— 显示它自己的状态与用量（不是这个 workspace 的消息数） */}
-        <div style={styles.layerRow}>
-          <span style={styles.layerTag}>{L('Pod', 'Pod')}</span>
-          {pod ? (
-            <>
-              <code style={styles.code}>{pod.pod_label}</code>
-              {pod.custom && <span style={styles.dim}>{L('（已自定义）', ' (custom)')}</span>}
-              {pod.domain && <span style={styles.code}>{pod.domain}</span>}
-              {/* 已开 agent 数 / 上限 —— 这才是 Pod 的真实状态 */}
-              <span style={pod.state === 'ready' ? styles.ok : styles.warn}>{stateText}</span>
-              <span style={styles.dim}>
-                {pod.agents === null || pod.agents === undefined
-                  ? L('agent —（未探测到）', 'agents — (not probed)')
-                  : L('{n} / {max} 个 Agent 信箱', '{n} / {max} inboxes', {
-                      n: pod.agents, max: pod.max_agents ?? '—',
-                    })}
-              </span>
-            </>
-          ) : (
-            <span style={styles.dim}>{L('（此 workspace 尚无 Pod）', '(no pod yet)')}</span>
-          )}
-        </div>
-
-        {/* 第 3 层：Agent 信箱地址 */}
-        {row.address && (
-          <div style={styles.layerRow}>
-            <span style={styles.layerTag}>{L('Agent', 'Agent')}</span>
-            <code style={styles.code}>{row.address}</code>
           </div>
         )}
 
@@ -317,24 +376,7 @@ function WorkspaceRow({
       </div>
       <div style={styles.rowStats}>
         {opening.error && <span style={styles.warn}>{L('开通失败', 'Failed')}</span>}
-        {row.provisioned ? (
-          // 这个徽标是**本 workspace（本 Agent 信箱）**的未读数，不是 Pod 合计 ——
-          // 悬停文案说清楚，免得和上面 POD 行的用量混淆。
-          badge
-            ? (
-              <span
-                style={styles.badge}
-                title={L(
-                  '{address} 这个信箱有 {n} 封未读',
-                  '{address} has {n} unread',
-                  { address: row.address ?? '', n: unread },
-                )}
-              >
-                {badge}
-              </span>
-            )
-            : null
-        ) : (
+        {!row.provisioned && (
           <>
             <button
               type="button"
@@ -567,7 +609,18 @@ const styles: Record<string, CSSProperties> = {
     borderTop: `1px solid ${BORDER}`,
   },
   rowIcon: { flexShrink: 0, color: DIM },
-  rowText: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: 1 },
+  // flexBasis 给个下限：窄面板时让右侧按钮换行，而不是把文字压到逐字换行/被裁掉
+  rowText: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: '1 1 240px' },
+  // 紧凑行：把「workspace · Pod · 域 · 状态 · 用量」排在同一行内（可换行）
+  lineRow: { display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+  // 未读数：本信箱的未读，跟在 Agent 地址后面
+  unread: { fontSize: 11, color: ACCENT, fontWeight: 500 },
+  // 分组：每类一个小标题 + 说明，空组也显示「（无）」——"没有问题"本身是信息
+  group: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 },
+  groupHead: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' },
+  groupTitle: { fontSize: 12, fontWeight: 600, color: DIM },
+  groupTitleWarn: { fontSize: 12, fontWeight: 600, color: '#d9534f' },
+  groupEmpty: { fontSize: 12, color: DIM, paddingLeft: 2 },
   rowTitle: { fontSize: 13, fontWeight: 500 },
   role: { fontSize: 11, color: FG, lineHeight: 1.5 },
   caps: { fontSize: 10, color: ACCENT, lineHeight: 1.5 },

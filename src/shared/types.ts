@@ -35,6 +35,16 @@ export interface PodStateView {
   suggested_label?: string
   /** 上述候选 pod 是否**已存在**于 ORG（已存在却空着，常是"本该开在这儿"的强信号）。 */
   suggested_exists?: boolean
+  /**
+   * 现址是否是 pod 形态（`<agent>@<pod>.<org>.<base>`）。
+   * `false` = 扁平域 / ORG 的 Default Pod ⇒ 没有 pod 归属。只在已开通时有值。
+   */
+  pod_form?: boolean
+  /**
+   * 现址所在的那个 pod **是否存在于 ORG**。
+   * 只在"ORG 探测成功"时才有值（探测失败给 undefined，**不把"未知"当"不存在"**）。
+   */
+  pod_exists?: boolean
 }
 
 /**

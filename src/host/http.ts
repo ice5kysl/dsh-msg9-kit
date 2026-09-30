@@ -510,9 +510,12 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
     // pod 名 → { agents, max_agents }：来自只读探测 `GET /api/v1/org/pods`。
     // 探测失败 ⇒ 空表 ⇒ 面板显示"—"，**不把"未知"画成"零"**。
     const podStats = new Map<string, { agents: number | null; max: number | null }>()
+    // 探测是否成功 —— 只有成功时才敢说"某个 pod 不存在"（失败 = 未知，不是不存在）
+    let podProbeOk = false
     if (orgReady) {
       const pods = await deps.api
         .orgListPods(orgMeta?.api_url || defaultApiUrl(), orgKey!.key)
+        .then((rows) => { podProbeOk = true; return rows })
         .catch(() => [])
       for (const pod of pods) {
         podStats.set(pod.pod_label, {
@@ -566,6 +569,15 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         // 纯 hash 名字只是噪音（中文标题无法生成 ASCII pod 名，需人工指定）。
         ...(suggested !== label && isMeaningfulPodLabel(suggested)
           ? { suggested_label: suggested, suggested_exists: podStats.has(suggested) }
+          : {}),
+        // 现址的归属事实（用于面板分"合规 / 不合规"）：
+        //   pod_form=false ⇒ 扁平域或 Default Pod（没有 pod 归属）
+        //   pod_exists=false ⇒ 地址指向一个 ORG 里不存在的 pod（探测成功才敢这么说）
+        ...(address
+          ? {
+              pod_form: Boolean(fromAddress),
+              ...(podProbeOk && fromAddress ? { pod_exists: podStats.has(fromAddress) } : {}),
+            }
           : {}),
       }
     }

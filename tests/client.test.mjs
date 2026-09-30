@@ -1695,6 +1695,29 @@ await check('contacts empty state guides; recipient suggestions filter to 6; pen
   assert.ok(chips.includes('…and 2 more'), 'overflow chip carries the remaining count')
 })
 
+await check('settings grouping: 4 objective buckets, and "another pod" is NOT non-compliant', async () => {
+  const { groupOf } = client
+  const base = { key: 'k', title: 't', path: '/p', address: 'a@dsh.ice.msg9.io', provisioned: true, cursor: null, current: false }
+  const pod = (extra) => ({ state: 'ready', pod_label: 'dsh', custom: false, ...extra })
+
+  // ① 目录已不存在 → 不存在了的
+  assert.equal(groupOf({ ...base, health: { pathMissing: true, removable: true } }), 'missing')
+  // ② 与他人共用地址 → 有问题的（优先级高于"合规"）
+  assert.equal(groupOf({ ...base, health: { pathMissing: false, duplicateOf: base.address, removable: true } }), 'problem')
+  // ③ 地址不是 pod 形态（扁平域 / Default Pod）→ 不合规的
+  assert.equal(groupOf({ ...base, address: 'a@msg9.io', pod: pod({ pod_form: false }) }), 'noncompliant')
+  // ④ 地址指向 ORG 里不存在的 pod → 不合规的
+  assert.equal(groupOf({ ...base, pod: pod({ pod_form: true, pod_exists: false }) }), 'noncompliant')
+  // ⑤ ★ 开在别的 pod 下，但那个 pod 存在于 ORG → **算合规**。
+  //    规范 address-format.md §3 明说「项目即 pod」只是推荐用法之一，
+  //    归属与直觉是否一致不属于"违反规范"。
+  assert.equal(groupOf({ ...base, pod: pod({ pod_label: 'whymyphone', pod_form: true, pod_exists: true }) }), 'ok')
+  // ⑥ 探测失败（pod_exists 未知）不得当成"不存在"
+  assert.equal(groupOf({ ...base, pod: pod({ pod_form: true }) }), 'ok')
+  // ⑦ 未开通的行（没有 pod 信息）不因为缺字段被判不合规
+  assert.equal(groupOf({ ...base, address: null, provisioned: false, pod: { state: 'pod_closed', pod_label: 'x', custom: false } }), 'ok')
+})
+
 await check('highlight: an unloaded grammar (```jsonc) degrades to plaintext instead of crashing the panel', async () => {
   // 真实事故：roadmap 组的信带 jsonc 代码块，getLanguage 对未加载语言直接
   // 抛 ShikiError，React 整树崩溃、页面空白。语言成员判定必须走
