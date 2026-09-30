@@ -391,7 +391,9 @@ function WorkspaceRow({
 
         {/* 行 2：目录（前面加个文件夹图标，标明这一行是路径） */}
         <div style={styles.lineRow}>
-          <FolderOpen size={12} style={styles.inlineIcon} />
+          <span style={styles.iconWrap} title={L('工作区目录', 'Workspace directory')}>
+            <FolderOpen size={12} />
+          </span>
           <span style={styles.path}>{row.path}</span>
         </div>
 
@@ -401,8 +403,11 @@ function WorkspaceRow({
         {(row.address || unread > 0) && (
           <div style={styles.lineBetween}>
             <div style={styles.lineRow}>
-              <AtSign size={12} style={styles.inlineIcon} />
-              <span style={styles.layerTag}>{L('Agent', 'Agent')}</span>
+              {/* 「Agent」这个词不再写出来：前面的 @ 图标已经说明了。
+                  说明移到图标的悬停提示上（不占横向空间）。 */}
+              <span style={styles.iconWrap} title={L('Agent 信箱', 'Agent inbox')}>
+                <AtSign size={12} />
+              </span>
               {row.address
                 ? <code style={styles.code}>{row.address}</code>
                 : <span style={styles.dim}>{L('（未开通）', '(not open)')}</span>}
@@ -731,8 +736,17 @@ const styles: Record<string, CSSProperties> = {
     padding: '9px 0',
     borderTop: `1px solid ${BORDER}`,
   },
-  // 行内小图标（目录 / Agent 前的标识）：跟着文字视觉居中
-  inlineIcon: { flexShrink: 0, color: DIM, alignSelf: 'center' },
+  // 行内小图标（目录 / Agent 前的标识）。
+  // 用 <span title> 包一层而不是给 <svg> 加 title —— SVG 的 title **属性**
+  // 不产生原生 tooltip（那要靠 <title> 子元素），HTML 元素的 title 才可靠。
+  iconWrap: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    flexShrink: 0,
+    color: DIM,
+    alignSelf: 'center',
+    cursor: 'help',
+  },
   // flexBasis 给个下限：窄面板时让右侧按钮换行，而不是把文字压到逐字换行/被裁掉
   rowText: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: '1 1 240px' },
   // 紧凑行：把「workspace · Pod · 域 · 状态 · 用量」排在同一行内（可换行）
@@ -850,14 +864,6 @@ const styles: Record<string, CSSProperties> = {
   smallBtn: { fontSize: 11, padding: '2px 8px' },
   slugInput: { width: 140, fontSize: 11, padding: '2px 6px' },
   // 三层分明：workspace（标题+路径）/ Pod / Agent 各占一行，左侧小标签对齐。
-  layerTag: {
-    flex: 'none',
-    width: 42,
-    fontSize: 10,
-    color: DIM,
-    textTransform: 'uppercase',
-    letterSpacing: '0.04em',
-  },
   // 移除确认：给它自己的框，别和那一行的其它内容混在一起。
   confirmBox: {
     display: 'flex',
