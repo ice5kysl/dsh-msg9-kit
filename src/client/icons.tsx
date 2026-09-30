@@ -11,6 +11,7 @@ import {
   AtSign,
   Bell,
   BellOff,
+  Boxes,
   Check,
   ChevronDown,
   ChevronRight,
@@ -31,4 +32,4 @@ import {
   X,
 } from 'lucide-react'
 
-export { ArrowRight, AtSign, Bell, BellOff, Check, ChevronDown, ChevronRight, Copy, FolderOpen, Globe, Inbox, Mail, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X }
+export { ArrowRight, AtSign, Bell, Boxes, BellOff, Check, ChevronDown, ChevronRight, Copy, FolderOpen, Globe, Inbox, Mail, MessagesSquare, PenLine, RefreshCw, Reply, Search, Send, Trash2, UserPlus, Users, X }

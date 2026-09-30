@@ -12,7 +12,7 @@
  */
 
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
-import { AtSign, ChevronDown, ChevronRight, FolderOpen } from './icons.tsx'
+import { Boxes, ChevronDown, ChevronRight, FolderOpen, Mail } from './icons.tsx'
 import { L } from './locale.ts'
 import { SetupView } from './Msg9Panel.tsx'
 import type { Msg9State, Msg9Store } from './store.ts'
@@ -357,24 +357,29 @@ function WorkspaceRow({
       {/* 不再有行首的邮箱图标：每一行都是信箱，它什么也没说明，
           只是把每行都往右推。图标改为贴在有信息量的地方（目录 / Agent）。 */}
       <div style={styles.rowText}>
-        {/* 行 1：左 = workspace · Pod · 域；右 = 状态 / 用量 pill。
-            两者放在同一个 flex 行里 ⇒ pill 与**行 1 基线对齐**（此前它们挂在
-            整个行的垂直居中处，看起来像浮在第 1、2 行之间）。 */}
+        {/* 三层各一行，行首各有一个图标标明"这一行是什么"：
+              行 1 = Pod（项目在平台上的落脚点）+ 状态/用量
+              行 2 = 工作区（名字 + 目录）
+              行 3 = Agent 信箱（地址）+ 未读
+            主人 2026-09-30 的排法：把"三层"这件事在版面上显式化，
+            每行的图标就是它的标签，因此行里不再重复写"Pod""Agent"这些词。 */}
         <div style={styles.lineBetween}>
           <div style={styles.lineRow}>
-            <span style={styles.rowTitle}>{row.title}</span>
-            {pod && (
+            <span style={styles.iconWrap} title={L('Pod（项目在平台上的落脚点）', 'Pod (the project’s foothold on the platform)')}>
+              <Boxes size={12} />
+            </span>
+            {pod ? (
               <>
-                <span style={styles.dot}>·</span>
-                <span style={styles.dim}>{L('Pod', 'Pod')}</span>
                 <code style={styles.code}>{pod.pod_label}</code>
                 {pod.domain && (
                   <>
-                    <span style={styles.dot}>·</span>
-                    <code style={styles.code}>{pod.domain}</code>
+                    <span style={styles.dot}>-</span>
+                    <span style={styles.code}>{pod.domain}</span>
                   </>
                 )}
               </>
+            ) : (
+              <span style={styles.dim}>{L('（尚无 Pod）', '(no pod yet)')}</span>
             )}
           </div>
           <div style={styles.lineRight}>
@@ -393,24 +398,26 @@ function WorkspaceRow({
           </div>
         </div>
 
-        {/* 行 2：目录（前面加个文件夹图标，标明这一行是路径） */}
+        {/* 行 2：工作区 —— 名字 + 目录（工作区就是它那个目录，所以放同一行） */}
         <div style={styles.lineRow}>
           <span style={styles.iconWrap} title={L('工作区目录', 'Workspace directory')}>
             <FolderOpen size={12} />
           </span>
-          <span style={styles.path}>{row.path}</span>
+          <span style={styles.rowTitle}>{row.title}</span>
+          {row.path && (
+            <>
+              <span style={styles.dot}>-</span>
+              <span style={styles.path}>{row.path}</span>
+            </>
+          )}
         </div>
 
-        {/* 行 3：Agent 信箱（前面加个 @ 图标）+ 未读靠右。
-            未读是**本信箱**的（不是 Pod 合计），所以它挂在这一行、贴右边缘，
-            与上面 pill 的右边缘对齐。 */}
+        {/* 行 3：Agent 信箱 —— 未读挂本行右端（它是**本信箱**的，不是 Pod 合计） */}
         {(row.address || unread > 0) && (
           <div style={styles.lineBetween}>
             <div style={styles.lineRow}>
-              {/* 「Agent」这个词不再写出来：前面的 @ 图标已经说明了。
-                  说明移到图标的悬停提示上（不占横向空间）。 */}
               <span style={styles.iconWrap} title={L('Agent 信箱', 'Agent inbox')}>
-                <AtSign size={12} />
+                <Mail size={12} />
               </span>
               {row.address
                 ? <code style={styles.code}>{row.address}</code>
@@ -849,7 +856,8 @@ const styles: Record<string, CSSProperties> = {
   groupTitleWarn: { fontSize: 12, fontWeight: 600, color: '#d9534f' },
   groupEmpty: { fontSize: 12, color: DIM, paddingLeft: 2 },
   rowTitle: { fontSize: 13, fontWeight: 500 },
-  path: { fontSize: 11, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  // 与工作区名同行 ⇒ 必须可收缩，否则 nowrap 的长路径会顶破整行
+  path: { fontSize: 11, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: '0 1 auto' },
   rowStats: { display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 },
   pendingChips: { display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 44, overflow: 'hidden' },
   pendingChip: { fontSize: 11, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '1px 8px', whiteSpace: 'nowrap' },
