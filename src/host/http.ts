@@ -652,6 +652,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       address: string | null,
       path: string,
       stale?: { registryPath: string; statePath: string } | null,
+      pathSource?: 'registry' | 'state',
     ): WorkspaceHealth => {
       const pathMissing = Boolean(path) && !existsSync(path)
       const holders = address ? (byAddress.get(address) ?? []) : []
@@ -684,6 +685,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         ...(reason ? { reason } : {}),
         // 两处记录对"目录在哪"说法不一致 —— 以注册表为准，但把差异摆出来
         ...(stale ? { stalePath: stale.statePath, registryPath: stale.registryPath } : {}),
+        ...(pathSource ? { pathSource } : {}),
       }
     }
 
@@ -702,7 +704,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         cursor: null,
         current: workspace.key === currentKey,
         pod: podFor(workspace, null, null),
-        health: healthFor(workspace.key, null, workspace.path),
+        health: healthFor(workspace.key, null, workspace.path, null, 'registry'),
       })
     }
     for (const [key, inbox] of Object.entries(state.workspaces)) {
@@ -740,7 +742,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         // 已开通 ⇒ ready；pod 域取地址里 `@` 之后那一段（真实值，不是推导值）。
         pod: podFor({ key, title, path }, address, address ? address.slice(address.indexOf('@') + 1) : null),
         pod_domain: address ? address.slice(address.indexOf('@') + 1) : null,
-        health: healthFor(key, address, path, stalePathInfo),
+        // 显示的 path 是注册表优先；注册表没有这条时才来自 state
+        health: healthFor(key, address, path, stalePathInfo, registryPath ? 'registry' : 'state'),
       })
     }
 

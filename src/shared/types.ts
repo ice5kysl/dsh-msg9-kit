@@ -83,6 +83,16 @@ export interface WorkspaceHealth {
   stalePath?: string
   /** 工作区注册表里的当前路径（仅在它与 msg9 记录的路径不同时给出）。 */
   registryPath?: string
+  /**
+   * 面板上那一行显示的路径**取自哪里**。
+   *
+   * 两处记录都可能持有路径：dsh 的工作区注册表（活数据）与 msg9-kit 的 state。
+   * 规则是**注册表优先**。之所以要把它说出来：主人 2026-09-30 看到
+   * `⚠ 目录已不存在` 后问"这个路径是 msg9-kit 登记的、还是 dsh 登记的、
+   * 还是它现在真的在这" —— 而界面上本来没法回答。
+   */
+  pathSource?: 'registry' | 'state'
+
   /** 与另一条记录共用同一个地址（两条都指向同一个信箱）。 */
   duplicateOf?: string | null
   /** 移除这条记录是否安全。`false` = 它是该地址唯一的持有者（移除会孤立信箱）。 */

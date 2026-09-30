@@ -488,15 +488,32 @@ function WorkspaceRow({
           {row.health?.pathMissing && (
             <span
               style={styles.warn}
-              title={row.address
-                ? L(
-                    '仓库搬走了。信箱还在收信，但它挂在了已经不存在的工作区上。',
-                    'The repo moved. The inbox still receives mail, but it is attached to a workspace that no longer exists.',
-                  )
-                : L(
-                    '这是 dsh 注册表里的一条失效工作区，请到 dsh 中清理。',
-                    'A stale workspace in the dsh registry — clean it up in dsh.',
-                  )}
+              title={[
+                // ① 先说**这个路径是谁记的** —— 主人 2026-09-30 正是问这个：
+                //    "是 msg9-kit 登记的、dsh 登记的、还是它现在真的在这？"
+                //    两处记录都可能持有路径，而界面本来没法回答。
+                //
+                //    ⚠️ 出处未知时**什么都不说**，不默认成"注册表" ——
+                //    宿主是旧代码时（客户端 bundle 热更新、宿主没重启）这个字段是
+                //    undefined，默认成注册表对"只在 state 里"的行就是**假话**。
+                ...(row.health.pathSource === 'state'
+                  ? [L('上面这个路径取自 **msg9-kit 的记录**（该工作区已不在 dsh 注册表里）。',
+                       'That path comes from the **msg9-kit record** (this workspace is no longer in the dsh registry).')]
+                  : row.health.pathSource === 'registry'
+                    ? [L('上面这个路径取自 **dsh 的工作区注册表**。',
+                         'That path comes from the **dsh workspace registry**.')]
+                    : []),
+                // ② 再说它的状态与后果
+                row.address
+                  ? L(
+                      '目录已不存在：仓库搬走了。信箱还在收信，但它挂在了已经不存在的工作区上。',
+                      'The directory is gone — the repo moved. The inbox still receives mail, but it is attached to a workspace that no longer exists.',
+                    )
+                  : L(
+                      '目录已不存在：这是 dsh 注册表里的一条失效工作区，请到 dsh 中清理。',
+                      'The directory is gone — a stale workspace in the dsh registry; clean it up in dsh.',
+                    ),
+              ].join('\n')}
             >
               {L('⚠ 目录已不存在', '⚠ directory is gone')}
             </span>
