@@ -1845,11 +1845,11 @@ await check('tenant mode: a conflicting address falls back to the hashed form', 
   assert.ok(payload.data.address.startsWith('taken-'), payload.data.address)
 })
 
-await check('settings section lists inboxes under another pod (read-only, no migrate button)', async () => {
-  // ws-a's inbox was opened under a different pod than this instance's domain:
-  // it must be surfaced, **without** offering a one-click migration —
-  // whether to move it depends on which project that workspace belongs to,
-  // which this instance cannot know.
+await check('settings section groups workspaces and offers NO one-click migrate', async () => {
+  // 「归属在其它 Pod」那张单独的卡片已并入列表（每行都显示 Pod 与域），
+  // 但它唯一独有的信号（候选 Pod 已存在）保留在行内。
+  // ws-a 的信箱开在别的 pod 下 ⇒ 仍在列表中可见，但**不提供**「一键迁移」：
+  // 该不该迁、迁去哪个 pod 取决于那个 workspace 属于哪个项目，本实例无从知道。
   const overview = await call(`${BRIDGE_PREFIX}/overview`)
   const row = overview.payload.data.workspaces.find((r) => r.key === 'ws-a')
   assert.equal(row.legacy, true)
@@ -1858,9 +1858,13 @@ await check('settings section lists inboxes under another pod (read-only, no mig
   store.setCwd('/work/a')
   await store.refreshAll()
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
-  assert.ok(html.includes('Held by another pod'), html)
-  assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'the misplaced address is shown')
-  // 🔴 关键：**不得**再出现「一键迁移」——把别人的项目的信箱一起搬走是错的。
+  // 四个分组标题都在（合规在最上，越需要处理的越往下）
+  for (const label of ['Compliant', 'Non-compliant', 'Problems', 'Gone']) {
+    assert.ok(html.includes(label), `group "${label}" rendered`)
+  }
+  assert.ok(html.indexOf('Compliant') < html.indexOf('Gone'), '合规的排在最上面，不存在了的在最后')
+  assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'the address is shown')
+  // 🔴 关键：**不得**再出现「一键迁移」——把别的项目的信箱一起搬走是错的。
   assert.ok(!html.includes('Migrate'), 'no one-click migrate button')
 })
 

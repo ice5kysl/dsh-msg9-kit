@@ -17,7 +17,6 @@ import { L } from './locale.ts'
 import { SetupView } from './Msg9Panel.tsx'
 import type { Msg9State, Msg9Store } from './store.ts'
 import { ACCENT, BORDER, DIM, FG, M9_CSS } from './theme.ts'
-import { badgeText } from './view.ts'
 
 /** Props handed to the section: the injected store (owner prop `close` unused). */
 export interface Msg9SettingsSectionProps {
@@ -66,8 +65,6 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
           同一批 workspace 出现两次只会让人以为它们是不同的东西。 */}
       <WorkspaceCard state={state} store={store} />
 
-      {/* 归位提示：列出"开在别的 pod 下"的信箱（**只读判断，不做批量迁移**） */}
-      <PlacementCard state={state} />
     </div>
   )
 }
@@ -207,7 +204,9 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
  *    取决于用户想要什么粒度 —— 那不是程序能替他判的。
  * 优先级即上序，一行只进一个组。
  */
-export function groupOf(row: Msg9State['workspaces'][number]): 'missing' | 'problem' | 'noncompliant' | 'ok' {
+export type GroupId = 'missing' | 'problem' | 'noncompliant' | 'ok'
+
+export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
   if (row.health?.pathMissing) return 'missing'
   if (row.health?.duplicateOf) return 'problem'
   if (row.provisioned && row.pod) {
@@ -219,22 +218,26 @@ export function groupOf(row: Msg9State['workspaces'][number]): 'missing' | 'prob
 
 function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
   const bound = Boolean(state.org)
-  const groups: { id: string; label: string; hint: string | null; warn: boolean }[] = [
-    { id: 'missing', label: L('不存在了的', 'Gone'), warn: true,
-      hint: L('目录已不存在（仓库搬走或改名了）', 'directory no longer exists') },
-    { id: 'problem', label: L('有问题的', 'Problems'), warn: true,
-      hint: L('多条记录指向同一个地址', 'several records share one address') },
+  // 组序按主人要求：合规的 → 不合规的 → 有问题的 → 不存在了的。
+  // 越需要处理的越往下 —— 上面是"一切正常"，往下才是要动手的东西。
+  const groups: { id: GroupId; label: string; hint: string | null; warn: boolean }[] = [
+    { id: 'ok', label: L('合规的', 'Compliant'), warn: false, hint: null },
     { id: 'noncompliant', label: L('不合规的', 'Non-compliant'), warn: true,
       hint: L('地址没有 Pod 归属，或指向 ORG 里不存在的 Pod', 'no pod ownership, or a pod missing from the ORG') },
-    { id: 'ok', label: L('合规的', 'Compliant'), warn: false, hint: null },
+    { id: 'problem', label: L('有问题的', 'Problems'), warn: true,
+      hint: L('多条记录指向同一个地址', 'several records share one address') },
+    { id: 'missing', label: L('不存在了的', 'Gone'), warn: true,
+      hint: L('目录已不存在（仓库搬走或改名了）', 'directory no longer exists') },
   ]
-  const byGroup = new Map<string, Msg9State['workspaces']>()
+  const byGroup = new Map<GroupId, Msg9State['workspaces']>()
   for (const row of state.workspaces) {
     const id = groupOf(row)
     const bucket = byGroup.get(id)
     if (bucket) bucket.push(row)
     else byGroup.set(id, [row])
   }
+  // 折叠：默认全展开，点标题栏切换
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   return (
     <section style={styles.card}>
       <div style={styles.cardTitle}>
@@ -243,24 +246,36 @@ function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store })
       {state.workspaces.length === 0 ? (
         <div style={styles.dim}>{L('还没有 workspace。', 'No workspaces yet.')}</div>
       ) : groups.map((group) => {
+        // 组内保持 overview 给的**原始顺序**（宿主已不再重排）
         const rows = byGroup.get(group.id) ?? []
+        const isCollapsed = collapsed[group.id] === true
         return (
           <div key={group.id} style={styles.group}>
             <div style={styles.groupHead}>
-              <span style={group.warn && rows.length > 0 ? styles.groupTitleWarn : styles.groupTitle}>
-                {L('{label}（{n}）', '{label} ({n})', { label: group.label, n: rows.length })}
-              </span>
+              <button
+                type="button"
+                style={styles.groupBtn}
+                onClick={() => setCollapsed((prev) => ({ ...prev, [group.id]: !prev[group.id] }))}
+                title={isCollapsed ? L('展开', 'Expand') : L('折叠', 'Collapse')}
+              >
+                <span style={styles.groupArrow}>{isCollapsed ? '▸' : '▾'}</span>
+                <span style={group.warn && rows.length > 0 ? styles.groupTitleWarn : styles.groupTitle}>
+                  {L('{label}（{n}）', '{label} ({n})', { label: group.label, n: rows.length })}
+                </span>
+              </button>
               {group.hint && <span style={styles.dim}>{group.hint}</span>}
             </div>
-            {rows.length === 0
-              ? <div style={styles.groupEmpty}>{L('（无）', '(none)')}</div>
-              : (
-                <ul style={styles.list}>
-                  {rows.map((row) => (
-                    <WorkspaceRow key={row.key} row={row} state={state} store={store} orgBound={bound} />
+            {isCollapsed
+              ? null
+              : (rows.length === 0
+                  ? <div style={styles.groupEmpty}>{L('（无）', '(none)')}</div>
+                  : (
+                    <ul style={styles.list}>
+                      {rows.map((row) => (
+                        <WorkspaceRow key={row.key} row={row} state={state} store={store} orgBound={bound} />
+                      ))}
+                    </ul>
                   ))}
-                </ul>
-              )}
           </div>
         )
       })}
@@ -355,6 +370,20 @@ function WorkspaceRow({
           <div style={styles.rowMeta}>
             <span style={styles.warn}>{L('⚠ 与另一条记录共用同一地址', '⚠ shares an address with another record')}</span>
             <code style={styles.code}>{row.health.duplicateOf}</code>
+          </div>
+        )}
+        {/* 候选 Pod 已存在、而信箱开在别处 —— 这是"可能开错地方"的**客观**信号
+            （本机 LLMPool：ORG 里的 `llmpool` pod 空着，信箱却在 `whymyphone` 下）。
+            只在候选 pod **确实存在**时才提示，免得给十几条"候选尚未创建"的行添噪音。
+            注意：这**不是**不合规 —— 规范并不要求 pod 名等于项目名。 */}
+        {pod?.suggested_exists && pod.suggested_label && (
+          <div style={styles.rowMeta}>
+            <span style={styles.warn}>
+              {L('⚠ 候选 Pod「{pod}」已存在', '⚠ candidate pod "{pod}" already exists', { pod: pod.suggested_label })}
+            </span>
+            <span style={styles.dim}>
+              {L('（它可能是这个 workspace 该去的地方）', '(it may be where this workspace belongs)')}
+            </span>
           </div>
         )}
 
@@ -488,105 +517,6 @@ export function PendingChips({ titles }: { titles: string[] }): JSX.Element {
   )
 }
 
-/**
- * 归位提示：把"**开在别的 pod 下**"的信箱列出来（只读）。
- *
- * 为什么不做「一键迁移」：
- *   旧实现按「地址域 ≠ 当前 owner 域」判定，然后提供一个批量迁移按钮 ——
- *   那个判据在 ORG 模型下是错的。规范 `address-format.md` §3 明说
- *   **「项目即 pod」只是 P1 一种用法，不写成强制**；pod 叫什么由 ORG 决定。
- *   所以"地址不在某个域里"**本身不代表任何问题** ——
- *   真正要看的只有一条：**这个信箱是不是开在了一个跟它无关的 pod 下**
- *   （本机实例：8 条被开进了 `msg9` 这个 pod，7 条被开进了 `whymyphone`，
- *    而那分别是 msg9.io 项目和 WhyMyPhone 项目的 pod）。
- *
- * 而且迁移是**破坏性 + 涉及归属判断**的动作：该不该迁、迁去哪个 pod，
- * 取决于那个 workspace 属于哪个项目 —— 这件事 dsh 不该替用户猜。
- * ⇒ 这里只**如实呈现**，把决定留给看到它的人。
- */
-function PlacementCard({ state }: { state: Msg9State }): JSX.Element | null {
-  // ⚠️ 判据必须是「地址实际落在哪个 pod」，**不是** `pod.pod_label` ——
-  //    后者是"将要/已经使用的 pod"（对未开通的行只是推导出的候选名），
-  //    拿它去比地址段会把正常行误判成异常（我第一版就误报了 5 条）。
-  //    真正的异常只有一种：**地址的域与本实例自己的域不同**。
-  // 本实例的域：优先 ORG 模型的 `address_domain`，退回 `<slug>.<mail_domain>`
-  // （扁平域时两者都没有 ⇒ selfDomain 为 null ⇒ 卡片不渲染，宁可不报也不误报）
-  const selfDomain = state.owner?.address_domain
-    ?? (state.owner?.slug ? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}` : null)
-  const rows = state.workspaces.filter((row) => {
-    if (!row.address || !row.provisioned) return false
-    // 没有自身域可比就无从判断 ⇒ 宁可不报，也不误报
-    if (!selfDomain) return false
-    const domain = row.address.slice(row.address.indexOf('@') + 1)
-    return domain !== selfDomain
-  })
-  if (rows.length === 0) return null
-
-  return (
-    <section style={styles.card}>
-      <div style={styles.cardTitle}>
-        {L('归属在其它 Pod（{n}）', 'Held by another pod ({n})', { n: rows.length })}
-      </div>
-      <div style={styles.dim}>
-        {L(
-          '这些信箱开在与本实例（{self}）不同的 Pod 下。'
-          + '⚠️ 这【不违反规范】：规范只要求地址形如 <agent>@<pod>.<org>.<base>，'
-          + '并没有规定哪个 workspace 必须用哪个 Pod（address-format.md §3：'
-          + '「项目即 pod」只是推荐用法之一）。只要那些 Pod 属于你的 ORG 就合规 —— '
-          + '这里只是把归属列出来，供你判断是否需要归拢。',
-          'These inboxes live under a different pod than this instance ({self}). '
-          + '⚠️ That is NOT a violation: the spec only requires <agent>@<pod>.<org>.<base> and does not '
-          + 'mandate which pod a workspace must use. As long as those pods belong to your ORG, it is fine. '
-          + 'Listed here only so you can see the grouping.',
-          { self: selfDomain ?? '—' },
-        )}
-      </div>
-      <ul style={styles.list}>
-        {rows.map((row) => (
-          <li key={row.key} style={styles.row}>
-            <div style={styles.rowText}>
-              <div style={styles.rowTitle}>{row.title}</div>
-              <div style={styles.path}>{row.path}</div>
-              <div style={styles.layerRow}>
-                <span style={styles.layerTag}>{L('现址', 'now')}</span>
-                <code style={styles.code}>{row.address}</code>
-              </div>
-              {row.pod && (
-                <div style={styles.layerRow}>
-                  <span style={styles.layerTag}>{L('归属', 'pod')}</span>
-                  <code style={styles.code}>{row.pod.pod_label}</code>
-                  <span style={styles.dim}>{L('（与本实例不同的 Pod）', '(a different pod)')}</span>
-                </div>
-              )}
-              {row.pod?.suggested_label && (
-                // 候选 pod = 按这个 workspace 的名字推导出来的那个。
-                // **"已存在却空着"是客观信号**（本机的 llmpool 正是这样：
-                // pod 建好了、0 个信箱，而它的信箱开在 whymyphone 下）。
-                <div style={styles.layerRow}>
-                  <span style={styles.layerTag}>{L('候选', 'alt')}</span>
-                  <code style={styles.code}>{row.pod.suggested_label}</code>
-                  <span style={row.pod.suggested_exists ? styles.warn : styles.dim}>
-                    {row.pod.suggested_exists
-                      ? L('该 Pod 已存在（可能就是它该去的地方）', 'this pod already exists')
-                      : L('该 Pod 尚未创建', 'not created yet')}
-                  </span>
-                </div>
-              )}
-            </div>
-          </li>
-        ))}
-      </ul>
-      <div style={styles.dim}>
-        {L(
-          '注：这里【没有】迁移按钮。旧版的「一键迁到当前域」会把这些信箱批量搬进本实例的 Pod —— '
-          + '而该不该搬、搬去哪个 Pod，取决于每个 workspace 属于哪个项目，那不是能批量决定的动作。',
-          'Note: no migrate button on purpose. The old one-click migration would sweep these into this '
-          + "instance's pod; whether to move one, and to which pod, depends on each workspace's project.",
-        )}
-      </div>
-    </section>
-  )
-}
 
 const styles: Record<string, CSSProperties> = {
   wrap: { display: 'flex', flexDirection: 'column', gap: 20, padding: '16px 0', maxWidth: 640, color: FG, fontSize: 13 },
@@ -621,27 +551,24 @@ const styles: Record<string, CSSProperties> = {
   groupTitle: { fontSize: 12, fontWeight: 600, color: DIM },
   groupTitleWarn: { fontSize: 12, fontWeight: 600, color: '#d9534f' },
   groupEmpty: { fontSize: 12, color: DIM, paddingLeft: 2 },
+  // 可点标题栏：看起来像文字，但整条可点（含折叠箭头）
+  groupBtn: {
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: 4,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    cursor: 'pointer',
+  },
+  groupArrow: { fontSize: 10, color: DIM, width: 10, display: 'inline-block' },
   rowTitle: { fontSize: 13, fontWeight: 500 },
-  role: { fontSize: 11, color: FG, lineHeight: 1.5 },
-  caps: { fontSize: 10, color: ACCENT, lineHeight: 1.5 },
   path: { fontSize: 11, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   rowStats: { display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 },
-  badge: {
-    minWidth: 18,
-    height: 18,
-    padding: '0 5px',
-    borderRadius: 9,
-    background: ACCENT,
-    color: '#ffffff',
-    fontSize: 11,
-    lineHeight: '18px',
-    textAlign: 'center',
-    fontWeight: 600,
-  },
-  pending: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, color: DIM, borderTop: `1px solid ${BORDER}`, paddingTop: 8 },
   pendingChips: { display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 44, overflow: 'hidden' },
   pendingChip: { fontSize: 11, color: DIM, border: `1px solid ${BORDER}`, borderRadius: 999, padding: '1px 8px', whiteSpace: 'nowrap' },
-  migrateKeyRow: { display: 'flex', flexDirection: 'column', gap: 4, maxWidth: 380 },
   // --- ORG 卡（设置页第 ② 步）---
   link: { color: ACCENT, textDecoration: 'none' },
   orgForm: { display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 420 },
@@ -657,7 +584,6 @@ const styles: Record<string, CSSProperties> = {
   smallBtn: { fontSize: 11, padding: '2px 8px' },
   slugInput: { width: 140, fontSize: 11, padding: '2px 6px' },
   // 三层分明：workspace（标题+路径）/ Pod / Agent 各占一行，左侧小标签对齐。
-  layerRow: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 12, marginTop: 2 },
   layerTag: {
     flex: 'none',
     width: 42,

@@ -685,11 +685,10 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       })
     }
 
-    return [...rows.values()].sort((a, b) => {
-      if (a.current !== b.current) return a.current ? -1 : 1
-      if (a.provisioned !== b.provisioned) return a.provisioned ? -1 : 1
-      return a.title.localeCompare(b.title)
-    })
+    // 保持**原始顺序**（registry 的 workspace 顺序，其次才是只存在于 state 的条目）。
+    // 主人 2026-09-30：分组之后组内要按"工作区里原本的顺序"，所以这里不再
+    // 按 current / provisioned / title 重排 —— 排序交给客户端的分组去表达。
+    return [...rows.values()]
   }
 
   /** The inbox behind a state key, provisioning it when the workspace is known. */
