@@ -163,46 +163,80 @@ export function shortHash(input: string): string {
 }
 
 /**
+ * 各 harness 在项目 Pod 里使用的**固定** Agent 名（主人 2026-09-30 定案）。
+ *
+ * 规范地址 = **`<harness 名>@<项目 Pod>.<org>.<base>`**：
+ *
+ *   ```
+ *   dsh@jev.ice.msg9.io      ← dsh harness 在「Jev」这个项目里的信箱
+ *   kimi@jev.ice.msg9.io     ← kimi harness 在同一个项目里的信箱
+ *   cc@jev.ice.msg9.io       ← claude harness（主人明确用 `cc`，不是 `claude`）
+ *   ```
+ *
+ * **Agent 名不带项目后缀** —— 项目身份由 Pod 段承载，`dsh-jev-8221`、
+ * `dsh-ws-04fe` 那种丑名字正是旧规则"一个 workspace 一个 agent 名"的产物，已废弃。
+ */
+export const HARNESS_AGENT_NAMES: Record<string, string> = {
+  dsh: 'dsh',
+  kimi: 'kimi',
+  claude: 'cc',
+}
+
+/** 本插件跑在哪个 harness 里（决定规范的 Agent 名）。 */
+export const HARNESS = 'dsh'
+
+/** harness → 它在项目 Pod 里用的 Agent 名（未知 harness 就用它自己的名字）。 */
+export function harnessAgentName(harness: string = HARNESS): string {
+  return HARNESS_AGENT_NAMES[harness] ?? harness
+}
+
+/**
  * Derive a msg9 address for a workspace.
  *
  * Flat `@msg9.io` namespace (default): `dsh-<slug>-<hash4>` — the prefix marks
  * the harness and the deterministic hash (from the workspace key) makes
- * collisions across workspaces impossible.
+ * collisions across workspaces impossible. **这条不变**：扁平域里没有 Pod 段
+ * 承载项目身份，只能靠本地部分区分。
  *
- * Tenant subdomain (`tenant: true`): `<slug>` — the harness already lives in
- * the domain (`@<tenant>.msg9.io`), so the local part is just the workspace
- * slug. Slugs shorter than msg9's 3-char minimum fall back to `<slug>-<hash4>`.
+ * Tenant subdomain (`tenant: true`): **harness 名**（`dsh`）—— 项目身份由 Pod 段
+ * 承载（`dsh@<pod>.<org>`），所以同一个项目的不同 harness 各占一个名字。
  *
- * Always satisfies msg9's rules (lowercase, `-`/`_`, alphanumeric ends, 3–30).
+ * ⚠️ 2026-09-30 变更：这里**原来返回 workspace slug**（→ `jev@dsh.ice`），
+ * 方向是反的，是那 13 条"不规范"地址的根因。主人定案后改为 harness 名。
+ * 冲突时**加可读后缀**（`dsh-2` / `dsh-dev`），不再退化成带哈希的丑名字
+ * （见 `tenantAddressCandidates`）。
  */
 export function deriveAddress(workspace: CurrentWorkspace, options?: { tenant?: boolean }): string {
+  if (options?.tenant) return harnessAgentName()
   const slug = slugify(workspace.title) || slugify(basename(workspace.path)) || 'ws'
-  if (options?.tenant) {
-    if (slug.length >= 3) return slug.slice(0, 30).replace(/[^a-z0-9]+$/, '')
-    return deriveTenantFallback(workspace)
-  }
   const address = `dsh-${slug}-${shortHash(workspace.key)}`
   return address.slice(0, 30).replace(/[^a-z0-9]+$/, '')
 }
 
-/** Tenant-namespace conflict fallback: `<slug>-<hash4>` (deterministic). */
-export function deriveTenantFallback(workspace: CurrentWorkspace): string {
-  const slug = slugify(workspace.title) || slugify(basename(workspace.path)) || 'ws'
-  return `${slug}-${shortHash(workspace.key)}`.slice(0, 30).replace(/[^a-z0-9]+$/, '')
-}
-
 /**
- * Local parts provisioning tries under a tenant, in order: an explicit
- * preference first (a user naming their own inbox, e.g. `dsh@<tenant-domain>`),
- * then the readable per-workspace name, then the hashed fallback. The server
- * answers a taken name with code 40900 and the caller walks on, so the list
- * doubles as the honest preview of the outcome.
+ * 租户模式下开通要试的本地部分，**按顺序**：显式指定 → harness 名 → `dsh-2`…
+ *
+ * 主人 2026-09-30 定的粒度（**两个都是他的原话**）：
+ *
+ * 1. 「大多数应该是 **1 个项目对应 1 个 workspace**」⇒ 默认就是 `dsh@<项目>`；
+ * 2. 「如果有多个 dsh，后续可以加 **`dsh-1`、`dsh-2`** 或者 **`dsh-dev`、`dsh-fe`** 这样」
+ *    ⇒ 撞名时**允许加可读后缀**，不是硬拒绝。
+ *
+ * ⚠️ 但与旧行为的**关键区别**：后缀必须是**可读**的。
+ *    旧实现撞名时退化成 `<workspace-slug>-<hash4>`（`dsh-jev-8221`、`dsh-ws-04fe`）——
+ *    那串哈希就是"认不出是谁"的根源，**已废弃**。这里只自动试 `dsh-2`…`dsh-4`
+ *    这种一眼能读的编号；想要 `dsh-dev` / `dsh-fe` 这类**语义后缀**，
+ *    由人显式指定（`preferred`）。
  */
 export function tenantAddressCandidates(workspace: CurrentWorkspace, preferred?: string | null): string[] {
+  void workspace
+  const base = harnessAgentName()
   return [...new Set([
     ...(preferred ? [preferred] : []),
-    deriveAddress(workspace, { tenant: true }),
-    deriveTenantFallback(workspace),
+    base,
+    `${base}-2`,
+    `${base}-3`,
+    `${base}-4`,
   ])]
 }
 

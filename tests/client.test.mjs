@@ -47,6 +47,8 @@ const { renderToStaticMarkup } = require_('react-dom/server')
 // ---------------------------------------------------------------- fake msg9
 
 const seen = { send: [], read: [], readBy: [], processed: [], contactAdd: [], contactRemove: [], ownerAgents: 0, register: 0, inboxLimit: [], provisioned: [], provisionProfiles: [], directory: [], forwarding: [], moveMail: [], signingKeys: [] }
+/** 假服务端认为"已被占用"的本地部分，由各用例显式设置（见上）。 */
+let conflictLocals = new Set()
 const ownerAgents = [{ id: 'oa_a', agent_address: 'dsh-alpha-1a2b@msg9.io', profile: { display_name: 'alpha', description: 'alpha workspace inbox', capabilities: ['code-review'] } }]
 
 const inbox = [
@@ -277,10 +279,11 @@ const server = createServer(async (req, res) => {
     const body = await readBody(req)
     seen.provisioned.push(body.addresses[0])
     seen.provisionProfiles.push(body.profile ?? null)
-    // This local part is already taken: the server reports a 40900 conflict
-    // inside the provision envelope.
-    if (body.addresses[0] === 'taken') {
-      return reply(res, 200, { code: 0, data: { created: [], errors: [{ address: 'taken@vme.msg9.io', code: 40900, message: 'address already taken' }] } })
+    // 冲突集**由各用例显式设置**（`conflictLocals`），不靠隐式顺序 ——
+    // 规范改成"本地部分 = harness 名"之后，本地部分不再随 workspace 名变，
+    // 硬编码某个字面量既不真实也会让用例互相影响。
+    if (conflictLocals.has(body.addresses[0])) {
+      return reply(res, 200, { code: 0, data: { created: [], errors: [{ address: `${body.addresses[0]}@vme.msg9.io`, code: 40900, message: 'address already taken' }] } })
     }
     // The slugged tenant mints addresses on its own domain.
     const domain = req.headers.authorization === 'Bearer msg9_tk_slug_1234567890' ? 'vme.msg9.io' : 'msg9.io'
@@ -351,6 +354,7 @@ const {
   isTrustedRequest,
   createBridgeEventBus,
   readProjectCredentials,
+  harnessAgentName,
 } = await import('../lib/index.js')
 
 const bridge = createMsg9Bridge(defaultBridgeDeps(host))
@@ -1705,6 +1709,37 @@ await check('contacts empty state guides; recipient suggestions filter to 6; pen
   assert.ok(chips.includes('…and 2 more'), 'overflow chip carries the remaining count')
 })
 
+await check('地址规范：Agent 段 = harness 名（含 claude→cc），冲突退到可读后缀', async () => {
+  // 主人 2026-09-30 定案。这三条是**命名规则本身**，钉死免得将来改回去。
+  assert.equal(harnessAgentName(), 'dsh', '本插件跑在 dsh harness 里')
+  assert.equal(harnessAgentName('dsh'), 'dsh')
+  assert.equal(harnessAgentName('kimi'), 'kimi')
+  assert.equal(harnessAgentName('claude'), 'cc', '主人明确：claude 用 cc，不是 claude')
+
+  // 判据：`dsh@项目` 规范；`dsh-2` / `dsh-dev` 这类**可读后缀**也规范；
+  // 拿 workspace 名当 Agent 名（旧规则的产物）不规范。
+  const { groupOf } = client
+  const pod = (extra) => ({ state: 'ready', pod_label: 'dsh', custom: false, expected_agent: 'dsh', ...extra })
+  const base = { key: 'k', title: 't', path: '/p', provisioned: true, stored: true, cursor: null, current: false }
+  const at = (addr) => groupOf({ ...base, address: addr, pod: pod({ pod_form: true, pod_exists: true }) })
+
+  assert.equal(at('dsh@dsh.ice.msg9.io'), 'ok', 'harness 名本身')
+  assert.equal(at('dsh-2@dsh.ice.msg9.io'), 'ok', 'dsh-2 是可读后缀')
+  assert.equal(at('dsh-dev@dsh.ice.msg9.io'), 'ok', 'dsh-dev 是可读后缀')
+  assert.equal(at('diansuan@dsh.ice.msg9.io'), 'noncompliant', 'workspace 名当 Agent 名 = 旧规则')
+  assert.equal(at('vme@dsh.ice.msg9.io'), 'noncompliant')
+  // 历史遗留那种 `dsh-jev-8221`：**Agent 段按前缀规则其实过关**（以 `dsh-` 开头），
+  // 它被判不规范靠的是 **Pod 段不对**（开在 whymyphone pod 下，项目应是 jev）。
+  // ⚠️ 也正因如此，我**没有**加"后缀里带哈希就判死"的启发式 ——
+  // `dsh-2024` 这种正常编号会被误伤，而真正的问题行已经由 Pod 段抓到了。
+  const withPodMismatch = groupOf({
+    ...base,
+    address: 'dsh-jev-8221@whymyphone.ice.msg9.io',
+    pod: pod({ pod_label: 'whymyphone', pod_form: true, pod_exists: true, suggested_label: 'jev' }),
+  })
+  assert.equal(withPodMismatch, 'noncompliant', '开在别的 pod 下（历史遗留丑名字的真实问题在这里）')
+})
+
 await check('按钮规则：目录不存在的行不给「开通」；无记录的行不给「移除记录」', async () => {
   const { canOpen, canRemoveRecord } = client
   const base = { key: 'k', title: 't', path: '/p', address: null, provisioned: false, stored: false, cursor: null, current: false }
@@ -1866,30 +1901,35 @@ await check('tenant mode: setup stores the slug and the preview drops the hash',
   assert.equal(payload.data.owner.slug, 'vme')
   assert.equal(payload.data.owner.mail_domain, 'msg9.io')
 
-  // cwd bucket "/work/t" -> slug "t": too short for msg9's 3-char minimum, so
-  // the preview uses the deterministic `<slug>-<hash4>` fallback.
+  // 2026-09-30 规则变更：子域/租户模式下本地部分是 **harness 名**（`dsh`），
+  // 不再拿 workspace slug 兜底 —— 项目身份由 Pod 段承载。
   const overview = await call(`${BRIDGE_PREFIX}/overview?cwd=${encodeURIComponent(W.t)}`)
   assert.equal(overview.payload.data.owner.slug, 'vme')
-  assert.match(overview.payload.data.current.planned_address, /^t-[0-9a-f]{4}@vme\.msg9\.io$/)
+  assert.equal(overview.payload.data.current.planned_address, 'dsh@vme.msg9.io',
+    '规范形式 = harness 名 @ 项目 Pod 域')
 })
 
-await check('tenant mode: provisioning asks for the readable address first', async () => {
+await check('tenant mode: 开通用的是 harness 名（不是 workspace 名）', async () => {
   const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.t, title: 'tenantws' } })
   assert.equal(payload.data.provisioned, true)
-  assert.ok(payload.data.address.startsWith('tenantws@'), payload.data.address)
-  // No harness prefix: the tenant domain already says whose agent this is.
-  assert.equal(seen.provisioned[seen.provisioned.length - 1], 'tenantws')
+  // 规范地址 = <harness 名>@<项目 Pod>.<org>：这里 harness 是 dsh，pod 域是 vme
+  assert.equal(payload.data.address, 'dsh@vme.msg9.io', 'harness 名做本地部分，项目身份交给 Pod')
+  assert.equal(seen.provisioned[seen.provisioned.length - 1], 'dsh')
 })
 
-await check('tenant mode: a conflicting address falls back to the hashed form', async () => {
+await check('tenant mode: 撞名时退到【可读后缀】dsh-2，不再用带哈希的丑名字', async () => {
+  // 主人 2026-09-30：「如果有多个 dsh，后续可以加 dsh-1、dsh-2 或者 dsh-dev、dsh-fe 这样」
+  // ⇒ 撞名要能兜底，但兜出来的必须是**一眼能读**的名字。
+  // 旧实现退化成 <workspace-slug>-<hash4>（dsh-jev-8221 / dsh-ws-04fe）—— 已废弃。
+  conflictLocals = new Set(['dsh'])
   const before = seen.provisioned.length
   const { payload } = await call(`${BRIDGE_PREFIX}/provision`, { method: 'POST', body: { cwd: W.taken, title: 'taken' } })
   assert.equal(payload.data.provisioned, true)
   const attempts = seen.provisioned.slice(before)
-  assert.equal(attempts.length, 2, 'one conflict, one retry')
-  assert.equal(attempts[0], 'taken')
-  assert.match(attempts[1], /^taken-[0-9a-f]{4}$/)
-  assert.ok(payload.data.address.startsWith('taken-'), payload.data.address)
+  assert.deepEqual(attempts, ['dsh', 'dsh-2'], '一个冲突，一次重试；后缀是可读编号')
+  assert.equal(payload.data.address, 'dsh-2@vme.msg9.io')
+  assert.doesNotMatch(payload.data.address, /-[0-9a-f]{4}@/, '不得再出现哈希后缀')
+  conflictLocals = new Set()
 })
 
 await check('settings section groups workspaces and offers NO one-click migrate', async () => {
@@ -1924,9 +1964,10 @@ await check('tenant migration: legacy inbox is re-provisioned and the old one su
   })
   assert.equal(status, 200)
   assert.equal(payload.data.old_address, 'dsh-alpha-1a2b@msg9.io')
-  assert.ok(payload.data.new_address.startsWith('alpha@'), payload.data.new_address)
+  // 2026-09-30 规则：迁移后的新地址 = harness 名 @ 项目 Pod 域（不再是 workspace slug）
+  assert.equal(payload.data.new_address, 'dsh@vme.msg9.io', payload.data.new_address)
   assert.equal(payload.data.old_disabled, true)
-  assert.equal(seen.provisioned[before], 'alpha', 'tenant-form address requested')
+  assert.equal(seen.provisioned[before], 'dsh', 'tenant-form address requested')
   assert.ok(seen.disabled.includes('dsh-alpha-1a2b@msg9.io'), 'old inbox suspended with the old key')
 
   // v1.9 order: forwarding first (old inbox's own key), then the history move.

@@ -28,6 +28,13 @@ export interface PodStateView {
   /** 该 pod 的 agent 上限（`max_agents`）。 */
   max_agents?: number | null
   /**
+   * 这一行**应有的 Agent 名**（= harness 名，如 `dsh`；claude 用 `cc`）。
+   *
+   * 规范地址 = `<harness 名>@<项目 Pod>.<org>`，所以 Agent 段不是自由命名。
+   * 之前「规范的/不规范的」只查了 Pod 段 —— 是**半条判据**，这里补齐另一半。
+   */
+  expected_agent?: string
+  /**
    * 按 workspace 推导出的「候选 pod」（标题/目录名派生的那个）。
    * 只在**与现址所在 pod 不同**时才有值 —— 用来回答"它开在自己的 pod 里吗"。
    * 注意：候选名 ≠ "就应该叫这个"，它只是一个对照基准。

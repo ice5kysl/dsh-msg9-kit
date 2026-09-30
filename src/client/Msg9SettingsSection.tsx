@@ -261,6 +261,17 @@ export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
   if (row.pod.pod_exists === false) return 'noncompliant'
   // ③ 现址 pod ≠ 应有 pod —— host 只在两者不同时给出 suggested_label，故有值即判
   if (row.pod.suggested_label) return 'noncompliant'
+  // ④ Agent 段必须是 harness 名，或 harness 名 + **可读后缀**
+  //    （主人 2026-09-30：「大多数是 1 个项目 1 个 workspace；如果有多个 dsh，
+  //      后续可以加 dsh-1、dsh-2 或者 dsh-dev、dsh-fe 这样」）。
+  //    所以 `dsh` / `dsh-2` / `dsh-dev` 都算规范；`diansuan@` / `jev@` / `vme@`
+  //    这种**拿 workspace 名当 Agent 名**的才是旧规则的产物。
+  //    之前只查了 Pod 段，是**半条判据** —— 这里补齐另一半。
+  const expectedAgent = row.pod.expected_agent
+  if (expectedAgent && row.address) {
+    const local = row.address.slice(0, row.address.indexOf('@'))
+    if (local !== expectedAgent && !local.startsWith(`${expectedAgent}-`)) return 'noncompliant'
+  }
   return 'ok'
 }
 
@@ -516,6 +527,18 @@ function WorkspaceRow({
               · 名字本身取不出合法 pod 名（纯 ASCII 限制）⇒ 需要人工指定
             注意措辞：这违反的是**本工作区约定**（项目即 pod），
             规范里它只是推荐用法 —— 不把约定说成规范。 */}
+        {/* Agent 段不是 harness 名（规范地址的另一半）。 */}
+        {pod?.expected_agent && row.address
+          && row.address.slice(0, row.address.indexOf('@')) !== pod.expected_agent && (
+          <div style={styles.rowMeta}>
+            <span style={styles.warn}>
+              {L('⚠ Agent 名不是 harness 名（应为「{want}」或「{want}-后缀」）', '⚠ the agent part is not the harness name (expected "{want}" or "{want}-suffix")', { want: pod.expected_agent })}
+            </span>
+            <span style={styles.dim}>
+              {L('（规范地址 = harness 名 @ 项目 Pod；多个 dsh 可加 dsh-2 / dsh-dev 这类可读后缀）', '(compliant = harness name @ project pod; extra dsh inboxes may use readable suffixes like dsh-2 / dsh-dev)')}
+            </span>
+          </div>
+        )}
         {pod?.suggested_label && (
           <div style={styles.rowMeta}>
             <span style={styles.warn}>

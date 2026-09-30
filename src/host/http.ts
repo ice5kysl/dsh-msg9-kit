@@ -63,6 +63,7 @@ import type { OverviewView, PodStateView, WorkspaceHealth, WorkspaceView } from 
 import type { OrgInfo } from './api.ts'
 import {
   deriveAddress,
+  harnessAgentName,
   isValidLocalPart,
   listWorkspaces,
   matchWorkspaceByPath,
@@ -596,6 +597,8 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         domain,
         agents: stats?.agents ?? null,
         max_agents: stats?.max ?? null,
+        // 应有的 Agent 名（harness 名）：判据的另一半，随行给出
+        ...(address ? { expected_agent: harnessAgentName() } : {}),
         // 「应有 pod」只在**与现址不同**时给出 —— 这正是"没开在自己的 pod 里"。
         // 不论候选名有没有语义都给（分类要靠它）；有无语义另用一个字段表达，
         // 好让界面把"ws-89fa 这种名字本来就不合法"和"名字好好的却开错了"分开说。

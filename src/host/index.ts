@@ -76,7 +76,7 @@ export {
   tenantKeyPath,
   writeTenantKey,
 } from './credentials.ts'
-export { listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
+export { harnessAgentName, HARNESS_AGENT_NAMES, listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
 export { loadState, stateFilePath, upsertWorkspaceInbox, withStateLock } from './store.ts'
 export { WakeBudget, createNonReentrant, createWatchRuntime, deliverDaemonBatch, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
 // The watcher daemon's public surface (bin entry + integration tests).

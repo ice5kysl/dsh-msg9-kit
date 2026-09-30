@@ -40,7 +40,7 @@ import {
   type LiveInbox,
   type OwnerState,
 } from './store.ts'
-import { deriveAddress, resolveWorkspace, tenantAddressCandidates, type CallerAgent, type CurrentWorkspace } from './workspace.ts'
+import { deriveAddress, harnessAgentName, resolveWorkspace, tenantAddressCandidates, type CallerAgent, type CurrentWorkspace } from './workspace.ts'
 
 /** A resolved workspace together with its msg9 inbox. */
 export interface InboxContext {
@@ -261,6 +261,7 @@ async function provisionUnderOwner(
     : [deriveAddress(workspace)]
   let lastAddress = candidates[0]!
   let lastReason = 'no agent returned'
+  let lastCode: number | undefined
   for (const address of candidates) {
     lastAddress = address
     const result = await ownerCreateAgents(apiUrl, owner.api_key, [address], { workspace: workspace.title }, profile)
@@ -268,7 +269,20 @@ async function provisionUnderOwner(
     if (created?.api_key) return created
     const first = result.errors?.[0]
     lastReason = first ? `${first.message} (${first.code})` : 'no agent returned'
+    lastCode = first?.code
     if (first?.code !== 40900) break
+  }
+  // 自动编号（dsh-2…dsh-4）也全被占 ⇒ 给一条**可操作**的说明，
+  // 而不是把服务端的 40900 原文甩给用户。
+  // 主人 2026-09-30：允许多个 dsh，但要**可读后缀** —— 剩下的选择是让人显式命名
+  // （`dsh-dev` / `dsh-fe` 这种带语义的），而不是我们替他编更多编号。
+  if (lastCode === 40900 && lastAddress.startsWith(harnessAgentName())) {
+    throw new Error(L(
+      '本项目下「dsh」「dsh-2」「dsh-3」「dsh-4」都已被占用，自动编号用完了。\n'
+      + '请给这个 workspace **显式指定一个可读的 Agent 名**（例如 dsh-dev、dsh-fe）后重试。',
+      'In this project "dsh", "dsh-2", "dsh-3" and "dsh-4" are all taken; auto-numbering is exhausted.\n'
+      + 'Give this workspace an explicit, readable agent name (e.g. dsh-dev, dsh-fe) and retry.',
+    ))
   }
   throw new Error(
     L(
