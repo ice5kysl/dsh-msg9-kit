@@ -1822,20 +1822,23 @@ await check('tenant mode: a conflicting address falls back to the hashed form', 
   assert.ok(payload.data.address.startsWith('taken-'), payload.data.address)
 })
 
-await check('settings section offers migration for legacy inboxes', async () => {
-  // ws-a's inbox predates the slug tenant: it must be flagged legacy, with a
-  // migration target preview.
+await check('settings section lists inboxes under another pod (read-only, no migrate button)', async () => {
+  // ws-a's inbox was opened under a different pod than this instance's domain:
+  // it must be surfaced, **without** offering a one-click migration —
+  // whether to move it depends on which project that workspace belongs to,
+  // which this instance cannot know.
   const overview = await call(`${BRIDGE_PREFIX}/overview`)
   const row = overview.payload.data.workspaces.find((r) => r.key === 'ws-a')
   assert.equal(row.legacy, true)
-  assert.equal(row.planned_address, 'alpha@vme.msg9.io')
 
   const store = client.createMsg9Store({ bridge: client.createBridge({ fetch: bridgeFetch() }), pollMs: 10 ** 9 })
   store.setCwd('/work/a')
   await store.refreshAll()
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
-  assert.ok(html.includes('Migrate to the new tenant'), html)
-  assert.ok(html.includes('alpha@vme.msg9.io'), 'migration target preview')
+  assert.ok(html.includes('Opened under another pod'), html)
+  assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'the misplaced address is shown')
+  // 🔴 关键：**不得**再出现「一键迁移」——把别人的项目的信箱一起搬走是错的。
+  assert.ok(!html.includes('Migrate'), 'no one-click migrate button')
 })
 
 await check('tenant migration: legacy inbox is re-provisioned and the old one suspended', async () => {

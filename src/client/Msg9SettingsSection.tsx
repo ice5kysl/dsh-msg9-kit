@@ -36,10 +36,6 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
     void store.refreshPeers()
   }, [store])
 
-  const provisioned = state.workspaces.filter((row) => row.provisioned)
-  const pending = state.workspaces.filter((row) => !row.provisioned)
-  const peerByAddress = new Map(state.peers.map((peer) => [peer.address, peer]))
-
   return (
     <div style={styles.wrap}>
       <style>{M9_CSS}</style>
@@ -64,50 +60,14 @@ export function Msg9SettingsSection(props: Msg9SettingsSectionProps): JSX.Elemen
       {/* ② 引导创建并录入 ORG key（只绑定，不开 Pod） */}
       <OrgCard state={state} store={store} />
 
-      {/* ③ workspace 清单：基础信息 + 是否开通 Pod + 可点「开通」+ pod slug 可改 */}
+      {/* ③ workspace 清单：基础信息 + Pod 状态 + 「开通」+ pod slug 可改。
+          —— 这一节已完整覆盖"哪些开了、哪些没开"，所以**不再另开
+          「已开通的信箱」与「待开通」两块**：那是同一份数据的第二次陈列，
+          同一批 workspace 出现两次只会让人以为它们是不同的东西。 */}
       <WorkspaceCard state={state} store={store} />
 
-      {provisioned.length > 0 && (
-        <section style={styles.card}>
-          <div style={styles.cardTitle}>{L('已开通的信箱（{n}）', 'Open inboxes ({n})', { n: provisioned.length })}</div>
-          <ul style={styles.list}>
-            {provisioned.map((row) => {
-              const unread = state.unreadByKey[row.key] ?? 0
-              const mailboxSize = state.totalByKey[row.key]
-              const badge = badgeText(unread)
-              const peer = peerByAddress.get(row.address ?? '')
-              return (
-                <li key={row.key} style={styles.row}>
-                  <Mail size={14} style={styles.rowIcon} />
-                  <div style={styles.rowText}>
-                    <div style={styles.rowTitle}>{row.title}</div>
-                    {row.address && <div style={styles.path}>{row.address}</div>}
-                    {peer?.display_name && <div style={styles.role}>{peer.display_name}</div>}
-                  </div>
-                  <div style={styles.rowStats}>
-                    {mailboxSize !== undefined && <span style={styles.dim}>{mailboxSize}</span>}
-                    {badge && <span style={styles.badge}>{badge}</span>}
-                  </div>
-                </li>
-              )
-            })}
-          </ul>
-        </section>
-      )}
-
-      {pending.length > 0 && (
-        <section style={styles.card}>
-          <div style={styles.cardTitle}>{L('待开通（{n}）', 'Awaiting a pod ({n})', { n: pending.length })}</div>
-          <div style={styles.pendingChips}>
-            {pending.map((row) => (
-              <span key={row.key} style={styles.pendingChip}>{row.title}</span>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* 旧租户下开通的信箱：仍提供迁移入口（换绑 ORG 后这条才有内容） */}
-      <MigrationCard state={state} store={store} />
+      {/* 归位提示：列出"开在别的 pod 下"的信箱（**只读判断，不做批量迁移**） */}
+      <PlacementCard state={state} />
     </div>
   )
 }
@@ -469,55 +429,81 @@ export function PendingChips({ titles }: { titles: string[] }): JSX.Element {
   )
 }
 
-/** Tenant switch aftermath: move legacy inboxes to the current tenant. */
-function MigrationCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element | null {
-  const [oldKey, setOldKey] = useState('')
-  const legacyRows = state.workspaces.filter((row) => row.provisioned && row.legacy)
-  // ORG pods report no slug; the tenant domain lives in `address_domain`, so
-  // gating on slug alone hid this card exactly when it was needed.
-  if (!(state.owner?.address_domain || state.owner?.slug) || legacyRows.length === 0) return null
+/**
+ * 归位提示：把"**开在别的 pod 下**"的信箱列出来（只读）。
+ *
+ * 为什么不做「一键迁移」：
+ *   旧实现按「地址域 ≠ 当前 owner 域」判定，然后提供一个批量迁移按钮 ——
+ *   那个判据在 ORG 模型下是错的。规范 `address-format.md` §3 明说
+ *   **「项目即 pod」只是 P1 一种用法，不写成强制**；pod 叫什么由 ORG 决定。
+ *   所以"地址不在某个域里"**本身不代表任何问题** ——
+ *   真正要看的只有一条：**这个信箱是不是开在了一个跟它无关的 pod 下**
+ *   （本机实例：8 条被开进了 `msg9` 这个 pod，7 条被开进了 `whymyphone`，
+ *    而那分别是 msg9.io 项目和 WhyMyPhone 项目的 pod）。
+ *
+ * 而且迁移是**破坏性 + 涉及归属判断**的动作：该不该迁、迁去哪个 pod，
+ * 取决于那个 workspace 属于哪个项目 —— 这件事 dsh 不该替用户猜。
+ * ⇒ 这里只**如实呈现**，把决定留给看到它的人。
+ */
+function PlacementCard({ state }: { state: Msg9State }): JSX.Element | null {
+  // ⚠️ 判据必须是「地址实际落在哪个 pod」，**不是** `pod.pod_label` ——
+  //    后者是"将要/已经使用的 pod"（对未开通的行只是推导出的候选名），
+  //    拿它去比地址段会把正常行误判成异常（我第一版就误报了 5 条）。
+  //    真正的异常只有一种：**地址的域与本实例自己的域不同**。
+  // 本实例的域：优先 ORG 模型的 `address_domain`，退回 `<slug>.<mail_domain>`
+  // （扁平域时两者都没有 ⇒ selfDomain 为 null ⇒ 卡片不渲染，宁可不报也不误报）
+  const selfDomain = state.owner?.address_domain
+    ?? (state.owner?.slug ? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}` : null)
+  const rows = state.workspaces.filter((row) => {
+    if (!row.address || !row.provisioned) return false
+    // 没有自身域可比就无从判断 ⇒ 宁可不报，也不误报
+    if (!selfDomain) return false
+    const domain = row.address.slice(row.address.indexOf('@') + 1)
+    return domain !== selfDomain
+  })
+  if (rows.length === 0) return null
 
   return (
     <section style={styles.card}>
-      <div style={styles.cardTitle}>{L('迁移到新租户（{n}）', 'Migrate to the new tenant ({n})', { n: legacyRows.length })}</div>
+      <div style={styles.cardTitle}>
+        {L('开在别的 Pod 下（{n}）', 'Opened under another pod ({n})', { n: rows.length })}
+      </div>
       <div style={styles.dim}>
         {L(
-          '以下收件箱还开在旧租户下（域名不是 {domain}）。迁移会在新租户下按地址规范重新开通，并给旧地址设置转发（新邮件自动进新信箱，旧地址不会被他人注册）。',
-          'These inboxes still live under the previous tenant (not on {domain}). Migrating re-opens them under the new tenant with the naming spec and sets forwarding on the old address (new mail lands in the new mailbox; the old address stays reserved).',
-          { domain: state.owner.address_domain ?? `${state.owner.slug}.${state.owner.mail_domain ?? 'msg9.io'}` },
+          '这些信箱的地址落在别的 Pod 里（不是本实例自己的域）。'
+          + '地址本身仍然可用，只是归属上不属于本项目 —— 是否迁移、迁去哪个 Pod，取决于那个 workspace 属于哪个项目，请自行判断。',
+          'These inboxes live under another pod (not this instance\'s own domain). They keep working; only the ownership is off. Whether to move them — and to which pod — depends on which project that workspace belongs to, so it is left to you.',
         )}
       </div>
-      <label style={styles.migrateKeyRow}>
-        <span style={styles.dim}>{L('旧租户 key（可选，用于搬运同租户历史邮件并停用旧收件箱）', 'Old tenant key (optional — moves same-tenant history and suspends the old inbox)')}</span>
-        <input
-          className="m9-input"
-          type="password"
-          value={oldKey}
-          autoComplete="off"
-          spellCheck={false}
-          placeholder="msg9_tk_…"
-          onChange={(event) => setOldKey(event.target.value)}
-        />
-      </label>
       <ul style={styles.list}>
-        {legacyRows.map((row) => (
+        {rows.map((row) => (
           <li key={row.key} style={styles.row}>
             <div style={styles.rowText}>
               <div style={styles.rowTitle}>{row.title}</div>
-              <div style={styles.dim}>{row.address}</div>
-              {row.planned_address ? <div style={styles.caps}>→ {row.planned_address}</div> : null}
+              <div style={styles.path}>{row.path}</div>
+              <div style={styles.layerRow}>
+                <span style={styles.layerTag}>{L('现址', 'now')}</span>
+                <code style={styles.code}>{row.address}</code>
+              </div>
+              {row.pod && (
+                <div style={styles.layerRow}>
+                  <span style={styles.layerTag}>{L('归属', 'pod')}</span>
+                  <code style={styles.code}>{row.pod.pod_label}</code>
+                  <span style={styles.dim}>
+                    {L('（该 pod 不是此 workspace 的）', '(not this workspace\'s pod)')}
+                  </span>
+                </div>
+              )}
             </div>
-            <button
-              type="button"
-              className="m9-btn m9-btn-primary"
-              disabled={state.busy.action}
-              onClick={() => void store.migrate(row.key, oldKey || undefined)}
-            >
-              {state.busy.action ? L('迁移中…', 'Migrating…') : L('迁移', 'Migrate')}
-            </button>
           </li>
         ))}
       </ul>
+      <div style={styles.dim}>
+        {L(
+          '注：这里【没有】迁移按钮。旧版本的「一键迁到当前域」会把这些信箱批量搬进本项目的 Pod —— 其中有些属于别的项目（例如 msg9、WhyMyPhone 自己的信箱），那一步不该由本项目代做。',
+          'Note: there is no migrate button here on purpose. The old one-click migration would have swept these into this project\'s pod, including inboxes that belong to other projects.',
+        )}
+      </div>
     </section>
   )
 }
