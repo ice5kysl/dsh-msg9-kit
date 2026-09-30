@@ -12,7 +12,7 @@
  */
 
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
-import { AtSign, FolderOpen } from './icons.tsx'
+import { AtSign, ChevronDown, ChevronRight, FolderOpen } from './icons.tsx'
 import { L } from './locale.ts'
 import { SetupView } from './Msg9Panel.tsx'
 import type { Msg9State, Msg9Store } from './store.ts'
@@ -261,20 +261,25 @@ function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store })
         const isCollapsed = collapsed[group.id] === true
         return (
           <div key={group.id} style={styles.group}>
-            <div style={styles.groupHead}>
-              <button
-                type="button"
-                style={styles.groupBtn}
-                onClick={() => setCollapsed((prev) => ({ ...prev, [group.id]: !prev[group.id] }))}
-                title={isCollapsed ? L('展开', 'Expand') : L('折叠', 'Collapse')}
-              >
-                <span style={styles.groupArrow}>{isCollapsed ? '▸' : '▾'}</span>
+            {/* 整行都是折叠开关：标题 + 说明在左，箭头在最右。
+                箭头用 lucide 的 Chevron（14px）而不是 `▾` 字形 ——
+                那个字形在这个字号下只有 10px 出头，太细看不清。 */}
+            <button
+              type="button"
+              style={styles.groupHead}
+              onClick={() => setCollapsed((prev) => ({ ...prev, [group.id]: !prev[group.id] }))}
+              title={isCollapsed ? L('展开', 'Expand') : L('折叠', 'Collapse')}
+            >
+              <span style={styles.groupHeadText}>
                 <span style={group.warn && rows.length > 0 ? styles.groupTitleWarn : styles.groupTitle}>
                   {L('{label}（{n}）', '{label} ({n})', { label: group.label, n: rows.length })}
                 </span>
-              </button>
-              {group.hint && <span style={styles.dim}>{group.hint}</span>}
-            </div>
+                {group.hint && <span style={styles.dim}>{group.hint}</span>}
+              </span>
+              {isCollapsed
+                ? <ChevronRight size={14} style={styles.groupChevron} />
+                : <ChevronDown size={14} style={styles.groupChevron} />}
+            </button>
             {isCollapsed
               ? null
               : (rows.length === 0
@@ -790,23 +795,26 @@ const styles: Record<string, CSSProperties> = {
   },
   // 分组：每类一个小标题 + 说明，空组也显示「（无）」——"没有问题"本身是信息
   group: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 },
-  groupHead: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' },
-  groupTitle: { fontSize: 12, fontWeight: 600, color: DIM },
-  groupTitleWarn: { fontSize: 12, fontWeight: 600, color: '#d9534f' },
-  groupEmpty: { fontSize: 12, color: DIM, paddingLeft: 2 },
-  // 可点标题栏：看起来像文字，但整条可点（含折叠箭头）
-  groupBtn: {
+  // 整行可点：左（标题+说明）… 右（折叠箭头）
+  groupHead: {
     display: 'flex',
-    alignItems: 'baseline',
-    gap: 4,
-    padding: 0,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    width: '100%',
+    padding: '2px 0',
     border: 'none',
     background: 'transparent',
     color: 'inherit',
     font: 'inherit',
     cursor: 'pointer',
+    textAlign: 'left',
   },
-  groupArrow: { fontSize: 10, color: DIM, width: 10, display: 'inline-block' },
+  groupHeadText: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+  groupChevron: { flexShrink: 0, color: DIM },
+  groupTitle: { fontSize: 12, fontWeight: 600, color: DIM },
+  groupTitleWarn: { fontSize: 12, fontWeight: 600, color: '#d9534f' },
+  groupEmpty: { fontSize: 12, color: DIM, paddingLeft: 2 },
   rowTitle: { fontSize: 13, fontWeight: 500 },
   path: { fontSize: 11, color: DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   rowStats: { display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 },
