@@ -17,6 +17,7 @@ import { L } from './locale.ts'
 import { SetupView } from './Msg9Panel.tsx'
 import type { Msg9State, Msg9Store } from './store.ts'
 import { ACCENT, BORDER, DIM, FG, M9_CSS } from './theme.ts'
+import { badgeText } from './view.ts'
 
 /** Props handed to the section: the injected store (owner prop `close` unused). */
 export interface Msg9SettingsSectionProps {
@@ -325,7 +326,9 @@ function WorkspaceRow({
     <li style={styles.row}>
       <Mail size={14} style={styles.rowIcon} />
       <div style={styles.rowText}>
-        {/* 行 1：workspace · Pod · 域 · 状态 · 用量（紧凑一行） */}
+        {/* 行 1：只有「workspace · Pod · 域」。
+            状态与用量挪到右侧做成两个 pill —— 原先挤在这一行里，
+            四个不同性质的值连成一句，读起来是一团。 */}
         <div style={styles.lineRow}>
           <span style={styles.rowTitle}>{row.title}</span>
           {pod && (
@@ -339,12 +342,6 @@ function WorkspaceRow({
                   <code style={styles.code}>{pod.domain}</code>
                 </>
               )}
-              <span style={pod.state === 'ready' ? styles.ok : styles.warn}>{stateText}</span>
-              <span style={styles.dim}>
-                {pod.agents === null || pod.agents === undefined
-                  ? L('agent —', 'agents —')
-                  : L('{n} / {max} 个信箱', '{n} / {max} inboxes', { n: pod.agents, max: pod.max_agents ?? '—' })}
-              </span>
             </>
           )}
         </div>
@@ -360,7 +357,17 @@ function WorkspaceRow({
               ? <code style={styles.code}>{row.address}</code>
               : <span style={styles.dim}>{L('（未开通）', '(not open)')}</span>}
             {unread > 0 && (
-              <span style={styles.unread}>{L('{n} 未读', '{n} unread', { n: unread })}</span>
+              // 气泡：本信箱的未读数（悬停说明，因为上方的用量是 Pod 级的）
+              <span
+                style={styles.unreadBubble}
+                title={L(
+                  '{address} 这个信箱有 {n} 封未读',
+                  '{address} has {n} unread',
+                  { address: row.address ?? '', n: unread },
+                )}
+              >
+                {badgeText(unread)}
+              </span>
             )}
           </div>
         )}
@@ -418,6 +425,21 @@ function WorkspaceRow({
         )}
       </div>
       <div style={styles.rowStats}>
+        {/* 状态 pill：只在"已开通"或"未配置 ORG"时显示。
+            pod_closed 不显示 —— 右边的「开通」按钮已经说明了。 */}
+        {pod && pod.state === 'ready' && <span style={styles.pillOk}>{stateText}</span>}
+        {pod && pod.state === 'unconfigured' && <span style={styles.pillWarn}>{stateText}</span>}
+        {/* 用量 pill：Pod 级的（该 Pod 下已开信箱数 / 上限），与 Agent 行的未读气泡层级不同 */}
+        {pod && pod.state === 'ready' && (
+          <span
+            style={styles.pillDim}
+            title={L('该 Pod 下已开通的信箱数 / 上限', 'inboxes in this pod / limit')}
+          >
+            {pod.agents === null || pod.agents === undefined
+              ? L('用量未知', 'usage —')
+              : L('{n} / {max} 信箱', '{n} / {max} inboxes', { n: pod.agents, max: pod.max_agents ?? '—' })}
+          </span>
+        )}
         {opening.error && <span style={styles.warn}>{L('开通失败', 'Failed')}</span>}
         {!row.provisioned && (
           <>
@@ -557,8 +579,66 @@ const styles: Record<string, CSSProperties> = {
   rowText: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: '1 1 240px' },
   // 紧凑行：把「workspace · Pod · 域 · 状态 · 用量」排在同一行内（可换行）
   lineRow: { display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap', minWidth: 0 },
-  // 未读数：本信箱的未读，跟在 Agent 地址后面
-  unread: { fontSize: 11, color: ACCENT, fontWeight: 500 },
+  // 未读气泡：本信箱的未读，做成实心小圆泡跟在 Agent 地址后面
+  unreadBubble: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 18,
+    height: 18,
+    padding: '0 6px',
+    borderRadius: 9,
+    background: ACCENT,
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: 600,
+    lineHeight: '18px',
+  },
+  // 小药丸：状态 / 用量。用背景色区分"状态"（有色）与"用量"（中性）
+  pill: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    padding: '1px 7px',
+    borderRadius: 999,
+    fontSize: 11,
+    lineHeight: '16px',
+    whiteSpace: 'nowrap',
+  },
+  pillOk: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    padding: '1px 7px',
+    borderRadius: 999,
+    fontSize: 11,
+    lineHeight: '16px',
+    whiteSpace: 'nowrap',
+    background: 'rgba(45,102,247,0.10)',
+    color: ACCENT,
+    fontWeight: 500,
+  },
+  pillWarn: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    padding: '1px 7px',
+    borderRadius: 999,
+    fontSize: 11,
+    lineHeight: '16px',
+    whiteSpace: 'nowrap',
+    background: 'rgba(217,83,79,0.10)',
+    color: '#d9534f',
+    fontWeight: 500,
+  },
+  pillDim: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    padding: '1px 7px',
+    borderRadius: 999,
+    fontSize: 11,
+    lineHeight: '16px',
+    whiteSpace: 'nowrap',
+    border: `1px solid ${BORDER}`,
+    color: DIM,
+  },
   // 分组：每类一个小标题 + 说明，空组也显示「（无）」——"没有问题"本身是信息
   group: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 },
   groupHead: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' },
