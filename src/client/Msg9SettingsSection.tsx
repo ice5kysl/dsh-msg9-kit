@@ -479,12 +479,9 @@ function WorkspaceRow({
             <FolderOpen size={12} />
           </span>
           <span style={styles.rowTitle}>{row.title}</span>
-          {row.path && (
-            <>
-              <span style={styles.dot}>-</span>
-              <span style={styles.path}>{row.path}</span>
-            </>
-          )}
+          {/* `-` 与路径放**同一个 span**：分开写时 flex 换行会把 `-` 留在上一行
+              尾巴上（截图里就是 `📁 项目3-数字孪生 -` 然后路径单独一行）。 */}
+          {row.path && <span style={styles.path}>- {row.path}</span>}
           {row.health?.pathMissing && (
             <span
               style={styles.warn}
@@ -497,11 +494,11 @@ function WorkspaceRow({
                 //    宿主是旧代码时（客户端 bundle 热更新、宿主没重启）这个字段是
                 //    undefined，默认成注册表对"只在 state 里"的行就是**假话**。
                 ...(row.health.pathSource === 'state'
-                  ? [L('上面这个路径取自 **msg9-kit 的记录**（该工作区已不在 dsh 注册表里）。',
-                       'That path comes from the **msg9-kit record** (this workspace is no longer in the dsh registry).')]
+                  ? [L('上面这个路径取自 msg9-kit 的记录（该工作区已不在 dsh 注册表里）。',
+                       'That path comes from the msg9-kit record (this workspace is no longer in the dsh registry).')]
                   : row.health.pathSource === 'registry'
-                    ? [L('上面这个路径取自 **dsh 的工作区注册表**。',
-                         'That path comes from the **dsh workspace registry**.')]
+                    ? [L('上面这个路径取自 dsh 的工作区注册表。',
+                         'That path comes from the dsh workspace registry.')]
                     : []),
                 // ② 再说它的状态与后果
                 row.address
@@ -547,7 +544,7 @@ function WorkspaceRow({
                   style={styles.warn}
                   title={L(
                     'Agent 段应当是 harness 名「{want}」。规范地址 = harness 名 @ 项目 Pod；'
-                    + '一个项目里有多个 dsh 时，可以加 dsh-2 / dsh-dev 这类**可读**后缀。',
+                    + '一个项目里有多个 dsh 时，可以加 dsh-2 / dsh-dev 这类可读后缀。',
                     'The agent part should be the harness name "{want}". Compliant = harness name @ project pod; '
                     + 'with several dsh inboxes in one project, readable suffixes like dsh-2 / dsh-dev are fine.',
                     { want: pod.expected_agent },

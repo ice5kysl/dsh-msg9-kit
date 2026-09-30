@@ -338,6 +338,11 @@ const workspaces = [
   { id: 'ws-a', title: 'alpha', path: W.a },
   { id: 'ws-b', title: 'beta', path: W.b },
   { id: 'ws-c', title: 'gamma', path: W.c },
+  // ws-dead：目录**故意不存在**（模拟"仓库搬走了"），且 state 里没有它 ⇒
+  // 面板上走 pathMissing + "只在注册表里"那条渲染路径。
+  // 之前把 fixture 换成真实目录后，这条路径**整个失去了测试覆盖** ——
+  // 连带"tooltip 里写 markdown 会原样显示"这种 bug 也测不出来（踩过）。
+  { id: 'ws-dead', title: 'deadrepo', path: join(workRoot, 'gone-repo') },
 ]
 const sessionCwd = { 'sess-a': W.a, 'sess-c': W.c }
 
@@ -469,7 +474,7 @@ await check('bridge: overview resolves the current workspace from a session cwd'
   assert.equal(payload.data.current.key, 'ws-a')
   assert.equal(payload.data.current.address, 'dsh-alpha-1a2b@msg9.io')
   assert.equal(payload.data.owner.name, 'dsh')
-  assert.deepEqual(payload.data.workspaces.map((row) => row.key), ['ws-a', 'ws-b', 'ws-c'])
+  assert.deepEqual(payload.data.workspaces.map((row) => row.key), ['ws-a', 'ws-b', 'ws-c', 'ws-dead'])
   assert.equal(payload.data.workspaces.find((row) => row.key === 'ws-c').provisioned, false)
   // Unprovisioned rows carry the host-derived address preview.
   assert.match(payload.data.workspaces.find((row) => row.key === 'ws-c').planned_address, /^dsh-gamma-[0-9a-f]{4}@/)
@@ -479,7 +484,7 @@ await check('bridge: overview resolves the current workspace from a session cwd'
 await check('bridge: overview without a cwd still lists the tenant', async () => {
   const { payload } = await call(`${BRIDGE_PREFIX}/overview`)
   assert.equal(payload.data.current, null)
-  assert.equal(payload.data.workspaces.length, 3)
+  assert.equal(payload.data.workspaces.length, 4) // a/b/c + ws-dead（目录已不存在的那条）
   assert.match(payload.data.owner.masked, /^msg9_tk_smo…/)
 })
 
@@ -1954,6 +1959,22 @@ await check('settings section groups workspaces and offers NO one-click migrate'
   assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'the address is shown')
   // 🔴 关键：**不得**再出现「一键迁移」——把别的项目的信箱一起搬走是错的。
   assert.ok(!html.includes('Migrate'), 'no one-click migrate button')
+  // 🔴 原生 HTML `title` 是**纯文本**，不渲染 markdown。曾把 `**强调**` 写进 tooltip，
+  //    界面上就原样显示出一对星号（主人截图抓到）。这条护栏防同类复发：
+  //    设置页的所有可见文本里都不该出现 markdown 强调/代码标记。
+  assert.ok(!html.includes('**'), 'no literal markdown emphasis in the settings surface')
+  // 渲染只能覆盖**当前 locale**（测试跑在 en）。而 markdown 常常只写进中文串里，
+  // 于是"英文渲染没问题"会让这条护栏瞎掉 —— 我第一版就栽在这上面。
+  // ⇒ 补一条**源码级**扫描：剥掉注释行后，任何字符串里都不许出现 markdown 标记。
+  const src = await readFile(new URL('../src/client/Msg9SettingsSection.tsx', import.meta.url), 'utf8')
+  const code = src
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, '') // JSX 注释块 {/* … */}（可跨行）
+    .replace(/\/\*[\s\S]*?\*\//g, '')      // 普通块注释
+    .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n') // 行注释
+  assert.ok(!code.includes('**'), 'no markdown emphasis left in code (only comments may carry it)')
+  // 注：**不**检查反引号 —— 在这个文件里它主要是 JS 模板字符串
+  // （`` `1px solid ${BORDER}` ``），正则分不清它和 markdown 代码跨度，
+  // 写了就是一台误报机器（试过，6 条全是模板字符串）。
 })
 
 await check('tenant migration: legacy inbox is re-provisioned and the old one suspended', async () => {
