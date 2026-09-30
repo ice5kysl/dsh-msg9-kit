@@ -1724,8 +1724,12 @@ await check('settings grouping: 4 objective buckets, and "another pod" is NOT no
   assert.equal(groupOf({ ...base, pod: pod({ pod_label: 'dsh', pod_form: true, pod_exists: true }) }), 'ok')
   // ⑥ 探测失败（pod_exists 未知）不得当成"不存在"
   assert.equal(groupOf({ ...base, pod: pod({ pod_form: true }) }), 'ok')
-  // ⑦ 未开通的行（没有 pod 信息）不因为缺字段被判不合规
-  assert.equal(groupOf({ ...base, address: null, provisioned: false, pod: { state: 'pod_closed', pod_label: 'x', custom: false } }), 'ok')
+  // ⑦ 未开通的行单独一组：它还没有归属，既不算合规也不算不合规
+  assert.equal(groupOf({ ...base, address: null, provisioned: false, pod: { state: 'pod_closed', pod_label: 'x', custom: false } }), 'unopened')
+  // ⑦b 连 pod 信息都没有（overview 早期形态）也算未开通，不得落进合规
+  assert.equal(groupOf({ ...base, address: null, provisioned: false }), 'unopened')
+  // ⑦c 但"目录已不存在"优先于"未开通"（故障优先）
+  assert.equal(groupOf({ ...base, address: null, provisioned: false, health: { pathMissing: true, removable: true } }), 'missing')
 })
 
 await check('highlight: an unloaded grammar (```jsonc) degrades to plaintext instead of crashing the panel', async () => {
@@ -1869,10 +1873,11 @@ await check('settings section groups workspaces and offers NO one-click migrate'
   await store.refreshAll()
   const html = renderToStaticMarkup(React.createElement(client.Msg9SettingsSection, { store }))
   // 四个分组标题都在（合规在最上，越需要处理的越往下）
-  for (const label of ['Compliant', 'Non-compliant', 'Problems', 'Gone']) {
+  for (const label of ['Compliant', 'Non-compliant', 'Problems', 'Gone', 'Not opened']) {
     assert.ok(html.includes(label), `group "${label}" rendered`)
   }
-  assert.ok(html.indexOf('Compliant') < html.indexOf('Gone'), '合规的排在最上面，不存在了的在最后')
+  assert.ok(html.indexOf('Compliant') < html.indexOf('Gone'), '合规的排在最上面')
+  assert.ok(html.indexOf('Gone') < html.indexOf('Not opened'), '未开通的排在最后')
   assert.ok(html.includes('dsh-alpha-1a2b@msg9.io'), 'the address is shown')
   // 🔴 关键：**不得**再出现「一键迁移」——把别的项目的信箱一起搬走是错的。
   assert.ok(!html.includes('Migrate'), 'no one-click migrate button')

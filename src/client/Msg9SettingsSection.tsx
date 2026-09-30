@@ -190,44 +190,42 @@ function OrgCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.
  * 让不可用的原因在界面上直接可见。
  */
 /**
- * 一条记录的归类 —— **只用客观判据，不猜意图**。
+ * 一条记录的归类。
  *
  *   missing      目录已不存在（仓库搬走 / 改名，记录成了残留）
  *   problem      与其他记录共用同一个地址
- *   noncompliant 地址没有 pod 归属（扁平域 / ORG 的 Default Pod），
- *                或者它指向的 pod 在 ORG 里不存在（探测成功时才敢这么说）
- *   ok           其余
+ *   noncompliant 已开通，但**没开在自己的 Pod 里**
+ *                （含：地址无 Pod 归属 / Pod 不存在 / 现址 Pod ≠ 应有 Pod）
+ *   unopened     还没有信箱 —— **没有归属可言**，所以既不算合规也不算不合规
+ *   ok           已开通、且开在自己的 Pod 里
  *
- * ⚠️ 刻意**不**把"开在别的 pod 下"算作不合规：规范
- *    `address-format.md` §3 明说「项目即 pod」只是推荐用法之一，
- *    只要求地址形如 <agent>@<pod>.<org>.<base>。归属与直觉一致与否，
- *    取决于用户想要什么粒度 —— 那不是程序能替他判的。
- * 优先级即上序，一行只进一个组。
+ * 优先级即上序（故障优先），一行只进一个组。
+ *
+ * ⚠️「没开在自己的 Pod 里」是**本工作区的约定**（主人 2026-09-30 定：
+ *    一个 workspace 的信箱应开在它自己那个 pod 下）。规范 `address-format.md`
+ *    §3 只说「项目即 pod」是**推荐用法之一**、不强制 —— 措辞上要把两者分开，
+ *    别让人以为那是规范违反。
  */
-export type GroupId = 'missing' | 'problem' | 'noncompliant' | 'ok'
+export type GroupId = 'missing' | 'problem' | 'noncompliant' | 'unopened' | 'ok'
 
 export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
   if (row.health?.pathMissing) return 'missing'
   if (row.health?.duplicateOf) return 'problem'
-  if (row.provisioned && row.pod) {
-    // ① 地址没有 pod 归属（扁平域 / ORG 的 Default Pod）
-    if (row.pod.pod_form === false) return 'noncompliant'
-    // ② 地址指向一个 ORG 里不存在的 pod
-    if (row.pod.pod_exists === false) return 'noncompliant'
-    // ③ ★「没开在自己的 pod 里」—— 主人 2026-09-30 定的本项目约定：
-    //    一个 workspace 的信箱应当开在它自己那个 pod 下（项目即 pod）。
-    //    host 只在"应有 pod ≠ 现址 pod"时给出 suggested_label，故有值即不合规。
-    //    ⚠️ 规范本身只把"项目即 pod"列为**推荐用法**，不强制；
-    //       所以这条是**本工作区的约定**，不是规范违反 —— 措辞上要区分。
-    if (row.pod.suggested_label) return 'noncompliant'
-  }
+  // 还没开通 ⇒ 没有"归属"可言，单独一组（放在最下：它不是故障，只是还没做）
+  if (!row.provisioned || !row.pod) return 'unopened'
+  // ① 地址没有 pod 归属（扁平域 / ORG 的 Default Pod）
+  if (row.pod.pod_form === false) return 'noncompliant'
+  // ② 地址指向一个 ORG 里不存在的 pod
+  if (row.pod.pod_exists === false) return 'noncompliant'
+  // ③ 现址 pod ≠ 应有 pod —— host 只在两者不同时给出 suggested_label，故有值即判
+  if (row.pod.suggested_label) return 'noncompliant'
   return 'ok'
 }
 
 function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store }): JSX.Element {
   const bound = Boolean(state.org)
-  // 组序按主人要求：合规的 → 不合规的 → 有问题的 → 不存在了的。
-  // 越需要处理的越往下 —— 上面是"一切正常"，往下才是要动手的东西。
+  // 组序按主人要求：合规的 → 不合规的 → 有问题的 → 不存在了的 → 未开通的。
+  // 越需要处理的越往下；「未开通的」不是故障，放最后。
   const groups: { id: GroupId; label: string; hint: string | null; warn: boolean }[] = [
     { id: 'ok', label: L('合规的', 'Compliant'), warn: false, hint: null },
     { id: 'noncompliant', label: L('不合规的', 'Non-compliant'), warn: true,
@@ -236,6 +234,8 @@ function WorkspaceCard({ state, store }: { state: Msg9State; store: Msg9Store })
       hint: L('多条记录指向同一个地址', 'several records share one address') },
     { id: 'missing', label: L('不存在了的', 'Gone'), warn: true,
       hint: L('目录已不存在（仓库搬走或改名了）', 'directory no longer exists') },
+    { id: 'unopened', label: L('未开通的', 'Not opened'), warn: false,
+      hint: L('还没有信箱，点「开通」即可', 'no inbox yet — hit "Open pod"') },
   ]
   const byGroup = new Map<GroupId, Msg9State['workspaces']>()
   for (const row of state.workspaces) {
