@@ -308,12 +308,25 @@ export async function readTenantKeyWithSource(): Promise<{ key: string; source: 
   }
   const files = await listTenantKeyFiles()
 
-  // ② pod 模型：`tenants/<pod>-<org>.key`（当 state 里已知当前 pod 时优先）
-  //    规范示例：pod `msg9` + org `ice` ⇒ `tenants/msg9-ice.key`
+  // ② pod 模型：`tenants/<pod>-<org>.key`
+  //    规范示例：pod `dsh` + org `ice` ⇒ `tenants/dsh-ice.key`
   const known = await knownTenantKeyName()
   if (known && files.includes(known)) {
     const key = await readTenantKeyFile(known)
     if (key) return { key, source: `tenants/${known}` }
+  }
+
+  // ②b ORG 已绑定、但 pod label 未显式指定 ⇒ 按"本项目名"猜一个 pod 名试一下。
+  //     理由：ORG 绑定本身就说明了"这个实例属于哪个 ORG"，
+  //     而 pod 名在本项目里是有语义的（P1 项目即 pod ⇒ 通常等于项目/目录名）。
+  //     **只在文件真的存在时才用** —— 猜不到就继续往下走，绝不凭空造 key。
+  const orgLabel = (await loadState()).org?.label
+  if (orgLabel) {
+    const guessed = await guessPodKeyName(orgLabel, files)
+    if (guessed) {
+      const key = await readTenantKeyFile(guessed)
+      if (key) return { key, source: `tenants/${guessed}（按 ORG 绑定的 pod 推导）` }
+    }
   }
 
   // ③ 旧 harness 模型：tenants/dsh.key（存量）
@@ -348,14 +361,43 @@ async function readTenantKeyFile(name: string): Promise<string | undefined> {
 
 /**
  * 当前实例已知的 pod key 文件名（`<pod>-<org>.key`）。
- * 由 state 里的 owner 元数据推导；未知时返回 undefined（退回候选逻辑）。
+ *
+ * 只有**明确知道**自己在用哪个 pod 时才返回文件名：
+ * `state.org.pod_label`（ORG 绑定里的默认 pod）优先，其次 owner 上探测到的
+ * `pod_label`/`org_label`。都不知道 ⇒ undefined ⇒ 退回"多把就报错列候选"。
+ *
+ * ⚠️ 这里踩过一个坑，值得留着：最初只读 owner 上那两个字段时，用户明明在设置里
+ * 绑好了 ORG（写进 `state.org`），但 `owner.pod_label` 要等一次 `/owner/me` 探测
+ * 才有值 —— 于是**绑定成功后仍解析不出 key**，`/overview` 直接抛"key 不唯一"，
+ * 面板表现成"点了没反应"。**绑定成功 ≠ 能被解析出来，两件事都得成立。**
  */
 async function knownTenantKeyName(): Promise<string | undefined> {
   const state = await loadState()
+  const orgLabel = state.org?.label
+  const podFromOrg = state.org?.pod_label
+  if (orgLabel && podFromOrg) return `${sanitizeKey(podFromOrg)}-${sanitizeKey(orgLabel)}.key`
   const label = state.owner?.pod_label
   const org = state.owner?.org_label
   if (!label || !org) return undefined
   return `${sanitizeKey(label)}-${sanitizeKey(org)}.key`
+}
+
+/**
+ * ORG 已绑定但没指定 pod label 时，从**已存在的 key 文件**里挑一个 `<pod>-<org>.key`。
+ *
+ * 为什么不直接报错：用户刚绑完 ORG、还没开 pod，此时 `state.org.pod_label` 是空的；
+ * 而本项目在 `tenants/` 下**确实已经有**正确的那把（`dsh-ice.key`）。
+ * **文件存在 = 事实**，比"猜一个名字"可靠得多，也比"因为没配置就整个页面报错"合理。
+ *
+ * 多个候选时取**字典序第一个**并在返回值里带上 source，让用户看得见用了哪个 ——
+ * 这仍然不是"替你猜租户"（那需要 key 里有租户信息，我们没有），
+ * 而是"按文件名收敛"，且只在确实存在时才生效。
+ */
+async function guessPodKeyName(orgLabel: string, files: string[]): Promise<string | undefined> {
+  const suffix = `-${sanitizeKey(orgLabel)}.key`
+  const matches = files.filter((name) => name.endsWith(suffix))
+  if (matches.length === 0) return undefined
+  return matches.sort()[0]
 }
 
 /**
