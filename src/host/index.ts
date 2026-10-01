@@ -81,9 +81,10 @@ export { loadState, stateFilePath, upsertWorkspaceInbox, withStateLock } from '.
 export { WakeBudget, createNonReentrant, createWatchRuntime, deliverDaemonBatch, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
 // The watcher daemon's public surface (bin entry + integration tests).
 export { DAEMON_PROTOCOL, createDaemon, runDaemon } from './daemon/main.ts'
-export { createEngine, createRegistry, defaultEngineConfig, DeliverHttpError, wsUrlFor } from './daemon/engine.ts'
+export { createEngine, createRegistry, defaultEngineConfig, DeliverHttpError, INSTANCE_STALE_MS, wsUrlFor } from './daemon/engine.ts'
 export type { DeliverBody, Engine, EngineConfig, EngineDeps, Registry, WorkspaceRow } from './daemon/engine.ts'
 export {
+  acceptArchivedBatch,
   backoffMs,
   computeFlushAt,
   daemonHome,
@@ -93,6 +94,7 @@ export {
   openDaemonStore,
   readDaemonInfo,
   removeDaemonInfo,
+  selectOrphanPending,
   writeDaemonInfo,
 } from './daemon/state.ts'
 export { connectWebSocket, encodeFrame, FrameParser, OPCODES, WsConnection, WsError } from './daemon/wsclient.ts'

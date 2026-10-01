@@ -26,7 +26,9 @@ const {
   DAEMON_PROTOCOL,
   DeliverHttpError,
   FrameParser,
+  INSTANCE_STALE_MS,
   OPCODES,
+  acceptArchivedBatch,
   connectWebSocket,
   createDaemon,
   createDaemonClient,
@@ -40,6 +42,7 @@ const {
   openDaemonStore,
   readDaemonInfo,
   removeDaemonInfo,
+  selectOrphanPending,
   writeDaemonInfo,
 } = await import('../lib/index.js')
 
@@ -308,6 +311,156 @@ await check('engine: notify_paused tracks silently (cursor advances, nothing del
     assert.equal(delivered.length, 0)
     assert.equal(store.get().inboxes['pk-1'].batch, undefined)
     assert.equal(store.get().pending.length, 0)
+  } finally {
+    await engine.stop()
+  }
+})
+
+// --------------------------------------------------- orphan pending (T-22)
+
+/**
+ * 注入真实事故的 state 形状：一个 project key 的批次压了很久投不出去。
+ * `ageHours` = 批次年龄；`cursor` = 批次覆盖到的游标（归档时必须跨过去）。
+ */
+async function seedOrphanPending(store, { ageHours, cursor = 'C2' }) {
+  await store.mutate((state) => {
+    state.inboxes['pk-1'] = {
+      address: 'a@msg9.io',
+      api_url: 'http://fake',
+      watch_cursor: 'C1',
+      fetch_cursor: cursor,
+      cursor_seq: 2,
+      acked_seq: 1,
+    }
+    state.pending.push({
+      id: 'orphan-1',
+      project_key: 'pk-1',
+      instance_id: 'inst-dead',
+      messages: [mail('m2')],
+      next_cursor: cursor,
+      cursor_seq: 2,
+      mode: 'followup',
+      downgraded: false,
+      enqueued_at: new Date(Date.now() - ageHours * 3_600_000).toISOString(),
+      attempts: 3,
+      next_retry_at: 0,
+    })
+  })
+}
+
+function orphanCase({ logs }) {
+  return makeEngine({
+    bootstrapPage: { messages: [mail('m0')], next_cursor: 'C1', has_more: false },
+    sincePages: { C2: { messages: [], next_cursor: 'C2', has_more: false } },
+    extraConfig: { orphanPendingTtlMs: 24 * 3_600_000 },
+    ...(logs ? { logs } : {}),
+  })
+}
+
+await check('selectOrphanPending（纯函数）：只有「无 live 注册 + 超阈值」才归档', async () => {
+  const now = Date.parse('2026-10-01T00:00:00.000Z')
+  const item = (projectKey, enqueuedAt) => ({
+    id: `p-${projectKey}-${enqueuedAt}`,
+    project_key: projectKey,
+    messages: [mail('m1')],
+    mode: 'followup',
+    downgraded: false,
+    enqueued_at: enqueuedAt,
+    attempts: 0,
+    next_retry_at: 0,
+  })
+  const old = new Date(now - 25 * 3_600_000).toISOString()
+  const young = new Date(now - 1 * 3_600_000).toISOString()
+  const pending = [
+    item('dead-old', old),
+    item('dead-young', young),
+    item('live-old', old),
+    item('live-young', young),
+  ]
+
+  const { archive, keep } = selectOrphanPending(pending, {
+    now,
+    ttlMs: 24 * 3_600_000,
+    isLive: (projectKey) => projectKey.startsWith('live'),
+  })
+  assert.deepEqual(archive.map((row) => row.project_key), ['dead-old'], '两条必须同时满足才归档')
+  assert.deepEqual(keep.map((row) => row.project_key), ['dead-young', 'live-old', 'live-young'])
+
+  // 保守边界：证明不了年龄就不动手；阈值 ≤ 0 = 关闭扫描（不是"全归档"）。
+  assert.equal(
+    selectOrphanPending([item('dead-old', '不是时间')], { now, ttlMs: 24 * 3_600_000, isLive: () => false }).archive.length,
+    0,
+    'enqueued_at 不可解析 ⇒ 保留',
+  )
+  assert.equal(
+    selectOrphanPending(pending, { now, ttlMs: 0, isLive: () => false }).archive.length,
+    0,
+    'ttlMs ≤ 0 ⇒ 整个扫描关闭',
+  )
+
+  // 归档跨游标用的是与 ack 同一条单调规则：陈旧批次不许把游标拉回去。
+  const inbox = { address: 'a@msg9.io', api_url: 'http://fake', watch_cursor: 'C5', fetch_cursor: 'C5', cursor_seq: 5, acked_seq: 5 }
+  acceptArchivedBatch(inbox, { ...item('pk-x', old), next_cursor: 'C2', cursor_seq: 2 })
+  assert.equal(inbox.watch_cursor, 'C5', '陈旧的归档批次不得回退游标')
+  assert.equal(inbox.acked_seq, 5)
+
+  const forward = { address: 'a@msg9.io', api_url: 'http://fake', watch_cursor: 'C1', fetch_cursor: 'C2', cursor_seq: 2, acked_seq: 1 }
+  acceptArchivedBatch(forward, { ...item('pk-y', old), next_cursor: 'C2', cursor_seq: 2, messages: [mail('m2')] })
+  assert.equal(forward.watch_cursor, 'C2', '归档必须把游标推到批次覆盖的位置')
+  assert.equal(forward.acked_seq, 2)
+  assert.deepEqual(forward.delivered_ids, ['m2'])
+})
+
+await check('orphan pending: 假死 key 的批次超阈值 ⇒ 归档 + 该地址游标能推进（唤醒不再哑）', async () => {
+  const logs = []
+  const { engine, store, registry, delivered, instance } = await orphanCase({ logs })
+  await seedOrphanPending(store, { ageHours: 30 })
+  // 注册过，但实例早已过期（心跳停了）—— 真实事故里的"死 key"。
+  registry.upsert(instance, Date.now() - INSTANCE_STALE_MS - 60_000)
+  try {
+    await engine.start()
+    await waitFor(() => store.get().pending.length === 0)
+    assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C2', '归档后游标必须能越过钉住它的批次')
+    assert.equal(store.get().inboxes['pk-1'].acked_seq, 2)
+    assert.equal(delivered.length, 0, '死实例不该被投递')
+
+    const line = logs.find((entry) => /archived 1 orphan mail\(s\)/.test(entry))
+    assert.ok(line, `归档必须留下日志，实际：${JSON.stringify(logs)}`)
+    assert.match(line, /a@msg9\.io \(pk-1\)/, '日志要说清归档的是谁')
+    assert.match(line, /no live instance for 30(\.\d+)?h \(> 24h reconnect budget\)/, '日志要说清为什么')
+    assert.match(line, /cursor advanced to C2/)
+  } finally {
+    await engine.stop()
+  }
+})
+
+await check('orphan pending: 活跃实例的 pending 再老也不归档（live 注册是否定条件）', async () => {
+  const logs = []
+  const { engine, store, registry, instance } = await orphanCase({ logs })
+  await seedOrphanPending(store, { ageHours: 30 })
+  registry.upsert(instance, Date.now()) // 刚刚心跳过 ⇒ live
+  try {
+    await engine.start()
+    await sleep(200)
+    assert.equal(store.get().pending.length, 1, '有 live 实例 ⇒ 不得归档')
+    assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1', '不得越过未投递的批次')
+    assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
+  } finally {
+    await engine.stop()
+  }
+})
+
+await check('orphan pending: 失活但未超阈值的批次不归档（正常重连窗口，本卡最关键的边界）', async () => {
+  const logs = []
+  const { engine, store, registry, instance } = await orphanCase({ logs })
+  await seedOrphanPending(store, { ageHours: 2 }) // 2h < 24h：还在重连预算里
+  registry.upsert(instance, Date.now() - INSTANCE_STALE_MS - 60_000)
+  try {
+    await engine.start()
+    await sleep(200)
+    assert.equal(store.get().pending.length, 1, '未超阈值 ⇒ 必须留着等实例回来')
+    assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1', '重连窗口里游标必须原地等')
+    assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
   } finally {
     await engine.stop()
   }

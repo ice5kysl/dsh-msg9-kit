@@ -28,15 +28,25 @@ import { connectWebSocket, type WsConnection } from './wsclient.ts'
 import type { DaemonIdentity } from './identity.ts'
 import {
   backoffMs,
+  acceptArchivedBatch,
   computeFlushAt,
   knownMessageIds,
   mergeDeliveredIds,
+  selectOrphanPending,
   type DaemonState,
   type DaemonStore,
   type PendingItem,
 } from './state.ts'
 
 // ------------------------------------------------------------------- registry
+
+/**
+ * How long a registration may go without a heartbeat before it counts as
+ * expired. 45s heartbeat (daemonclient.ts) ⇒ three missed beats; shared by the
+ * control server's pruneStale() and by the orphan-pending sweep, so "live" means
+ * exactly one thing in both places.
+ */
+export const INSTANCE_STALE_MS = 3 * 60_000
 
 export interface WorkspaceRow {
   project_key: string
@@ -131,6 +141,15 @@ export interface EngineConfig {
   pendingSweepMs: number
   /** Bound per-inbox pending items (overflow is safe: cursor never advanced). */
   pendingCap: number
+  /**
+   * DM-3 orphan guard（T-22）：project key 已无 live 注册、且批次压了超过这个
+   * 时长的 pending 会被**归档**（游标跨过去 + 日志 + 计数），而不是把
+   * **该地址**的游标永久钉死（真实漏信事故的根因）。
+   *
+   * 必须**远大于重连预算**（心跳 45s、实例过期 3min、重连退避上限 30s）：
+   * 正常重连窗口里压住的批次绝不能进归档。默认 24h。`<= 0` = 关闭扫描。
+   */
+  orphanPendingTtlMs: number
   fetchPageLimit: number
   fetchMaxPages: number
   unprocessedMaxPages: number
@@ -151,6 +170,9 @@ export function defaultEngineConfig(): EngineConfig {
     wakeWindowMs: 30 * 60_000,
     pendingSweepMs: 60_000,
     pendingCap: 50,
+    // 24h ≫ 重连预算（心跳 45s / 实例过期 3min / 退避上限 30s）：正常重连窗口
+    // 里的 pending 绝不会被误判成孤儿。真实事故里的死 key 压了整整两天。
+    orphanPendingTtlMs: 24 * 60 * 60_000,
     fetchPageLimit: 20,
     fetchMaxPages: 10,
     unprocessedMaxPages: 50,
@@ -757,6 +779,60 @@ export function createEngine(deps: EngineDeps): Engine {
   let replaying = false
   let stopped = false
 
+  /** Is some live (registered AND recently heartbeated) instance claiming this key? */
+  const hasLiveRegistration = (projectKey: string, now: number): boolean => {
+    const instance = deps.registry.forProjectKey(projectKey)
+    return instance !== undefined && now - instance.last_seen < INSTANCE_STALE_MS
+  }
+
+  /**
+   * DM-3 孤儿批次归档（T-22 的最小止血）。
+   *
+   * 只归档同时满足「该 project key 无 live 注册」**且**「批次超过
+   * `orphanPendingTtlMs`」的 pending（判定是纯函数：state.ts 的
+   * `selectOrphanPending`）。归档 = 从 pending 摘掉 + 用同一个单调规则把该 inbox
+   * 的游标跨过去（`acceptArchivedBatch`）+ 记日志与计数 —— 于是**该地址的游标
+   * 不再被死 key 钉住**，唤醒链路能继续推进。
+   *
+   * 邮件本体不在这里删：它仍在服务器 inbox 上（folder=unprocessed），可读、可回捞；
+   * 被放弃的只是"对这个再也不会出现的实例做投递唤醒"。
+   */
+  const sweepOrphanPending = async (): Promise<void> => {
+    const now = deps.now()
+    const ttl = deps.config.orphanPendingTtlMs
+    const { archive } = selectOrphanPending(deps.store.get().pending, {
+      now,
+      ttlMs: ttl,
+      isLive: (projectKey) => hasLiveRegistration(projectKey, now),
+    })
+    if (archive.length === 0) return
+
+    await deps.store.mutate((state) => {
+      const archivedIds = new Set(archive.map((item) => item.id))
+      state.pending = state.pending.filter((item) => !archivedIds.has(item.id))
+      for (const item of archive) {
+        const inbox = state.inboxes[item.project_key]
+        if (inbox) acceptArchivedBatch(inbox, item)
+      }
+    })
+
+    // 日志必须能回答「归档了谁的多少条、为什么」。
+    const state = deps.store.get()
+    const ttlHours = Math.round(ttl / 3_600_000)
+    for (const key of [...new Set(archive.map((item) => item.project_key))]) {
+      const items = archive.filter((item) => item.project_key === key)
+      const mails = items.reduce((total, item) => total + item.messages.length, 0)
+      const oldest = Math.min(...items.map((item) => Date.parse(item.enqueued_at)).filter(Number.isFinite))
+      const ageHours = Number.isFinite(oldest) ? Math.round(((now - oldest) / 3_600_000) * 10) / 10 : '?'
+      const inbox = state.inboxes[key]
+      deps.log(
+        `msg9 daemon: archived ${mails} orphan mail(s) in ${items.length} batch(es) for `
+        + `${inbox?.address ?? key} (${key}): no live instance for ${ageHours}h (> ${ttlHours}h reconnect budget); `
+        + `cursor advanced to ${inbox?.watch_cursor ?? '?'} — this address is no longer pinned`,
+      )
+    }
+  }
+
   const reconcile = async (): Promise<void> => {
     const identities = await deps.enumerate()
     const next = new Map(identities.map((identity) => [identity.project_key, identity]))
@@ -845,8 +921,16 @@ export function createEngine(deps: EngineDeps): Engine {
 
   return {
     async start() {
+      // 先清孤儿批次，再拉起 runner：死 key 的 pending 会先把游标钉死，晚清一步
+      // 就等于让新进程从同一个哑掉的位置开始（真实事故的形态）。
+      await sweepOrphanPending()
       await reconcile()
-      reconcileTimer = setInterval(() => void reconcile().catch((error) => deps.log(`msg9 daemon: reconcile failed: ${(error as Error)?.message ?? String(error)}`)), deps.config.reconcileMs)
+      // 安全网跳：运行期间新产生的孤儿批次（实例在此期间死掉）也按同一规则清掉。
+      reconcileTimer = setInterval(() => {
+        void reconcile()
+          .then(() => sweepOrphanPending())
+          .catch((error) => deps.log(`msg9 daemon: reconcile failed: ${(error as Error)?.message ?? String(error)}`))
+      }, deps.config.reconcileMs)
       sweepTimer = setInterval(() => void replayPending(), deps.config.pendingSweepMs)
     },
     async stop() {

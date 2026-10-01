@@ -226,6 +226,62 @@ export function mergeDeliveredIds(existing: string[] | undefined, acked: string[
   return merged.length > cap ? merged.slice(merged.length - cap) : merged
 }
 
+/**
+ * DM-3 的**孤儿批次**判定（纯函数，便于单测）。
+ *
+ * 真实故障（2026-09-30，T-22）：state 里可以同时存在两个 project key 指向
+ * **同一个地址** —— 一个是活跃实例，另一个是**再也不会注册**的死实例。按 DM-3
+ * 「pending 非空 ⇒ 游标不推进」，死 key 上投不出去的批次会把**该地址**的游标
+ * 永久钉死 ⇒ 唤醒链路静默哑掉（`/healthz` 一切正常、spool 照写，只有收信人
+ * 发现自己漏读了 4 封信）。
+ *
+ * 归档条件必须**同时**满足两条，缺一不可：
+ *
+ *   1. `isLive(project_key)` 为假 —— 注册表里没有该实例，或它的 `last_seen`
+ *      已过期（见 `INSTANCE_STALE_MS`）；
+ *   2. 批次已经压了 **>= ttlMs**（默认 24h）。
+ *
+ * 阈值必须**远大于重连预算**（心跳 45s、实例过期 3min、重连退避上限 30s）：
+ * 「正常重连窗口里被压住的批次」**绝不能**被归档 —— 那正是投递语义「不丢信」
+ * 赖以成立的部分。24h 是"这个实例一整天都没露过面"的粗判，宁可少归档、不可误归档。
+ *
+ * 两个保守边界：`enqueued_at` 不可解析 ⇒ 保留（证明不了年龄就不动手）；
+ * `ttlMs <= 0` ⇒ 整个扫描关闭（配置写成 0 的人想要的是"别动"，不是"全归档"）。
+ */
+export function selectOrphanPending(
+  pending: readonly PendingItem[],
+  options: { now: number; ttlMs: number; isLive: (projectKey: string) => boolean },
+): { archive: PendingItem[]; keep: PendingItem[] } {
+  if (!Number.isFinite(options.ttlMs) || options.ttlMs <= 0) return { archive: [], keep: [...pending] }
+  const archive: PendingItem[] = []
+  const keep: PendingItem[] = []
+  for (const item of pending) {
+    const enqueuedAt = Date.parse(item.enqueued_at)
+    const oldEnough = Number.isFinite(enqueuedAt) && options.now - enqueuedAt >= options.ttlMs
+    if (!options.isLive(item.project_key) && oldEnough) archive.push(item)
+    else keep.push(item)
+  }
+  return { archive, keep }
+}
+
+/**
+ * 把一个已归档批次"跨过去"：把游标推进到它覆盖的位置，语义与投递成功后的 ack
+ * 完全一致（同一单调规则：陈旧批次永不回退 `acked_seq` / `watch_cursor`），
+ * 并把它的消息 id 记进去重环，避免下一次回捞又把它们当成新信塞回队列。
+ *
+ * 与 `InboxRunner.commitCursor`（engine.ts）是同一条规则的第二个入口 —— 改动时
+ * 两处必须一起看。
+ */
+export function acceptArchivedBatch(inbox: DaemonInboxState, item: PendingItem): void {
+  const atSeq = item.cursor_seq ?? inbox.cursor_seq ?? 0
+  if (atSeq >= (inbox.acked_seq ?? 0)) {
+    if (item.next_cursor) inbox.watch_cursor = item.next_cursor
+    else if (inbox.fetch_cursor) inbox.watch_cursor = inbox.fetch_cursor
+    inbox.acked_seq = atSeq
+  }
+  inbox.delivered_ids = mergeDeliveredIds(inbox.delivered_ids, item.messages.map((message) => message.message_id))
+}
+
 /** The dedupe set for intake: acked ids + in-flight batch + queued redeliveries. */
 export function knownMessageIds(state: DaemonState, projectKey: string): Set<string> {
   const inbox = state.inboxes[projectKey]

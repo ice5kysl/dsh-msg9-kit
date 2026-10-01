@@ -20,7 +20,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { timingSafeEqual } from 'node:crypto'
-import type { Engine, InstanceRegistration, Registry, WorkspaceRow } from './engine.ts'
+import { INSTANCE_STALE_MS, type Engine, type InstanceRegistration, type Registry, type WorkspaceRow } from './engine.ts'
 import type { DaemonStore } from './state.ts'
 
 export interface ControlServerDeps {
@@ -98,7 +98,9 @@ function parseWorkspaces(value: unknown): WorkspaceRow[] {
 }
 
 export function startControlServer(deps: ControlServerDeps): Promise<ControlServer> {
-  const staleAfterMs = 3 * 60_000
+  // 「实例过期」只有一处定义（engine.ts）：pruneStale 与孤儿 pending 归档必须
+  // 对"什么算 live"给出同一个答案，否则两条规则会各自漂移。
+  const staleAfterMs = INSTANCE_STALE_MS
 
   const pruneStale = (): void => {
     const now = Date.now()
