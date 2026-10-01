@@ -24,6 +24,17 @@ state file.
 
 ## Compatibility
 
+## v0.5.0 — the two silent failures in the wake path, fixed at the root
+
+This release exists because of an external field report: msg9's PO sweep found our watcher **not reconnecting for 90 minutes after a WS drop**, with the spool frozen and **no self-healing or self-reporting at all**. Digging in turned up **two defects of the same family** — both are "failure and normal look identical from the outside":
+
+1. **Lost-wakeup race in the doorbell (T-21)**: the WS loop armed its close-waiter *after* the catch-up pass. When the server closed the socket inside that window (a restart/release is exactly that case), the close handler was a **no-op**, so the loop awaited a promise nobody would ever resolve — and the watchdog had already been cleared on the same path ⇒ **a permanent, silent hang** while `/healthz` kept answering 200. Fix: arm the waiter *before* `attachWs`, re-check whether the connection was swapped after catch-up, reconcile a socket that died before its handler was installed, log every close, and send the child's stdout/stderr to `<daemon home>/daemon.log` (it used to be `stdio:'ignore'` ⇒ /dev/null).
+2. **Orphaned pending pinning the address cursor (T-22)**: an undeliverable batch on a **dead project key** — combined with DM-3's "pending non-empty ⇒ the cursor does not advance", which is scoped to the **address** — **pinned that address's cursor forever**, silencing the wake path (it cost me four unread letters). Fix: on start and on the safety-net tick, archive "**no live registration + older than 24h**" batches and step the cursor past them, with a log line explaining why; the threshold is far beyond the reconnect budget — **better to archive too little than to archive wrongly**.
+
+The same batch also carries the collaboration-surface work (P1): the settings page and the ORG→Pod→Agent organisation view.
+
+**Two wake-path rules for future me**: ① the doorbell is **best-effort** and the ledger/server inbox is the source of truth ⇒ "no wake" ≠ "no mail", check `--folder unprocessed`; ② whether the cursor advanced is **not** the criterion (a non-empty pending deliberately holds it) — the criterion is **whether pending is being consumed**.
+
 - **dsh ≥ 0.1.7** — fully supported since **v0.4.7**: mail notices are injected with the v4 producer-owned source kind (`plugin:msg9-kit`) — the retired `kind:"plugin"` wrapper crashed the running turn under 0.1.7's persistence validation. The Messages panel resolves the session cwd from the `sessionId` slot prop (0.1.7 removed `current` from the session list state; the legacy field remains as a fallback for older hosts).
 
 ## Entry points

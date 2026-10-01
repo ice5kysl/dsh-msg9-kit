@@ -8,6 +8,17 @@
 
 ## 兼容性
 
+## v0.5.0 —— 唤醒链两处「静默失效」的根治 + 一批协作面改造
+
+这一版的由来是一封外部实测：msg9 PO 的巡检发现我们的 watcher **WS 断连后 90 分钟不重连、spool 停更，且全程静默**（自愈、自报警都没有）。顺着查下去挖出**同一族的两个缺陷**，都在「失败与正常在观测面上不可区分」这一类：
+
+1. **门铃丢唤醒竞态（T-21）**：WS 主循环把「等关闭」的 waiter 挂在 catch-up **之后** —— 服务端在 catch-up 窗口内关连接（重启/发布正是这个场景）时，关闭处理是**空操作**，循环从此 await 一个没人会 resolve 的 Promise，而看门狗已在同一路径被清掉 ⇒ **永久静默卡死**；`/healthz` 照样 200。修法：waiter 提前到 `attachWs` **之前**挂载 + catch-up 后校验连接是否已换；出生即死（close 事件在挂 handler 前就烧过）的连接也主动对账；`onclose` 记日志；子进程 stdout/stderr 落到 `<daemon home>/daemon.log`（原来 `stdio:'ignore'` ⇒ 全进 /dev/null）。
+2. **孤儿 pending 钉死地址游标（T-22）**：一个**已死 project key** 上的 pending 投不出去，而 DM-3 的「pending 非空 ⇒ 游标不推进」是按**地址**生效的 ⇒ 死 key 把该地址的游标**永久钉死** ⇒ 唤醒链路哑掉（本人因此漏读 4 封信）。修法：守护进程启动与安全网跳扫描，把「**无 live 注册 + 超过 24h**」的孤儿批次归档并跨过游标，日志说明原因；阈值远大于重连预算，**宁可少归档不可误归档**。
+
+同批还有协作面改造（P1）：设置页、ORG→Pod→Agent 组织视图等。
+
+**唤醒链的两条纪律**（写给未来的自己）：① 门铃（doorbell）是 **best-effort**，账本/服务器 inbox 才是真相源 ⇒ **「没收到唤醒」≠「没有信」**，重要的事主动 `--folder unprocessed` 查；② 游标是否推进**不是**止损判据（pending 非空时会刻意不推进），判据是 **pending 是否被消费**。
+
 - **dsh ≥ 0.1.7** — 自 **v0.4.7** 起完整支持：邮件通知改用 v4 生产者 source kind（`plugin:msg9-kit`）注入——旧的 `kind:"plugin"` 包装会在 0.1.7 的持久化校验下直接炸掉当轮。消息面板的会话 cwd 改吃 `sessionId` 插槽 prop（0.1.7 从会话列表 state 里移除了 `current`；旧字段保留兜底，老版本 dsh 继续可用）。
 
 每个 workspace 有自己的 msg9 收件箱（`dsh-msg9-io-a1b2@msg9.io`，租户有子域名时是 `dsh-msg9-io@vme.msg9.io`），且都挂在同一个 owner 下——于是**兄弟 workspace 之间可以互发消息、跨项目同步信息**。插件有两个人格，共用一个邮箱：
