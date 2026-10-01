@@ -100,6 +100,44 @@ export {
 export { connectWebSocket, encodeFrame, FrameParser, OPCODES, WsConnection, WsError } from './daemon/wsclient.ts'
 export { enumerateIdentities } from './daemon/identity.ts'
 export { createDaemonClient, daemonInstanceId } from './daemonclient.ts'
+// T-13 二期第一阶段：平台账本（spool）消费者骨架 —— 只读契约 + 纯函数判据。
+// 本阶段没有任何调用方切到它（投递路径仍是 watch.ts），导出是为了让测试与
+// 后续阶段（以及 msg9_status 的滞后读数）有稳定的公共面。
+export {
+  DEFAULT_CONSUMER,
+  DEFAULT_LAG_TOPUP_MS,
+  LEDGER_SCHEMA_VERSION,
+  SEEN_RING_CAP,
+  assertConsumerName,
+  computeCursorLag,
+  consumerCursorPath,
+  createLedgerConsumer,
+  decideTopUp,
+  ledgerPath,
+  mergeSeenIds,
+  parseLedgerLine,
+  parseLedgerLines,
+  readConsumerCursor,
+  readConsumerLag,
+  readLedger,
+  selectFreshEvents,
+  selectTopUpMessages,
+  spoolDir,
+  writeConsumerCursor,
+} from './ledger.ts'
+export type {
+  CursorLag,
+  DaemonHealth,
+  FreshSelection,
+  LedgerConsumer,
+  LedgerConsumerDeps,
+  LedgerEvent,
+  LedgerParse,
+  LedgerPoll,
+  TopUpDecision,
+  TopUpInput,
+  TopUpReason,
+} from './ledger.ts'
 
 /** The slice of `@deepseek-ai/dsh-host-webserver` this plugin uses. */
 interface WebServerLike {

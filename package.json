@@ -63,7 +63,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node scripts/test-all.mjs smoke client cordis watch watch-integration host-fixes credentials explicit-provision relink org-pod daemon",
+    "test": "node scripts/test-all.mjs smoke client cordis watch watch-integration host-fixes credentials explicit-provision relink org-pod daemon ledger",
     "prepare": "npm run build",
     "prepack": "npm run build"
   },
