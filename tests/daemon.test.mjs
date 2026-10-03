@@ -352,7 +352,9 @@ function orphanCase({ logs }) {
   return makeEngine({
     bootstrapPage: { messages: [mail('m0')], next_cursor: 'C1', has_more: false },
     sincePages: { C2: { messages: [], next_cursor: 'C2', has_more: false } },
-    extraConfig: { orphanPendingTtlMs: 24 * 3_600_000 },
+    // T-33 ①：归档扫描**不再**挂在 start() 的首扫上，只由 reconcile 跳驱动 ⇒
+    // 测试把这一跳调快（默认 60s）才能观察归档；生产里首扫窗口因此不存在。
+    extraConfig: { orphanPendingTtlMs: 24 * 3_600_000, reconcileMs: 120 },
     ...(logs ? { logs } : {}),
   })
 }
@@ -418,6 +420,7 @@ await check('orphan pending: 假死 key 的批次超阈值 ⇒ 归档 + 该地�
   // 注册过，但实例早已过期（心跳停了）—— 真实事故里的"死 key"。
   registry.upsert(instance, Date.now() - INSTANCE_STALE_MS - 60_000)
   try {
+    // 归档现在发生在 reconcile 跳（orphanCase 里 120ms 一跳），不再是 start() 首扫。
     await engine.start()
     await waitFor(() => store.get().pending.length === 0)
     assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C2', '归档后游标必须能越过钉住它的批次')
@@ -428,7 +431,39 @@ await check('orphan pending: 假死 key 的批次超阈值 ⇒ 归档 + 该地�
     assert.ok(line, `归档必须留下日志，实际：${JSON.stringify(logs)}`)
     assert.match(line, /a@msg9\.io \(pk-1\)/, '日志要说清归档的是谁')
     assert.match(line, /no live instance for 30(\.\d+)?h \(> 24h reconnect budget\)/, '日志要说清为什么')
+    assert.match(line, /batches \[orphan-1\]/, '日志必须带上批次 id（T-33 ②：事后追查归档了哪些批次）')
+    assert.match(line, /mails \[m2\]/, '日志必须带上邮件 id 列表（否则只能拿服务器 inbox 反查）')
     assert.match(line, /cursor advanced to C2/)
+  } finally {
+    await engine.stop()
+  }
+})
+
+await check('orphan pending ①：注册表构造性为空时绝不归档（daemon 重启窗口，实例随后注册也不得误伤）', async () => {
+  // T-33 ① 的真实形态：daemon 重启后注册表是**内存**的、构造性为空（main.ts：
+  // startControlServer → engine.start → 最后才写 daemon.json），而客户端最快也要
+  // 等下一次心跳（45s）才会重新注册。旧实现把归档扫描挂在 start() 首扫上 ——
+  // 那一刻 hasLiveRegistration 对一切 key 都是 false，于是一个**活着但没开会话**
+  // 的实例（投递连续 409 ⇒ pending 隔夜压过 24h）会被整批归档：那些信从此不再
+  // 唤醒任何人（服务器 inbox 里还在，只是本 daemon 的游标跨了过去）。
+  const logs = []
+  const { engine, store, registry, instance } = await orphanCase({ logs })
+  await seedOrphanPending(store, { ageHours: 30 })
+  try {
+    await engine.start()
+    // 注册表仍为空：跑够几跳 sweep（orphanCase 里 120ms 一跳）也不得动手 ——
+    // "从没被填充过的注册表"不构成"这些 key 都死了"的证据。
+    await sleep(300)
+    assert.equal(store.get().pending.length, 1, '空注册表不是证据：>24h 的 pending 绝不能在启动窗口被归档')
+    assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1', '不得越过未投递的批次')
+    assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
+
+    // 实例随后注册（真实节奏：45s 心跳内重注册）⇒ live，同样不得归档。
+    registry.upsert(instance, Date.now())
+    await sleep(300)
+    assert.equal(store.get().pending.length, 1, 'live 注册出现后，再老的 pending 也必须留给它投递')
+    assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1')
+    assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
   } finally {
     await engine.stop()
   }

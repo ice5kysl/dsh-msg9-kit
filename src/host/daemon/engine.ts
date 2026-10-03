@@ -41,10 +41,15 @@ import {
 // ------------------------------------------------------------------- registry
 
 /**
- * How long a registration may go without a heartbeat before it counts as
- * expired. 45s heartbeat (daemonclient.ts) ⇒ three missed beats; shared by the
- * control server's pruneStale() and by the orphan-pending sweep, so "live" means
- * exactly one thing in both places.
+ * 心跳过期阈值：心跳节奏 45s（daemonclient.ts）⇒ 3 个漏拍。
+ *
+ * 它只是「最近有没有心跳」这**一个**判据。共用这个常量的两条规则并不因此
+ * 对"什么算 live"给出同一个答案，这是有意的：
+ *   - 本文件的孤儿 pending 归档（`hasLiveRegistration`）把它当**唯一**条件 ——
+ *     最近心跳过就算 live（乐观：宁可不归档，也不能把还活着的实例的信跨过去）；
+ *   - server.ts 的 pruneStale() 还要求**端口拒连**才摘掉注册表条目（悲观：
+ *     摘错一条注册会让投递找不到人，所以要多一份证据）。
+ * 两处共享的是"多久算心跳过期"这个数字，不是完整的 live 判据。
  */
 export const INSTANCE_STALE_MS = 3 * 60_000
 
@@ -143,7 +148,7 @@ export interface EngineConfig {
   pendingCap: number
   /**
    * DM-3 orphan guard（T-22）：project key 已无 live 注册、且批次压了超过这个
-   * 时长的 pending 会被**归档**（游标跨过去 + 日志 + 计数），而不是把
+   * 时长的 pending 会被**归档**（游标跨过去 + 一行日志），而不是把
    * **该地址**的游标永久钉死（真实漏信事故的根因）。
    *
    * 必须**远大于重连预算**（心跳 45s、实例过期 3min、重连退避上限 30s）：
@@ -771,6 +776,14 @@ interface EngineContext {
   identities: Map<string, DaemonIdentity>
 }
 
+/**
+ * 把一串 id 压成一行可读摘要：不超过 `cap` 个就全列，超了列前 `cap` 个 + `+N`
+ * （归档日志带上批次/邮件 id 用，见 T-33 ②；限长是为了日志永远只有一行）。
+ */
+function summarizeIds(ids: string[], cap = 5): string {
+  return ids.length <= cap ? ids.join(', ') : `${ids.slice(0, cap).join(', ')}, +${ids.length - cap}`
+}
+
 export function createEngine(deps: EngineDeps): Engine {
   const context: EngineContext = { deps, identities: new Map() }
   const runners = new Map<string, InboxRunner>()
@@ -778,8 +791,22 @@ export function createEngine(deps: EngineDeps): Engine {
   let sweepTimer: ReturnType<typeof setInterval> | undefined
   let replaying = false
   let stopped = false
+  /**
+   * 本进程是否**见过**至少一次注册/心跳。
+   *
+   * 注册表是内存的（createRegistry），进程刚起来时它构造性为空 —— 那时
+   * `registry.list()` 为空**不能**推出"这些 key 都是死的"（客户端还没轮到
+   * 重注册，心跳 45s 一轮）。一旦见过注册，此后"某 key 无注册"才是证据。
+   */
+  let sawRegistration = false
 
-  /** Is some live (registered AND recently heartbeated) instance claiming this key? */
+  /**
+   * 该 key 是否有"最近心跳过"的实例。
+   *
+   * 乐观判据：**只看 last_seen**，不做端口探活 —— 摘掉还活着的实例的 pending
+   * 等于把信跨过去（永久不再唤醒），代价远大于多留一条 pending。与 pruneStale
+   * （还要端口拒连）的差别见 `INSTANCE_STALE_MS` 的注释。
+   */
   const hasLiveRegistration = (projectKey: string, now: number): boolean => {
     const instance = deps.registry.forProjectKey(projectKey)
     return instance !== undefined && now - instance.last_seen < INSTANCE_STALE_MS
@@ -791,13 +818,28 @@ export function createEngine(deps: EngineDeps): Engine {
    * 只归档同时满足「该 project key 无 live 注册」**且**「批次超过
    * `orphanPendingTtlMs`」的 pending（判定是纯函数：state.ts 的
    * `selectOrphanPending`）。归档 = 从 pending 摘掉 + 用同一个单调规则把该 inbox
-   * 的游标跨过去（`acceptArchivedBatch`）+ 记日志与计数 —— 于是**该地址的游标
-   * 不再被死 key 钉住**，唤醒链路能继续推进。
+   * 的游标跨过去（`acceptArchivedBatch`）+ 一行日志 —— 于是**该地址的游标不再被
+   * 死 key 钉住**，唤醒链路能继续推进。
+   *
+   * ★ 启动门槛（T-33 ①，真实可触发）：注册表构造性为空时，`hasLiveRegistration`
+   * 对一切 key 都是 false，24h 阈值就从"保护"变成"选择器" —— 一个**活着但没开
+   * 会话**的实例（投递连续 409、pending 隔夜压过 24h）会在 daemon 重启时被整批
+   * 归档，而那些信**再也不会唤醒任何人**（服务器 inbox 里还在，只是这个 daemon
+   * 的游标跨了过去）。所以扫描额外要求本进程**至少见过一次注册/心跳**
+   * （`sawRegistration`）：从没被填充过的注册表，"空"不构成证据，一律不归档。
+   *
+   * 代价（有意）：若这台机器始终没有客户端注册，这个进程就不会归档任何东西 ——
+   * 清理推迟到第一个客户端出现为止，届时死 key 照旧被清掉。少归档 > 误归档，
+   * 与 `selectOrphanPending` 的取舍一致。
    *
    * 邮件本体不在这里删：它仍在服务器 inbox 上（folder=unprocessed），可读、可回捞；
    * 被放弃的只是"对这个再也不会出现的实例做投递唤醒"。
    */
   const sweepOrphanPending = async (): Promise<void> => {
+    // 注册表非空 ⇒ 这个进程确实服务过客户端；此后"某 key 无注册"才算证据。
+    if (deps.registry.list().length > 0) sawRegistration = true
+    if (!sawRegistration) return
+
     const now = deps.now()
     const ttl = deps.config.orphanPendingTtlMs
     const { archive } = selectOrphanPending(deps.store.get().pending, {
@@ -816,18 +858,22 @@ export function createEngine(deps: EngineDeps): Engine {
       }
     })
 
-    // 日志必须能回答「归档了谁的多少条、为什么」。
+    // 日志必须能回答「归档了谁的多少条、哪些批次/哪些信、为什么」。
+    // 归档 = 这些信从此不再唤醒任何人（T-33 ②：事后只能拿服务器 inbox 反查），
+    // 所以带上批次 id 与邮件 id；列表限长，保住一行。
     const state = deps.store.get()
     const ttlHours = Math.round(ttl / 3_600_000)
     for (const key of [...new Set(archive.map((item) => item.project_key))]) {
       const items = archive.filter((item) => item.project_key === key)
       const mails = items.reduce((total, item) => total + item.messages.length, 0)
+      const mailIds = [...new Set(items.flatMap((item) => item.messages.map((message) => message.message_id)))]
       const oldest = Math.min(...items.map((item) => Date.parse(item.enqueued_at)).filter(Number.isFinite))
       const ageHours = Number.isFinite(oldest) ? Math.round(((now - oldest) / 3_600_000) * 10) / 10 : '?'
       const inbox = state.inboxes[key]
       deps.log(
         `msg9 daemon: archived ${mails} orphan mail(s) in ${items.length} batch(es) for `
         + `${inbox?.address ?? key} (${key}): no live instance for ${ageHours}h (> ${ttlHours}h reconnect budget); `
+        + `batches [${summarizeIds(items.map((item) => item.id))}] mails [${summarizeIds(mailIds)}]; `
         + `cursor advanced to ${inbox?.watch_cursor ?? '?'} — this address is no longer pinned`,
       )
     }
@@ -921,9 +967,14 @@ export function createEngine(deps: EngineDeps): Engine {
 
   return {
     async start() {
-      // 先清孤儿批次，再拉起 runner：死 key 的 pending 会先把游标钉死，晚清一步
-      // 就等于让新进程从同一个哑掉的位置开始（真实事故的形态）。
-      await sweepOrphanPending()
+      // T-33 ①：这里**不再**做「首扫」。启动瞬间注册表构造性为空（main.ts：
+      // startControlServer → engine.start → 最后才写 daemon.json，客户端此刻
+      // 不可能已注册），首扫只会把"活着但没开会话"的实例（投递连续 409、pending
+      // 隔夜压过 24h）整批误归档 —— 那些信从此不再唤醒任何人。
+      //
+      // 改由下面的 reconcile 跳承担（默认 60s 一跳；sweep 自身还有
+      // sawRegistration 门槛兜底）。代价：死 key 最多多钉 60s。确定性 > 及时性：
+      // 这里省下的 60s 换不来任何东西，而误归档是永久的。
       await reconcile()
       // 安全网跳：运行期间新产生的孤儿批次（实例在此期间死掉）也按同一规则清掉。
       reconcileTimer = setInterval(() => {

@@ -98,8 +98,11 @@ function parseWorkspaces(value: unknown): WorkspaceRow[] {
 }
 
 export function startControlServer(deps: ControlServerDeps): Promise<ControlServer> {
-  // 「实例过期」只有一处定义（engine.ts）：pruneStale 与孤儿 pending 归档必须
-  // 对"什么算 live"给出同一个答案，否则两条规则会各自漂移。
+  // 「心跳过期阈值」只有一处定义（engine.ts 的 INSTANCE_STALE_MS）。这里与孤儿
+  // pending 归档共享的是**这个数字**，不是"什么算 live"的完整判据 —— 两条规则的
+  // 严格程度不同，且是有意的：归档只看 last_seen（乐观，宁可留着 pending 也不
+  // 误伤活实例），而下面的 pruneStale 还要端口拒连才摘条目（悲观，摘错一条注册
+  // 投递就找不到人）。不要为了"对齐"给归档加端口探活（成本/副作用都不划算）。
   const staleAfterMs = INSTANCE_STALE_MS
 
   const pruneStale = (): void => {
