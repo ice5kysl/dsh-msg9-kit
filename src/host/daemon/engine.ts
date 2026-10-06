@@ -227,12 +227,28 @@ export interface InboxStatus {
   pending: number
 }
 
+/**
+ * T-23：一个信箱最近一次 fetch 带回来的未读读数。daemon 是这里唯一的推送
+ * 通道持有者，所以这个数字**已经付过配额了** —— 插件读它就不必再轮询。
+ */
+export interface DaemonUnreadRow {
+  project_key: string
+  address: string
+  unread: number
+  /** 只有确实知道 "folder 全量" 的观测（bootstrap/offset 模式）才有。 */
+  total?: number
+  /** 观测时刻（epoch ms）。 */
+  at?: number
+}
+
 export interface Engine {
   start(): Promise<void>
   stop(): Promise<void>
   /** Redeliver pending items (fire-and-forget; called on register/heartbeat). */
   replayPending(projectKey?: string): void
   status(): InboxStatus[]
+  /** T-23：每个信箱最近的未读读数（没有读数的信箱不出现）。 */
+  unreadSnapshot(): DaemonUnreadRow[]
 }
 
 /** msg9's WS endpoint for an API base URL (http→ws, https→wss). */
@@ -452,6 +468,11 @@ class InboxRunner {
         limit: deps.config.fetchPageLimit,
         since: cursor,
       })
+      // T-23：这一页已经带着未读数了 —— 记下来给徽章用，别再让插件为同一个
+      // 数字对每个信箱各打一次 `folder=all&limit=1`。
+      // ⚠️ `since` 模式的 `total` 是"游标之后的行数"（服务端 DEF-020），
+      // **不是**信箱大小，所以这里只取 unread_count。
+      await this.noteUnread(result.unread_count)
       if (result.next_cursor) {
         lastCursor = result.next_cursor
         cursor = result.next_cursor
@@ -473,6 +494,25 @@ class InboxRunner {
       return
     }
     await this.enqueue(fresh, lastCursor, seq)
+  }
+
+  /**
+   * T-23：记下一次 fetch 带回来的未读读数（供插件的侧栏徽章读取，`GET /unread`）。
+   *
+   * `mailboxTotal` **只在调用点确认过"这是 folder 全量"时才传**（bootstrap 的
+   * offset 模式）；`since` 模式的 total 是窗口命中数，传进来就是错的。
+   * 没有有效 unread 的页（老服务端不返回该字段）不写，绝不用 0 覆盖上一次的真实读数。
+   */
+  private async noteUnread(unreadCount: unknown, mailboxTotal?: unknown): Promise<void> {
+    const unread = typeof unreadCount === 'number' && Number.isFinite(unreadCount) ? unreadCount : undefined
+    if (unread === undefined) return
+    const total = typeof mailboxTotal === 'number' && Number.isFinite(mailboxTotal) ? mailboxTotal : undefined
+    await this.engine.deps.store.mutate((state) => {
+      const inbox = this.ensureInbox(state)
+      inbox.unread_count = unread
+      if (total !== undefined) inbox.mailbox_total = total
+      inbox.unread_at = Date.now()
+    })
   }
 
   /** Record the fetched (uncommitted) cursor + bump its monotonic sequence. */
@@ -497,6 +537,9 @@ class InboxRunner {
   private async bootstrap(identity: DaemonIdentity, inboxState: ReturnType<DaemonStore['get']>['inboxes'][string] | undefined): Promise<void> {
     const { deps } = this.engine
     const page = await deps.listInbox(identity.api_url, identity.api_key, { folder: 'all', limit: deps.config.fetchPageLimit })
+    // T-23：offset 模式（无 since）的 `total` 是 folder 全量命中数，与 REST 的
+    // `folder=all&limit=1` 同义 ⇒ 连信箱大小一起记，徽章不必再问一遍上游。
+    await this.noteUnread(page.unread_count, page.total)
     const messages = page.messages ?? []
     if (!page.next_cursor) {
       // Empty mailbox: the server issues no cursor until mail exists. Mark the
@@ -1005,6 +1048,24 @@ export function createEngine(deps: EngineDeps): Engine {
         batch_size: state.inboxes[key]?.batch?.messages.length ?? 0,
         pending: state.pending.filter((item) => item.project_key === key).length,
       }))
+    },
+    // T-23：把"已经付过配额"的未读读数交出去（`GET /unread`）。没有读数的信箱
+    // 不出现 —— 插件对缺席的 key 退回 REST 直查，两种来源不会互相覆盖。
+    unreadSnapshot() {
+      const state = deps.store.get()
+      const rows: DaemonUnreadRow[] = []
+      for (const key of [...context.identities.keys()].sort()) {
+        const inbox = state.inboxes[key]
+        if (!inbox || typeof inbox.unread_count !== 'number' || !Number.isFinite(inbox.unread_count)) continue
+        rows.push({
+          project_key: key,
+          address: context.identities.get(key)!.address,
+          unread: inbox.unread_count,
+          ...(typeof inbox.mailbox_total === 'number' ? { total: inbox.mailbox_total } : {}),
+          ...(typeof inbox.unread_at === 'number' ? { at: inbox.unread_at } : {}),
+        })
+      }
+      return rows
     },
   }
 }

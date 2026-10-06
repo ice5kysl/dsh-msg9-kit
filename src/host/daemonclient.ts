@@ -58,6 +58,17 @@ export interface DaemonClientDeps {
   heartbeatMs?: number
 }
 
+/** 一个信箱的未读读数，由 daemon 的推送通道带回（T-23）。 */
+export interface DaemonUnreadRow {
+  project_key: string
+  address: string
+  unread: number
+  /** 只有确实知道"folder 全量"的调用点才有；否则缺席。 */
+  total?: number
+  /** 读数时刻（daemon 的 epoch ms，同机时钟可直接比较）。 */
+  at?: number
+}
+
 export interface DaemonClient {
   /** The per-boot token the daemon must present on POST /dsh-msg9/deliver. */
   readonly deliverToken: string
@@ -67,6 +78,12 @@ export interface DaemonClient {
   start(): Promise<boolean>
   /** Stop heartbeats; the daemon prunes the registration on its own schedule. */
   stop(): Promise<void>
+  /**
+   * T-23：daemon 握着的未读读数（它的每次 fetch 都带 `unread_count`）。
+   * 拿不到（老 daemon 没这条路由 / 暂时不可达）就返回空数组 —— 调用方退回
+   * REST 直查，绝不因为本地快照缺失而让徽章停摆。
+   */
+  readUnread(): Promise<DaemonUnreadRow[]>
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -123,6 +140,42 @@ export function createDaemonClient(deps: DaemonClientDeps): DaemonClient {
       /* an empty/non-JSON body carries no detail */
     }
     return { status: response.status, data }
+  }
+
+  /**
+   * T-23：读 daemon 的未读快照（`GET /unread`）。
+   *
+   * 只走 127.0.0.1 —— 这条路径的意义正是**不花 msg9 的 IP 配额**。
+   * 任何失败（老 daemon 404 / 连接抖动 / 响应形状不对）都返回空数组：调用方
+   * 会退回 REST 直查，徽章不会因为本地快照缺失而变瞎。
+   */
+  async function readUnread(): Promise<DaemonUnreadRow[]> {
+    if (!daemon) return []
+    try {
+      const response = await fetch(`http://127.0.0.1:${daemon.port}/unread`, {
+        headers: { Authorization: `Bearer ${daemon.token}` },
+        signal: AbortSignal.timeout(5_000),
+      })
+      if (!response.ok) return []
+      const body = (await response.json()) as { data?: { inboxes?: unknown } }
+      const rows = Array.isArray(body?.data?.inboxes) ? body.data!.inboxes as Record<string, unknown>[] : []
+      const out: DaemonUnreadRow[] = []
+      for (const row of rows) {
+        const unread = row?.unread
+        const projectKey = row?.project_key
+        if (typeof unread !== 'number' || !Number.isFinite(unread) || typeof projectKey !== 'string') continue
+        out.push({
+          project_key: projectKey,
+          address: typeof row.address === 'string' ? row.address : '',
+          unread,
+          ...(typeof row.total === 'number' && Number.isFinite(row.total) ? { total: row.total } : {}),
+          ...(typeof row.at === 'number' && Number.isFinite(row.at) ? { at: row.at } : {}),
+        })
+      }
+      return out
+    } catch {
+      return []
+    }
   }
 
   async function register(): Promise<boolean> {
@@ -254,5 +307,6 @@ export function createDaemonClient(deps: DaemonClientDeps): DaemonClient {
       // No unregister endpoint by design: the daemon prunes this instance after
       // three missed heartbeats once the web port stops answering.
     },
+    readUnread,
   }
 }

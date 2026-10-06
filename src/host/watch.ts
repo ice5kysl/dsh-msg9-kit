@@ -52,6 +52,15 @@ export interface WatchDeps {
   resolveAgentById?(id: string): WatchAgent | undefined
   /** SSE invalidation hook: fired when fresh mail is SEEN (before delivery). */
   onEvent?(event: string): void
+  /**
+   * T-23：把这轮 fetch 里**已经拿到的**未读读数交出去（徽章用它，就不必再对
+   * 每个信箱各打一次 `folder=all&limit=1` —— msg9 PO 从生产日志里数出这块
+   * 3380 次/天，而推送页本来就带着同一个 `unread_count`）。
+   *
+   * ⚠️ `total` **只在该查询确实是"folder 全量命中数"时才传**：`since` 模式下的
+   * `total` 是"游标之后的行数"（服务端 DEF-020），当信箱大小用是错的。
+   */
+  onInboxSnapshot?(key: string, snapshot: { unread?: number; total?: number; at?: number }): void
   /** Notification mute: while true, mail is tracked but never delivered. */
   isPaused?(): boolean | Promise<boolean>
   /** Coalescing window for related mails (default 12s; 0 disables batching). */
@@ -272,6 +281,10 @@ export async function streamInboxLoop(
       const page = await deps.streamInbox(inbox.api_url, inbox.api_key, { since: inbox.watch_cursor, wait: 25 }, signal)
       failures = 0
       if (signal.aborted) return
+      // T-23：这一页同时带回了 `unread_count` 与（T-74 之后与 REST 同义的）`total`
+      // —— 徽章直接用它，不必再单独轮询每个信箱。客户端断开时的空壳页两个字段
+      // 都没有，交给 noteInboxSnapshot 的"缺字段就不写"规则处理（徽章不得被清零）。
+      deps.onInboxSnapshot?.(key, { unread: page.unread_count, total: page.total, at: deps.now() })
       if (page.next_cursor) await deps.setWatchState(key, { watch_cursor: page.next_cursor })
       const fresh = page.messages ?? []
       if (fresh.length === 0) continue
@@ -306,6 +319,10 @@ async function pollInbox(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: 
   const since = inbox.watch_cursor
   if (since) {
     const page = await deps.listInbox(inbox.api_url, inbox.api_key, { folder: 'all', limit: 20, since })
+    // T-23：`unread_count` 是地址级的（与查询无关，服务端 CountUnread(address)），
+    // 任何一页都可以拿来喂徽章；**`total` 在这里不可信**（since 模式 = 游标之后的
+    // 命中数），所以刻意不传。
+    deps.onInboxSnapshot?.(key, { unread: page.unread_count, at: deps.now() })
     if (page.next_cursor) await deps.setWatchState(key, { watch_cursor: page.next_cursor })
     const fresh = page.messages ?? []
     if (fresh.length > 0) await deps.setWatchState(key, {
@@ -321,6 +338,9 @@ async function pollInbox(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: 
   // the newest message id as the baseline — announcing nothing the first time,
   // exactly like msg9_inbox's bootstrap.
   const page = await deps.listInbox(inbox.api_url, inbox.api_key, { folder: 'all', limit: 20 })
+  // T-23：offset 模式（无 since）的 `total` 就是 folder 全量命中数，和 REST 的
+  // `folder=all&limit=1` 同义 —— 连同 unread_count 一起喂徽章。
+  deps.onInboxSnapshot?.(key, { unread: page.unread_count, total: page.total, at: deps.now() })
   const all = page.messages ?? []
   if (page.next_cursor) {
     await deps.setWatchState(key, { watch_cursor: page.next_cursor })

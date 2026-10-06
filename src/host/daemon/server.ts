@@ -10,6 +10,7 @@
  *                                 → 404 unknown-instance means "register again"
  *   GET  /notify                  { paused }
  *   POST /notify                  { paused }   (the panel bell / msg9_notify)
+ *   GET  /unread                  per-inbox unread readings (T-23 badge source)
  *   GET  /events                  debug dump: inboxes, instances, pending
  *
  * Every route except /healthz requires `Authorization: Bearer <token>` with
@@ -219,6 +220,13 @@ export function startControlServer(deps: ControlServerDeps): Promise<ControlServ
         })
         deps.log(`msg9 daemon: notify ${paused ? 'paused' : 'resumed'}`)
         return ok(res, { paused })
+      }
+
+      // T-23：插件用这一条填侧栏徽章 —— 数字来自 daemon 自己的推送通道，
+      // 于是插件不必再对每个信箱各打一次 msg9 的 `folder=all&limit=1`
+      // （生产访问日志里 3380 次/天）。走 127.0.0.1，不花 msg9 的 IP 配额。
+      if (method === 'GET' && path === '/unread') {
+        return ok(res, { inboxes: deps.engine.unreadSnapshot() })
       }
 
       if (method === 'GET' && path === '/events') {

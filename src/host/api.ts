@@ -305,8 +305,116 @@ export function streamInbox(
   })
 }
 
+// ------------------------------------------------------------------ /resolve
+
+/**
+ * T-23 ②：`/resolve` 结果的进程内 **LRU + TTL** 缓存。
+ *
+ * 为什么值得缓存：msg9 PO 从生产访问日志里数出 **591 次/天** 的
+ * `GET /api/v1/resolve/iceskyls@msg9.io` —— **同一个地址**被反复解析，而这个
+ * 记录（存在性 / inbox_url / 公钥 / 黄页资料）几乎不变。平台按 IP 200 次/分钟
+ * 限流，而热路径（面板选人、Agent 发信前探地址）全都在解析同一小撮对端。
+ *
+ * TTL 取 **5 分钟**（卡上的下限）而不是更长：
+ *   - 上界意义：对端换 key / 重新注册 / 换了 pod 之后，最多 5 分钟就能看见新记录；
+ *   - 下界意义：一次会话里对同一地址的重复解析（实测一天 591 次）几乎全部命中；
+ *   - 只缓存**正结果**（`exists !== false`）：一个"还不存在"的地址绝不能被缓存
+ *     钉住 —— 那样刚建好的对端会静默解析不到（正是 AGENTS.md 里"发错地址不会
+ *     报错、只会静默躺着"那类事故的温床）；抛错同样不缓存。
+ */
+export const RESOLVE_CACHE_TTL_MS = 5 * 60_000
+
+/** LRU 容量上限：几十个 workspace + 黄页浏览的量级，够用且不会无界增长。 */
+export const RESOLVE_CACHE_MAX = 256
+
+export interface ResolveCacheOptions {
+  ttlMs?: number
+  max?: number
+  /** 时钟注入（测试用）。 */
+  now?: () => number
+  /** 取数实现（默认真打 msg9）；测试注入替身即可完全离线。 */
+  load?: (apiUrl: string, address: string, signal?: AbortSignal) => Promise<Record<string, unknown>>
+}
+
+export interface ResolveCacheStats {
+  hits: number
+  misses: number
+  size: number
+}
+
+export interface ResolveCache {
+  resolve(apiUrl: string, address: string, signal?: AbortSignal): Promise<Record<string, unknown>>
+  /** 清空（测试 / 需要强制重读时）。 */
+  clear(): void
+  stats(): ResolveCacheStats
+}
+
+/**
+ * 建一个解析缓存。键是 `apiUrl + '\0' + address`（**原样**，不做大小写/空白
+ * 归一 —— 缓存键必须与真正发出去的请求一一对应，自己造归一规则只会制造
+ * "看起来命中、其实问了另一个地址"的偏差）。
+ */
+export function createResolveCache(options: ResolveCacheOptions = {}): ResolveCache {
+  const ttlMs = options.ttlMs ?? RESOLVE_CACHE_TTL_MS
+  const max = Math.max(1, options.max ?? RESOLVE_CACHE_MAX)
+  const now = options.now ?? (() => Date.now())
+  const load = options.load
+    ?? ((apiUrl: string, address: string, signal?: AbortSignal) => msg9Request<Record<string, unknown>>(apiUrl, `/api/v1/resolve/${encodeURIComponent(address)}`, { signal }))
+  const entries = new Map<string, { at: number; record: Record<string, unknown> }>()
+  let hits = 0
+  let misses = 0
+  return {
+    async resolve(apiUrl, address, signal) {
+      const key = `${apiUrl.replace(/\/+$/, '')}\u0000${address}`
+      const hit = entries.get(key)
+      if (hit && now() - hit.at < ttlMs) {
+        hits += 1
+        // LRU：命中即移到队尾（Map 的迭代顺序就是插入顺序）。
+        entries.delete(key)
+        entries.set(key, hit)
+        return hit.record
+      }
+      misses += 1
+      const record = await load(apiUrl, address, signal)
+      // 只缓存正结果；失败（抛错）根本走不到这里。
+      if (record && typeof record === 'object' && (record as { exists?: unknown }).exists !== false) {
+        entries.set(key, { at: now(), record })
+        while (entries.size > max) {
+          const oldest = entries.keys().next().value
+          if (oldest === undefined) break
+          entries.delete(oldest)
+        }
+      }
+      return record
+    },
+    clear() {
+      entries.clear()
+    },
+    stats() {
+      return { hits, misses, size: entries.size }
+    },
+  }
+}
+
+/** 进程级共享的解析缓存（工具 + 浏览器桥共用同一份）。 */
+const defaultResolveCache = createResolveCache()
+
+/** 测试/诊断：清空进程级解析缓存。 */
+export function clearResolveCache(): void {
+  defaultResolveCache.clear()
+}
+
+/** 测试/诊断：进程级解析缓存的命中统计。 */
+export function resolveCacheStats(): ResolveCacheStats {
+  return defaultResolveCache.stats()
+}
+
+/**
+ * Resolve a msg9 address to its public record (T-23 ②: served from a 5-minute
+ * LRU cache; see {@link createResolveCache}).
+ */
 export function resolveAddress(apiUrl: string, address: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
-  return msg9Request(apiUrl, `/api/v1/resolve/${encodeURIComponent(address)}`, { signal })
+  return defaultResolveCache.resolve(apiUrl, address, signal)
 }
 
 /**

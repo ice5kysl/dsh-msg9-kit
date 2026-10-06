@@ -114,6 +114,17 @@ export interface DaemonInboxState {
   bootstrap_pending?: boolean
   /** Ring of recently acked message ids (dedupe WS push vs cursor refetch). */
   delivered_ids?: string[]
+  /**
+   * T-23：最近一次 fetch 带回来的未读读数（`unread_count` 是**地址级**的，
+   * 与查询无关，任何一页都能拿）。插件用它填侧栏徽章，于是**不必**再对每个
+   * 信箱各打一次 `folder=all&limit=1`（生产日志里 3380 次/天）。
+   * 持久化是有意的：daemon 重启后第一轮 fetch 之前，旧读数仍可用于展示。
+   */
+  unread_count?: number
+  /** 只有"folder 全量"的查询（bootstrap/offset 模式）才会写；`since` 模式的 total 不可信。 */
+  mailbox_total?: number
+  /** `unread_count` 的观测时刻（epoch ms）。 */
+  unread_at?: number
   batch?: PersistedBatch
 }
 

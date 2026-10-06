@@ -23,7 +23,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { listInbox, streamInbox } from './api.ts'
 import { registerMsg9Commands } from './commands.ts'
 import { deriveProjectKey, resolveCredentials } from './credentials.ts'
-import { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, computeUnread, createBridgeEventBus } from './http.ts'
+import { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, computeUnread, createBridgeEventBus, noteInboxSnapshot, clearInboxSnapshot } from './http.ts'
 import { L } from './locale.ts'
 import { loadState, setWatchState, getNotifyPaused, type LiveInbox } from './store.ts'
 import { registerMsg9Tools } from './tools.ts'
@@ -52,7 +52,9 @@ export const inject = ['tools', 'commands', 'sessions'] as const
 // Testable seams: the browser bridge, the shared inbox service and the watch
 // logic are part of the package's public surface, so they can be driven
 // without a cordis host.
-export { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, invalidateUnreadCache, createBridgeEventBus } from './http.ts'
+export { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, isTrustedRequest, computeUnread, invalidateUnreadCache, createBridgeEventBus, clearInboxSnapshot, inboxSnapshotKeys, noteInboxSnapshot, resetInboxSnapshots, INBOX_SNAPSHOT_MAX_AGE_MS } from './http.ts'
+// T-23 ②：/resolve 的 LRU+TTL 缓存（工具与浏览器桥共用一份进程级缓存的接缝）。
+export { clearResolveCache, createResolveCache, resolveAddress, resolveCacheStats, RESOLVE_CACHE_MAX, RESOLVE_CACHE_TTL_MS } from './api.ts'
 export { derivePodLabel, ensureInbox, migrateInbox, openPod, ownerContext, podState, resolveInbox } from './service.ts'
 export {
   credentialsMigrated,
@@ -82,7 +84,10 @@ export { WakeBudget, createNonReentrant, createWatchRuntime, deliverDaemonBatch,
 // The watcher daemon's public surface (bin entry + integration tests).
 export { DAEMON_PROTOCOL, createDaemon, runDaemon } from './daemon/main.ts'
 export { createEngine, createRegistry, defaultEngineConfig, DeliverHttpError, INSTANCE_STALE_MS, wsUrlFor } from './daemon/engine.ts'
-export type { DeliverBody, Engine, EngineConfig, EngineDeps, Registry, WorkspaceRow } from './daemon/engine.ts'
+export type { DeliverBody, Engine, EngineConfig, EngineDeps, Registry, WorkspaceRow, DaemonUnreadRow } from './daemon/engine.ts'
+// T-23：控制面服务器（`GET /unread` 的宿主）也要能被测试直接驱动。
+export { startControlServer } from './daemon/server.ts'
+export type { ControlServer, ControlServerDeps } from './daemon/server.ts'
 export {
   acceptArchivedBatch,
   backoffMs,
@@ -206,6 +211,12 @@ export function apply(ctx: Context): void {
     },
   }
 
+  // T-23：机器级 daemon 拥有推送通道时，未读数在它手里（它每次 fetch 都带
+  // `unread_count`）。startWatcher 在 daemon 连上时填这条读取口，徽章对账于是
+  // 一次本地调用就够 —— 不必再对每个信箱各打一次 REST（生产日志里 3380 次/天）。
+  const daemonUnread: { read?: () => Promise<Record<string, { unread?: number; total?: number; at?: number }>> } = {}
+  bridgeDeps.readLocalSnapshots = async () => (daemonUnread.read ? daemonUnread.read() : {})
+
   let webServerRef: WebServerLike | undefined
   const bridge = createMsg9Bridge(bridgeDeps)
   ctx.inject(['webServer'], (child) => {
@@ -306,6 +317,7 @@ export function apply(ctx: Context): void {
       reconcileUnread,
       () => webServerRef?.port ?? 0,
       daemonDelivery,
+      daemonUnread,
     )
     log.info(`msg9 new-mail watcher started (daemon-first, in-process fallback every ${WATCH_POLL_MS / 1000}s)`)
   })
@@ -321,6 +333,7 @@ function startWatcher(
   reconcileUnread: () => Promise<void>,
   getPort: () => number,
   daemonDelivery: { token?: string; handle?: (body: DaemonDelivery) => Promise<unknown> },
+  daemonUnread: { read?: () => Promise<Record<string, { unread?: number; total?: number; at?: number }>> },
 ): void {
   const rt = createWatchRuntime()
 
@@ -341,6 +354,9 @@ function startWatcher(
     setWatchState,
     listInbox: (apiUrl, apiKey, query) => listInbox(apiUrl, apiKey, query),
     onEvent: (event) => events.emit(event),
+    // T-23：推送通道（流页 / 轮询兜底页）已经带回的未读读数直接进徽章登记表，
+    // 于是 /unread 不必再"每个信箱各打一次 folder=all&limit=1"。
+    onInboxSnapshot: (key, snapshot) => noteInboxSnapshot(key, snapshot),
     isPaused: () => getNotifyPaused(),
     resolveAgentById: (id) => agents.get(id),
     batchWindowMs: Math.max(0, Number(process.env.MSG9_WATCH_BATCH_MS ?? 12_000) || 12_000),
@@ -421,6 +437,9 @@ function startWatcher(
 
       const stopLoops = (): void => {
         for (const controller of loopControllers.values()) controller.abort()
+        // T-23：循环停了，它留下的未读快照必须立刻作废 —— 否则徽章会一直用一条
+        // 死通道的读数（直到 120s 年龄上限）。作废后 computeUnread 自动退回 REST。
+        for (const key of loopControllers.keys()) clearInboxSnapshot(key)
         loopControllers.clear()
       }
       const startPolling = (): void => {
@@ -455,6 +474,9 @@ function startWatcher(
             })
             .finally(() => {
               loopControllers.delete(key)
+              // T-23：这个信箱的推送通道结束了 —— 丢掉它的未读快照，让徽章
+              // 立刻退回 REST 直查（"订阅流断了必须有兜底"，省配额不能省可靠性）。
+              clearInboxSnapshot(key)
             })
         }
       }
@@ -501,10 +523,35 @@ function startWatcher(
         }
         if (connected) {
           log('msg9 watcher daemon connected; this instance is a delivery target only')
+          // T-23：把 daemon 手上的未读读数接到徽章上。project_key → workspace key
+          // 的映射与注册时同源（state 的 project_key，缺省按 title/path 派生）。
+          const client = daemonClient!
+          daemonUnread.read = async () => {
+            const rows = await client.readUnread()
+            if (rows.length === 0) return {}
+            const state = await loadState()
+            const byProjectKey = new Map(rows.map((row) => [row.project_key, row]))
+            const byAddress = new Map(rows.map((row) => [row.address, row]))
+            const out: Record<string, { unread?: number; total?: number; at?: number }> = {}
+            for (const [key, row] of Object.entries(state.workspaces)) {
+              const projectKey = row.project_key
+                ?? await deriveProjectKey({ title: row.title, path: row.path }).catch(() => undefined)
+              const match = (projectKey ? byProjectKey.get(projectKey) : undefined)
+                ?? (row.address ? byAddress.get(row.address) : undefined)
+              if (!match) continue
+              out[key] = {
+                unread: match.unread,
+                ...(typeof match.total === 'number' ? { total: match.total } : {}),
+                ...(typeof match.at === 'number' ? { at: match.at } : {}),
+              }
+            }
+            return out
+          }
         } else {
           if (daemonClient) log('msg9 watcher daemon unavailable; falling back to the in-process watcher')
           daemonClient = undefined
           daemonDelivery.token = undefined
+          daemonUnread.read = undefined
           startInProcessWatcher()
         }
       })()
@@ -515,6 +562,7 @@ function startWatcher(
         stopLoops()
         if (pollTimer) clearInterval(pollTimer)
         if (reconcileTimer) clearInterval(reconcileTimer)
+        daemonUnread.read = undefined
         if (daemonClient) {
           daemonDelivery.token = undefined
           void daemonClient.stop()

@@ -134,6 +134,15 @@ export interface BridgeDeps {
   /** Optional SSE invalidation bus (clients stop polling /unread when present). */
   events?: BridgeEventBus
   /**
+   * 本机推送通道持有的未读读数（**机器级 watcher daemon** 拥有 WS 时用它）。
+   *
+   * 为什么需要这条路：daemon 连着的时候插件不再自己跑 stream 循环，可是未读数
+   * 就在 daemon 手里（它的每次 fetch 都带 `unread_count`）。没有这条路，徽章
+   * 对账就只能对**每个信箱**各打一次 REST —— 那正是 T-23 要消掉的重复请求。
+   * 返回按 workspace key 索引；读不到/没有的 key 走 REST 兜底。
+   */
+  readLocalSnapshots?(): Promise<Record<string, InboxUnreadSnapshot>>
+  /**
    * The watcher daemon's delivery seam (POST /dsh-msg9/deliver). Absent = this
    * instance has no daemon client; the route then answers 401 to everything.
    */
@@ -187,10 +196,23 @@ function resolveVia(deps: BridgeDeps, key: string): Promise<LiveInbox | undefine
   return deps.resolveCredentials ? deps.resolveCredentials(key) : resolveCredentials(key, { log: deps.log })
 }
 
+/** 未读数的来源：流页 / 本机 daemon 快照 / 兜底直查上游。 */
+export type UnreadSource = 'stream' | 'local' | 'rest'
+
 export interface UnreadView {
   total: number
   byKey: Record<string, number>
   totalByKey: Record<string, number>
+  /** 每个 key 的未读数**出处**：断言/排障用（客户端忽略未知字段）。 */
+  sourceByKey?: Record<string, UnreadSource>
+}
+
+/** 从推送通道的页面上取下来的一次未读读数。 */
+export interface InboxUnreadSnapshot {
+  unread?: number
+  total?: number
+  /** 读数产生的时刻（epoch ms）。 */
+  at?: number
 }
 
 /**
@@ -204,6 +226,99 @@ let unreadCache: { at: number; view: UnreadView } | undefined
 let unreadInflight: Promise<UnreadView> | undefined
 
 /**
+ * 未读快照的最大可信年龄。
+ *
+ * 取值必须**明显大于最慢那条推送通道的刷新周期**，否则安静的信箱会来回
+ * 在"用快照 / 退回 REST"之间抖 —— 而退回 REST 正是本卡要消掉的配额开销。
+ * 两条通道的周期：
+ *   · 进程内 `/inbox/stream`：长轮询 `wait=25s`，**超时也返回带 `unread_count`
+ *     的空页**（服务端 `StreamInbox` 的 deadline 分支）⇒ 活着的流 ≤25s 刷新一次；
+ *   · 机器级 daemon：WS 帧即时，安静信箱靠安全网 `safetyNetMs = 120s`。
+ * ⇒ 取 **240s = 2× 最慢周期**：容忍一次错过的刷新，同时仍是一个"通道卡死了
+ * 就会在几分钟内退回服务器直查"的有界承诺。
+ * 通道自己退出时另有 `clearInboxSnapshot` 立即失效（见 index.ts 的 finally），
+ * 这个年龄只是"没能及时察觉"的兜底。
+ */
+export const INBOX_SNAPSHOT_MAX_AGE_MS = 240_000
+
+/**
+ * 未读快照登记表（**按 workspace key**）。
+ *
+ * 存在的理由：msg9 平台按 **IP 200 次/分钟**限流，而我们过去在"推送通道已经
+ * 把未读数带回来了"的同时，又对**每个信箱**各打一次
+ * `GET /inbox/messages?folder=all&limit=1` —— 同一件事做两遍。msg9 PO 从生产
+ * 访问日志里数出这块 **3380 次/天**（同一台机器上 28 个信箱）。
+ * v1.41.5 T-74 之后 `/inbox/stream` 的 `Total` 与 REST 同义、`unread_count`
+ * 本来就是同一个 `CountUnread(address)`，所以推送页上的读数**可以直接用**。
+ */
+const inboxSnapshots = new Map<string, { unread?: number; total?: number; at: number }>()
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * 记下一个信箱的最新未读读数（由推送通道的页面喂进来）。
+ *
+ * ⚠️ **字段缺失 ≠ 0**：`/inbox/stream` 在客户端断开（`ctx.Done()`）时回的是一页
+ * 空壳（只有 `messages` + `next_cursor`）。那种页**不得**把徽章清零，所以这里
+ * 只合并"确实带回来的字段"，一个都没有就整条不写。
+ * 同理 `total` 只在**确实是全量命中数**的调用点才传：`since` 模式下的 `total`
+ * 是"游标之后的行数"（DEF-020），拿它当信箱大小是错的。
+ */
+export function noteInboxSnapshot(key: string, snapshot: InboxUnreadSnapshot): void {
+  const unread = finiteNumber(snapshot.unread)
+  const total = finiteNumber(snapshot.total)
+  if (unread === undefined && total === undefined) return
+  const previous = inboxSnapshots.get(key)
+  inboxSnapshots.set(key, {
+    unread: unread ?? previous?.unread,
+    total: total ?? previous?.total,
+    at: snapshot.at ?? Date.now(),
+  })
+}
+
+/** 某个信箱的推送通道没了：立刻作废它的快照，而不是等年龄过期。 */
+export function clearInboxSnapshot(key: string): void {
+  inboxSnapshots.delete(key)
+}
+
+/** 测试/诊断用：清空全部快照。 */
+export function resetInboxSnapshots(): void {
+  inboxSnapshots.clear()
+}
+
+/** 只读诊断：当前快照（不改变任何状态）。 */
+export function inboxSnapshotKeys(): string[] {
+  return [...inboxSnapshots.keys()]
+}
+
+/**
+ * 挑一条可用的快照：优先"更近"的那条（进程内流 vs 本机 daemon），
+ * 太老的一律不用 —— 宁可退回 REST，也不拿过期读数糊弄徽章。
+ */
+function pickSnapshot(
+  key: string,
+  local: InboxUnreadSnapshot | undefined,
+  now: number,
+  maxAge: number,
+): { unread: number; total: number | undefined; source: UnreadSource } | undefined {
+  const candidates: { unread: number; total?: number; at: number; source: UnreadSource }[] = []
+  const stream = inboxSnapshots.get(key)
+  if (stream && finiteNumber(stream.unread) !== undefined) {
+    candidates.push({ unread: stream.unread!, ...(stream.total !== undefined ? { total: stream.total } : {}), at: stream.at, source: 'stream' })
+  }
+  if (local && finiteNumber(local.unread) !== undefined) {
+    candidates.push({ unread: local.unread!, ...(local.total !== undefined ? { total: local.total } : {}), at: local.at ?? now, source: 'local' })
+  }
+  const fresh = candidates.filter((candidate) => now - candidate.at <= maxAge)
+  if (fresh.length === 0) return undefined
+  fresh.sort((a, b) => b.at - a.at)
+  const best = fresh[0]!
+  return { unread: best.unread, total: best.total, source: best.source }
+}
+
+/**
  * 本地状态变化后（已读/闭环/开通/迁移）立刻作废旧快照。
  *
  * ⚠️ **必须连在途请求一起作废**（只清 `unreadCache` 不够）：
@@ -212,19 +327,39 @@ let unreadInflight: Promise<UnreadView> | undefined
  * `if (unreadInflight) return unreadInflight`），于是"刚点已读、未读数又跳回去"。
  * 这里只是把登记清掉，之后的新调用会重新拉；已经拿到旧 promise 的调用方
  * 不受影响（它们本来就该拿到那次结果）。
+ *
+ * 传了 `key` 就连**那个信箱的推送快照**一起丢掉：推送页最早也要等到下一轮
+ * 长轮询（≤25s）才会带来写操作之后的读数，而"刚点已读、徽章必须立刻掉"是
+ * 更硬的体感要求 ⇒ 这一次宁可走 REST 直查（一个信箱一次），拿到写之后的真值。
+ * 快照会在下一轮推送页回来时自动恢复（自愈，不需要额外的"脏"标记）。
  */
-export function invalidateUnreadCache(): void {
+export function invalidateUnreadCache(key?: string): void {
   unreadCache = undefined
   unreadInflight = undefined
+  if (key === undefined) inboxSnapshots.clear()
+  else inboxSnapshots.delete(key)
 }
 
 /**
  * Unread + mailbox-size snapshot across every provisioned inbox. Used by the
  * /unread route AND the host-side reconcile (which only emits when the
  * snapshot actually changed).
+ *
+ * 三级取值，越靠前越省配额：
+ *   ① 进程内推送通道（`/inbox/stream` 页）留下的快照 —— 0 次上游请求；
+ *   ② 本机 daemon 的快照（它才是推送通道持有者时的真相，见 `readLocalSnapshots`）—— 0 次；
+ *   ③ REST 兜底 `folder=all&limit=1` —— 仅当该信箱**没有**新鲜快照时才对它发一次。
+ *
+ * ③ 是**必须留着的兜底**：门铃是 best-effort，"没收到唤醒 ≠ 没有信"，
+ * 推送通道断了（或压根没起来）时未读只能直查服务器。
  */
-export async function computeUnread(deps: BridgeDeps, signal: AbortSignal, options?: { ttlMs?: number }): Promise<UnreadView> {
+export async function computeUnread(
+  deps: BridgeDeps,
+  signal: AbortSignal,
+  options?: { ttlMs?: number; snapshotMaxAgeMs?: number },
+): Promise<UnreadView> {
   const ttl = options?.ttlMs ?? UNREAD_TTL_MS
+  const maxAge = options?.snapshotMaxAgeMs ?? INBOX_SNAPSHOT_MAX_AGE_MS
   if (unreadInflight) return unreadInflight
   if (unreadCache && Date.now() - unreadCache.at < ttl) return unreadCache.view
   // 共享任务不带任何单个调用方的 signal：第一个调用方断开不应中止合并后
@@ -238,33 +373,52 @@ export async function computeUnread(deps: BridgeDeps, signal: AbortSignal, optio
     const rows = keys
       .map((key, index) => [key, resolved[index]] as const)
       .filter((pair): pair is readonly [string, LiveInbox] => Boolean(pair[1]))
+    // 本机 daemon 的读数（daemon 拥有推送通道时，未读已经在它手里）。读不到就
+    // 当作没有 —— 绝不因为本地快照服务异常而让整个徽章挂掉。
+    let local: Record<string, InboxUnreadSnapshot> = {}
+    if (deps.readLocalSnapshots) {
+      try {
+        local = (await deps.readLocalSnapshots()) ?? {}
+      } catch (error) {
+        deps.log?.(`msg9 unread: local snapshot read failed (${(error as Error)?.message ?? String(error)})`)
+        local = {}
+      }
+    }
+    const now = Date.now()
     const settled = await Promise.allSettled(
       rows.map(async ([key, inbox]) => {
-        // folder=all: one call yields both the mailbox size and the unread count.
+        const snapshot = pickSnapshot(key, local[key], now, maxAge)
+        if (snapshot) return [key, snapshot.unread, snapshot.total, snapshot.source] as const
+        // 兜底：folder=all 一次调用同时给出信箱大小与未读数（推送快照缺席时才走）。
         const page = await deps.api.listInbox(inbox.api_url, inbox.api_key, { folder: 'all', limit: 1 })
-        return [key, Number(page?.unread_count ?? 0), Number(page?.total ?? (page?.messages ?? []).length)] as const
+        return [key, Number(page?.unread_count ?? 0), Number(page?.total ?? (page?.messages ?? []).length), 'rest' as const] as const
       }),
     )
     const previous = unreadCache?.view
     const byKey: Record<string, number> = {}
     const totalByKey: Record<string, number> = {}
+    const sourceByKey: Record<string, UnreadSource> = {}
     let total = 0
     for (let index = 0; index < rows.length; index += 1) {
       const [key] = rows[index]!
       const result = settled[index]!
       if (result.status === 'fulfilled') {
-        const [, count, mailboxSize] = result.value
+        const [, count, mailboxSize, source] = result.value
         byKey[key] = count
-        totalByKey[key] = mailboxSize
+        // 快照可能只带未读（`since` 模式的 total 不可信，见 noteInboxSnapshot）：
+        // 那就沿用上轮的信箱大小，而不是把界面上的数字抹成 0。
+        totalByKey[key] = mailboxSize ?? previous?.totalByKey[key] ?? 0
+        sourceByKey[key] = source
         total += count
       } else if (previous && key in previous.byKey) {
         // 部分失败：沿用上轮快照里该信箱的计数，而不是静默丢 key。
         byKey[key] = previous.byKey[key]!
         totalByKey[key] = previous.totalByKey[key] ?? 0
+        sourceByKey[key] = previous.sourceByKey?.[key] ?? 'rest'
         total += byKey[key]!
       }
     }
-    const view: UnreadView = { total, byKey, totalByKey }
+    const view: UnreadView = { total, byKey, totalByKey, sourceByKey }
     unreadCache = { at: Date.now(), view }
     return view
   })()
@@ -1175,7 +1329,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       await deps.api.markRead(inbox.api_url, inbox.api_key, messageId, 'human', signal)
       // The panel marked this one: attribute the read to the human.
       await setMessageMark(key, messageId, { read_by: 'human' })
-      invalidateUnreadCache()
+      invalidateUnreadCache(key)
       deps.events?.emit('read')
       return ok(res, { message_id: messageId, read: true })
     }
@@ -1196,7 +1350,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         await deps.api.markRead(inbox.api_url, inbox.api_key, messageId, 'human', signal).catch(() => {})
       }
       await setMessageMark(key, messageId, { read_by: 'human', processed_by: 'human' })
-      invalidateUnreadCache()
+      invalidateUnreadCache(key)
       deps.events?.emit('done')
       return ok(res, { message_id: messageId, processed: true })
     }
@@ -1263,7 +1417,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         throw new BridgeError(400, 'invalid-address', `"${preferred}" is not a valid msg9 local part (3-30 chars, a-z0-9-_ inside)`)
       }
       const result = await migrateInbox(workspace, existing, str(body.old_owner_key), preferred || undefined)
-      invalidateUnreadCache()
+      invalidateUnreadCache(key)
       deps.log(`migrated ${key}: ${existing.address} -> ${result.inbox.address}`)
       deps.events?.emit('migrate')
       return ok(res, {
@@ -1303,7 +1457,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         signal,
         preferred || undefined,
       )
-      if (provisioned) invalidateUnreadCache()
+      if (provisioned) invalidateUnreadCache(workspace.key)
       return ok(res, { key: workspace.key, address: inbox.address, provisioned })
     }
 
@@ -1379,7 +1533,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
       assertWorkspaceDirExists(workspace.path)
       const preferredLabel = str(body.pod_label)
       const result = await deps.openPod(workspace, preferredLabel ? { podLabel: preferredLabel } : undefined)
-      invalidateUnreadCache()
+      invalidateUnreadCache(workspace.key)
       return ok(res, { key: workspace.key, ...result })
     }
 
@@ -1424,7 +1578,7 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         ? await removeProjectCredentials(inbox.project_key)
         : []
       await deleteWorkspaceInbox(key)
-      invalidateUnreadCache()
+      invalidateUnreadCache(key)
       deps.log(`msg9: removed local record ${key} (${removedFiles.length} credential file(s))`)
       return ok(res, {
         key,
@@ -1527,7 +1681,9 @@ export function createMsg9Bridge(deps: BridgeDeps): Msg9Bridge {
         ))
       }
       const moved = await relinkWorkspaceInbox(fromKey, toKey, { path: target.path })
-      invalidateUnreadCache()
+      // 两个 key 都作废：源记录没了，目标记录换了地址。
+      invalidateUnreadCache(fromKey)
+      invalidateUnreadCache(toKey)
       const movedAddress = (await resolveVia(deps, toKey))?.address ?? null
       deps.log(`msg9: relinked inbox record ${fromKey} -> ${toKey} (local only)`)
       return ok(res, {
