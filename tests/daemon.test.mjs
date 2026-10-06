@@ -61,7 +61,13 @@ async function tempHome() {
   return mkdtemp(join(tmpdir(), 'dsh-msg9-kit-daemon-'))
 }
 
-async function waitFor(fn, timeoutMs = 3000) {
+/**
+ * 确定性等待：条件成立即返回，**到点用可读信息失败**。
+ *
+ * `what` 可以是字符串，也可以是**函数**（超时才求值）—— 后者用来在失败信息里
+ * 带上"当时到底长什么样"（日志、计数器…），否则只能看到一句干巴巴的 timed out。
+ */
+async function waitFor(fn, timeoutMs = 3000, what = 'condition') {
   const deadline = Date.now() + timeoutMs
   for (;;) {
     try {
@@ -70,9 +76,62 @@ async function waitFor(fn, timeoutMs = 3000) {
     } catch {
       /* not there yet */
     }
-    if (Date.now() > deadline) throw new Error('waitFor timed out')
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    if (Date.now() > deadline) {
+      const detail = typeof what === 'function' ? what() : what
+      throw new Error(`waitFor timed out after ${timeoutMs}ms: ${detail}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10))
   }
+}
+
+/**
+ * 等一条日志出现。断言的对象是"日志留下了什么"时，就该等**日志本身**。
+ *
+ * 这正是 T-39 的 flake 根因：原来等的是 `pending.length === 0`，而 state 是在
+ * `store.mutate(...)` 里先变空、日志在那次 mutate 的 await **之后**才写 ——
+ * 两者之间就是一个抢跑窗口（实测 6 跑 2 败）。
+ */
+async function waitForLog(logs, pattern, what, timeoutMs = 3000) {
+  return waitFor(
+    () => logs.find((entry) => pattern.test(entry)),
+    timeoutMs,
+    // 函数：超时才求值，于是失败信息里是**当时**的日志，而不是调用时的空数组。
+    () => `等日志 ${pattern}：${what}。当前日志：${JSON.stringify(logs)}`,
+  )
+}
+
+/**
+ * 等 daemon 真的跑够 `n` 轮**孤儿 pending 扫描**。
+ *
+ * 为什么负向断言必须用它：`sweepOrphanPending()` 每轮第一件事就是
+ * `deps.registry.list()`（engine.ts 的启动门槛），所以给注册表包一层测试侧
+ * 计数器，就能把"扫描跑了几轮"变成**可观测事实**。原来的 `sleep(200)` 是在猜：
+ * 机器一忙、一轮都没跑到，负向断言就会"因为什么都没发生"而通过（假绿）。
+ *
+ * 计数器只在测试里，生产路径一行没动。
+ */
+async function waitForSweeps(counts, n, timeoutMs = 3000) {
+  return waitFor(
+    () => counts.listCalls >= n,
+    timeoutMs,
+    () => `只跑了 ${counts.listCalls}/${n} 轮孤儿扫描（reconcileMs 见 orphanCase）`,
+  )
+}
+
+/** 注册表包装：只做**计数**，其余行为原样透传（生产代码不感知）。 */
+function countRegistryLists(inner, counts) {
+  return new Proxy(inner, {
+    get(target, prop, receiver) {
+      if (prop === 'list') {
+        return () => {
+          counts.listCalls += 1
+          return target.list()
+        }
+      }
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -179,7 +238,11 @@ function fakeWs() {
 async function makeEngine({ sincePages = {}, bootstrapPage, unprocessed = [], deliver, extraConfig = {}, wsConnect, logs } = {}) {
   const home = await tempHome()
   const store = await openDaemonStore(home)
-  const registry = createRegistry()
+  // 测试侧计数器：每轮孤儿扫描都会 `registry.list()` 一次（engine.ts 的启动门槛）
+  // ⇒ 负向断言可以用 waitForSweeps(registryCounts, n) 证明"扫描真的跑过 n 轮"，
+  // 而不是 `sleep(200)` 猜一把。注册表行为原样透传（生产代码不感知）。
+  const registryCounts = { listCalls: 0 }
+  const registry = countRegistryLists(createRegistry(), registryCounts)
   const ws = fakeWs()
   const delivered = []
   const listCalls = []
@@ -218,7 +281,7 @@ async function makeEngine({ sincePages = {}, bootstrapPage, unprocessed = [], de
     deliver_token: 'tok-1', protocol: DAEMON_PROTOCOL,
     workspaces: [{ project_key: 'pk-1', key: 'ws-a', title: 'a', path: '/a' }],
   }
-  return { engine, store, registry, ws, delivered, listCalls, instance, home }
+  return { engine, store, registry, registryCounts, ws, delivered, listCalls, instance, home }
 }
 
 await check('engine: new_message → ack → since fetch → coalesced delivery → cursor advance', async () => {
@@ -292,10 +355,12 @@ await check('engine: 409 (no live session) → pending → redelivered on regist
 })
 
 await check('engine: notify_paused tracks silently (cursor advances, nothing delivered)', async () => {
+  const logs = []
   const { engine, store, registry, ws, delivered, instance } = await makeEngine({
     bootstrapPage: { messages: [mail('m0')], next_cursor: 'C1', has_more: false },
     sincePages: { C1: { messages: [mail('m2')], next_cursor: 'C2', has_more: false } },
     unprocessed: () => [mail('m2')],
+    logs,
   })
   try {
     await engine.start()
@@ -306,11 +371,18 @@ await check('engine: notify_paused tracks silently (cursor advances, nothing del
     })
 
     ws.ontext(JSON.stringify({ type: 'new_message', message: { message_id: 'm2' } }))
-    await waitFor(() => store.get().inboxes['pk-1']?.watch_cursor === 'C2')
-    await sleep(150) // past the 40ms batch window: nothing may be in flight
+    // T-39：先等**这条路真的走完**（静音分支自己会留一行日志），再断言"什么都没投"。
+    // 光靠 sleep 是在猜"取信那一步已经发生"，机器一慢断言就变成假绿。
+    await waitForLog(logs, /notify paused .*tracked silently/, '静音分支必须跑完（游标已推进）')
+    assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C2', '静音不影响跟踪：游标照常推进')
     assert.equal(delivered.length, 0)
     assert.equal(store.get().inboxes['pk-1'].batch, undefined)
     assert.equal(store.get().pending.length, 0)
+
+    // 再等过 40ms 批次窗口：万一这条路径真的入队了，窗口内必然 flush（belt）。
+    await sleep(150)
+    assert.equal(delivered.length, 0, '静音期间一个批次都不许投出去')
+    assert.equal(store.get().inboxes['pk-1'].batch, undefined)
   } finally {
     await engine.stop()
   }
@@ -422,13 +494,16 @@ await check('orphan pending: 假死 key 的批次超阈值 ⇒ 归档 + 该地�
   try {
     // 归档现在发生在 reconcile 跳（orphanCase 里 120ms 一跳），不再是 start() 首扫。
     await engine.start()
-    await waitFor(() => store.get().pending.length === 0)
+    // ⚠️ T-39：**等日志本身**，不要等 `pending.length === 0`。
+    // state 是在 `store.mutate(...)` 里先变空、日志在那次 mutate 的 await 之后才写
+    // —— 中间正好是一个抢跑窗口（实测 6 跑 2 败，失败信息就是"日志里没有归档行"）。
+    const line = await waitForLog(logs, /archived 1 orphan mail\(s\)/, '归档必须留下日志')
+    // 归档的状态后果（游标跨过去）同样要有界等待，而不是假设"日志有了状态就一定有"。
+    await waitFor(() => store.get().pending.length === 0, 3000, '归档后 pending 必须清空')
     assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C2', '归档后游标必须能越过钉住它的批次')
     assert.equal(store.get().inboxes['pk-1'].acked_seq, 2)
     assert.equal(delivered.length, 0, '死实例不该被投递')
 
-    const line = logs.find((entry) => /archived 1 orphan mail\(s\)/.test(entry))
-    assert.ok(line, `归档必须留下日志，实际：${JSON.stringify(logs)}`)
     assert.match(line, /a@msg9\.io \(pk-1\)/, '日志要说清归档的是谁')
     assert.match(line, /no live instance for 30(\.\d+)?h \(> 24h reconnect budget\)/, '日志要说清为什么')
     assert.match(line, /batches \[orphan-1\]/, '日志必须带上批次 id（T-33 ②：事后追查归档了哪些批次）')
@@ -447,20 +522,24 @@ await check('orphan pending ①：注册表构造性为空时绝不归档（daem
   // 的实例（投递连续 409 ⇒ pending 隔夜压过 24h）会被整批归档：那些信从此不再
   // 唤醒任何人（服务器 inbox 里还在，只是本 daemon 的游标跨了过去）。
   const logs = []
-  const { engine, store, registry, instance } = await orphanCase({ logs })
+  const { engine, store, registry, registryCounts, instance } = await orphanCase({ logs })
   await seedOrphanPending(store, { ageHours: 30 })
   try {
     await engine.start()
-    // 注册表仍为空：跑够几跳 sweep（orphanCase 里 120ms 一跳）也不得动手 ——
+    // 注册表仍为空：跑够 3 轮扫描也不得动手 ——
     // "从没被填充过的注册表"不构成"这些 key 都死了"的证据。
-    await sleep(300)
+    // 用 waitForSweeps 而不是 sleep：负向断言必须建立在"扫描**确实跑过** 3 轮"
+    // 这个事实上，否则机器一忙就变成"什么都没发生所以通过"（假绿）。
+    await waitForSweeps(registryCounts, 3)
+    assert.ok(registryCounts.listCalls >= 3, `扫描必须真的跑过（实际 ${registryCounts.listCalls} 轮）`)
     assert.equal(store.get().pending.length, 1, '空注册表不是证据：>24h 的 pending 绝不能在启动窗口被归档')
     assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1', '不得越过未投递的批次')
     assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
 
     // 实例随后注册（真实节奏：45s 心跳内重注册）⇒ live，同样不得归档。
+    const before = registryCounts.listCalls
     registry.upsert(instance, Date.now())
-    await sleep(300)
+    await waitForSweeps(registryCounts, before + 3)
     assert.equal(store.get().pending.length, 1, 'live 注册出现后，再老的 pending 也必须留给它投递')
     assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1')
     assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
@@ -471,12 +550,12 @@ await check('orphan pending ①：注册表构造性为空时绝不归档（daem
 
 await check('orphan pending: 活跃实例的 pending 再老也不归档（live 注册是否定条件）', async () => {
   const logs = []
-  const { engine, store, registry, instance } = await orphanCase({ logs })
+  const { engine, store, registry, registryCounts, instance } = await orphanCase({ logs })
   await seedOrphanPending(store, { ageHours: 30 })
   registry.upsert(instance, Date.now()) // 刚刚心跳过 ⇒ live
   try {
     await engine.start()
-    await sleep(200)
+    await waitForSweeps(registryCounts, 3)
     assert.equal(store.get().pending.length, 1, '有 live 实例 ⇒ 不得归档')
     assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1', '不得越过未投递的批次')
     assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
@@ -487,12 +566,12 @@ await check('orphan pending: 活跃实例的 pending 再老也不归档（live �
 
 await check('orphan pending: 失活但未超阈值的批次不归档（正常重连窗口，本卡最关键的边界）', async () => {
   const logs = []
-  const { engine, store, registry, instance } = await orphanCase({ logs })
+  const { engine, store, registry, registryCounts, instance } = await orphanCase({ logs })
   await seedOrphanPending(store, { ageHours: 2 }) // 2h < 24h：还在重连预算里
   registry.upsert(instance, Date.now() - INSTANCE_STALE_MS - 60_000)
   try {
     await engine.start()
-    await sleep(200)
+    await waitForSweeps(registryCounts, 3)
     assert.equal(store.get().pending.length, 1, '未超阈值 ⇒ 必须留着等实例回来')
     assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C1', '重连窗口里游标必须原地等')
     assert.equal(logs.filter((entry) => /archived/.test(entry)).length, 0)
