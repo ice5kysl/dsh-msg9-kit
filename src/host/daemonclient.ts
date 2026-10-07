@@ -35,6 +35,8 @@ import { fileURLToPath } from 'node:url'
 import { DAEMON_PROTOCOL } from './daemon/main.ts'
 import type { WorkspaceRow } from './daemon/engine.ts'
 import { daemonHome, readDaemonInfo, type DaemonInfo } from './daemon/state.ts'
+// T-43 b：daemon.log 按大小滚动（复制+清空，见 daemonlog.ts 的取舍说明）。
+import { rotateDaemonLog } from './daemonlog.ts'
 // T-13 阶段三：死 pid 自愈（只读判断）。
 import { isPidAlive } from './cutover.ts'
 
@@ -233,6 +235,13 @@ export function createDaemonClient(deps: DaemonClientDeps): DaemonClient {
     const logPath = join(home, 'daemon.log')
     try {
       mkdirSync(home, { recursive: true })
+      // T-43 b：spawn **之前**滚一次 —— 此刻还没有子进程持有 fd，是最干净的时刻。
+      // 但光靠这里不够：daemon 起来之后可以连着跑很久（观察期里就是这样），
+      // 所以 heartbeat() 每 45s 再按大小兜一次。
+      const rotation = rotateDaemonLog(home)
+      if (rotation.rotated) {
+        log(`msg9 daemon: rotated daemon.log (${Math.round(rotation.sizeBytes / 1024)} KiB → daemon.log.1)`)
+      }
       const logFd = openSync(logPath, 'a')
       try {
         spawn(process.execPath, [binPath], { detached: true, stdio: ['ignore', logFd, logFd] }).unref()
@@ -259,9 +268,34 @@ export function createDaemonClient(deps: DaemonClientDeps): DaemonClient {
     return undefined
   }
 
+  /**
+   * T-43 b：心跳顺带看一眼日志体量。
+   *
+   * 为什么放在这里：daemon 起来之后不再重启，spawn 时那次滚动就只生效一次，
+   * 而**长期运行**恰恰是这条尾巴被漏掉的原因（"无限增长"要跑很久才吃到）。
+   * 插件每 45s 心跳一次，顺手 stat 一下的代价可以忽略。
+   *
+   * 滚动**永远不许影响心跳**：这是运维卫生，任何一次罕见的 fs 竞态都不该
+   * 演变成"投递链断了"。rotateDaemonLog 自身不抛（失败也不清空当前文件），
+   * 这里再包一层只是把"绝不连锁"写成代码而不是写成承诺。
+   */
+  function rotateLogIfNeeded(): void {
+    try {
+      const rotation = rotateDaemonLog(home)
+      if (rotation.rotated) {
+        log(`msg9 daemon: rotated daemon.log (${Math.round(rotation.sizeBytes / 1024)} KiB → daemon.log.1)`)
+      } else if (rotation.reason === 'failed') {
+        log(`msg9 daemon: daemon.log rotation skipped: ${rotation.error ?? 'unknown error'}`)
+      }
+    } catch (error) {
+      log(`msg9 daemon: daemon.log rotation failed: ${(error as Error)?.message ?? String(error)}`)
+    }
+  }
+
   async function heartbeat(): Promise<void> {
     if (heartbeating) return
     heartbeating = true
+    rotateLogIfNeeded()
     try {
       const workspaces = await deps.getWorkspaces()
       const port = deps.getPort()

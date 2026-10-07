@@ -10,8 +10,8 @@
 
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { existsSync, statSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -23,6 +23,8 @@ process.env.MSG9_HOME = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-daemon-msg9ho
 
 const {
   BridgeError,
+  DAEMON_LOG_KEEP,
+  DAEMON_LOG_MAX_BYTES,
   DAEMON_PROTOCOL,
   DeliverHttpError,
   FrameParser,
@@ -40,9 +42,12 @@ const {
   encodeFrame,
   isStalePidFile,
   openDaemonStore,
+  planDaemonLogRotation,
   readDaemonInfo,
   removeDaemonInfo,
+  rotateDaemonLog,
   selectOrphanPending,
+  shouldRotateDaemonLog,
   writeDaemonInfo,
 } = await import('../lib/index.js')
 
@@ -656,6 +661,62 @@ await check('engine: a socket that died BEFORE attach is reconciled instead of p
   }
 })
 
+await check('engine: 出生即死的连接不再被"多武装一次"看门狗（T-43 a：对账分支缺 return）', async () => {
+  // 对账分支若漏了 return，代码会继续往下，给**这条已经死了的** socket 再装一个看门狗。
+  // 阈值一到它就喊 "silent past the watchdog window"（外加 destroy() 触发的 "ws closed"）
+  // —— 于是"出生即死"被记成"活着但沉默"。两种故障的处置完全不同，日志里分不清就只能猜。
+  //
+  // ⚠️ 这个多余的看门狗**只有一个窗口**能开火：attachWs 之后到本轮 `continue` 之间那次
+  // catch-up 取信（engine.ts:345）。`continue` 会走循环的 finally ⇒ releaseWs() 立刻把它
+  // 清掉。也就是说：**catch-up 够快它就永远打不出那行假日志** —— 这正是它至今没被发现的
+  // 理由（测试里的假页是毫秒级，真实网络不是）。所以这里让**第一条连接的 catch-up 慢 400ms**，
+  // 把它逼出来；第二条连接照旧是快的，免得它的看门狗也在同一窗口里合法开火、混淆断言。
+  const page = () => {
+    const value = { messages: [], next_cursor: 'C1', has_more: false }
+    // thenable（不是裸对象）：只有再 resolve 一层才真的占用 400ms 的 await 窗口。
+    // 注意必须 resolve 到**另一个**对象，拿自己 resolve 会让 promise 自解析、永不 settle。
+    const delay = connects <= 1 ? 400 : 0
+    return { ...value, then(resolve) { setTimeout(() => resolve(value), delay) } }
+  }
+  const destroys = []
+  const logs = []
+  let connects = 0
+  const { engine, registry, instance } = await makeEngine({
+    bootstrapPage: page(),
+    sincePages: new Proxy({}, { get: () => async () => page() }),
+    extraConfig: { reconnectBaseMs: 20, reconnectMaxMs: 40, wsWatchdogMs: 120, safetyNetMs: 600_000 },
+    logs,
+    wsConnect: async () => {
+      connects += 1
+      const n = connects
+      const ws = fakeWs()
+      destroys[n - 1] = 0
+      const destroy = ws.destroy
+      ws.destroy = () => { destroys[n - 1] += 1; destroy() }
+      ws.isClosed = n === 1 // 第一条"出生即死"
+      return ws
+    },
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    // connects 自增发生在第二次 wsConnect 的**开头**，此刻第二条连接还没 attach
+    // ⇒ 下面这两条断言看到的是"只有死连接存在过"的那一段日志。
+    await waitFor(() => connects >= 2, 4000)
+    // 一条断言同时钉住"多武装"的两个后果：对死连接调了一次 destroy()，以及那行假日志。
+    // 合并成一次比较，是为了失败信息里能同时看到两个数字 —— 只报第一个的话，
+    // "假日志到底打没打出来"就得靠再跑一次才知道。
+    const falseWake = logs.filter((line) => /silent past the watchdog window/.test(line))
+    assert.deepEqual(
+      { deadSocketDestroys: destroys[0], falseWatchdogLines: falseWake.length },
+      { deadSocketDestroys: 0, falseWatchdogLines: 0 },
+      `出生即死的 socket 不该再被看门狗武装：destroy=${destroys[0]}，假日志=${JSON.stringify(falseWake)}`,
+    )
+  } finally {
+    await engine.stop()
+  }
+})
+
 await check('engine: WS「连着但不发帧」（活进程·死连接）→ 看门狗判死并重连', async () => {
   // 这是真实故障形态：服务端重启后 socket 还"开着"，但再也不推任何东西。
   // 若没有看门狗，进程会**一直活着、一声不响**——信照样进账本（真相源是 inbox），
@@ -957,6 +1018,104 @@ await check('daemonclient: 真实 spawn 必须留下 daemon.log（否则日志�
     existsSync(join(home, 'daemon.log')),
     'spawn 之后必须留下 daemon.log —— 这是 msg9 PO 那次 90 分钟静默卡死唯一的追查线索',
   )
+})
+
+// ------------------------------------------------------- daemon.log 轮转 (T-43 b)
+// 全部在 tempHome() 里做 —— **绝不碰真实的 ~/.msg9/**（也不碰真实的 daemon home）。
+
+await check('daemonlog: 阈值判据的边界是 >=（正好到上限就该滚，少一字节不滚）', async () => {
+  assert.equal(DAEMON_LOG_MAX_BYTES, 2 * 1024 * 1024, '阈值是写进注释的 2 MiB —— 改它必须有意识的改这条断言')
+  assert.equal(DAEMON_LOG_KEEP, 3, '保留 3 份历史 —— 同上')
+  assert.equal(shouldRotateDaemonLog(DAEMON_LOG_MAX_BYTES - 1), false)
+  assert.equal(shouldRotateDaemonLog(DAEMON_LOG_MAX_BYTES), true, '正好等于上限必须滚（>= 不是 >）')
+  assert.equal(shouldRotateDaemonLog(0), false, '空文件不滚')
+})
+
+await check('daemonlog: 搬动计划只留 N 份（顺序必须是先搬最旧的，否则自己覆盖自己）', async () => {
+  // 默认参数必须等于策略常量：调用方（daemonclient）不传 opts 就是这个形状，
+  // 所以这里钉的是**生产路径真的会执行的计划**，而不是"某个入参下的计划"。
+  assert.deepEqual(planDaemonLogRotation(), planDaemonLogRotation(DAEMON_LOG_KEEP))
+  assert.equal(planDaemonLogRotation().drop, 'daemon.log.3', '默认 3 份 ⇒ 被挤掉的是最旧的 .3')
+  assert.deepEqual(planDaemonLogRotation(3), {
+    drop: 'daemon.log.3',
+    shifts: [{ from: 'daemon.log.2', to: 'daemon.log.3' }, { from: 'daemon.log.1', to: 'daemon.log.2' }],
+    copyTo: 'daemon.log.1',
+  })
+  // keep=1：只有一份历史，没有右移，最旧的那份就是 .1（先删再复制）。
+  assert.deepEqual(planDaemonLogRotation(1), { drop: 'daemon.log.1', shifts: [], copyTo: 'daemon.log.1' })
+})
+
+await check('daemonlog: 未到阈值一行不动；到阈值整份留档并把当前文件清空', async () => {
+  const home = await tempHome()
+  const logPath = join(home, 'daemon.log')
+  const opts = { maxBytes: 64, keep: 3 }
+
+  await writeFile(logPath, 'x'.repeat(63))
+  const skipped = rotateDaemonLog(home, opts)
+  assert.equal(skipped.rotated, false)
+  assert.equal(skipped.reason, 'below-threshold')
+  assert.equal(await readFile(logPath, 'utf8'), 'x'.repeat(63), '没到阈值不许动当前文件')
+  assert.equal(existsSync(join(home, 'daemon.log.1')), false, '没到阈值不许产生历史份')
+
+  await writeFile(logPath, 'A'.repeat(64))
+  const rotated = rotateDaemonLog(home, opts)
+  assert.equal(rotated.rotated, true)
+  assert.equal(rotated.reason, 'rotated')
+  assert.equal(rotated.sizeBytes, 64)
+  assert.equal(await readFile(join(home, 'daemon.log.1'), 'utf8'), 'A'.repeat(64), '留档必须是滚之前的内容')
+  assert.equal(await readFile(logPath, 'utf8'), '', '当前文件必须清空 —— daemon 手里还攥着它的 fd')
+})
+
+await check('daemonlog: 只保留 keep 份，最旧的一代被挤掉（绝不出现第 keep+1 份）', async () => {
+  const home = await tempHome()
+  await writeFile(join(home, 'daemon.log.1'), 'one')
+  await writeFile(join(home, 'daemon.log.2'), 'two')
+  await writeFile(join(home, 'daemon.log.3'), 'three')
+  await writeFile(join(home, 'daemon.log'), 'current')
+
+  const result = rotateDaemonLog(home, { maxBytes: 4, keep: 3 })
+  assert.equal(result.rotated, true)
+  assert.equal(await readFile(join(home, 'daemon.log.1'), 'utf8'), 'current')
+  assert.equal(await readFile(join(home, 'daemon.log.2'), 'utf8'), 'one')
+  assert.equal(await readFile(join(home, 'daemon.log.3'), 'utf8'), 'two', '原来的 .3("three") 必须被挤掉')
+  assert.equal(existsSync(join(home, 'daemon.log.4')), false, 'keep=3 ⇒ 永远不该出现第 4 份')
+})
+
+await check('daemonlog: 留档失败时绝不清空当前文件（线索比整洁重要）', async () => {
+  const home = await tempHome()
+  // 让"复制到 daemon.log.1"必然失败：占位成一个目录。keep=1 ⇒ 没有右移，直接撞上它。
+  // （65 字节：明确超过 64 的阈值，免得这条断言顺带依赖阈值边界那条规则。）
+  await mkdir(join(home, 'daemon.log.1'))
+  await writeFile(join(home, 'daemon.log'), 'B'.repeat(65))
+
+  const result = rotateDaemonLog(home, { maxBytes: 64, keep: 1 })
+  assert.equal(result.rotated, false)
+  assert.equal(result.reason, 'failed')
+  assert.equal(await readFile(join(home, 'daemon.log'), 'utf8'), 'B'.repeat(65), '失败也必须原样留着')
+})
+
+await check('daemonclient: spawn 之前滚动超限的 daemon.log（子进程拿到的是清空后的那个 fd）', async () => {
+  const home = await tempHome()
+  const logPath = join(home, 'daemon.log')
+  // 造一个"跑了很久"的现场：超过阈值 1 字节。
+  await writeFile(logPath, 'x'.repeat(DAEMON_LOG_MAX_BYTES + 1))
+
+  const client = createDaemonClient({
+    home,
+    getPort: () => 0,
+    getWorkspaces: async () => [],
+    dshHome: () => '/tmp/dsh-test-home',
+    log: () => {},
+    heartbeatMs: 60_000,
+    bootTimeoutMs: 100,
+    // 真 spawn（不注入 spawnDaemon）：指向一个不存在的脚本，node 立刻退出。
+    // 这一步顺带证明"清空之后继承过去的 fd 依然可写"（node 的错误行落在新文件里）。
+    binPath: join(home, 'does-not-exist.mjs'),
+  })
+  await client.start().catch(() => {})
+
+  assert.ok(statSync(join(home, 'daemon.log.1')).size >= DAEMON_LOG_MAX_BYTES, '超限的旧日志必须整份留档')
+  assert.ok(statSync(logPath).size < DAEMON_LOG_MAX_BYTES, '当前文件必须重新开始，而不是接着那 2 MiB 长')
 })
 
 await check('daemonclient: spawns the daemon when none is running and waits for it', async () => {

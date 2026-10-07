@@ -163,6 +163,9 @@ export {
 export { connectWebSocket, encodeFrame, FrameParser, OPCODES, WsConnection, WsError } from './daemon/wsclient.ts'
 export { enumerateIdentities } from './daemon/identity.ts'
 export { createDaemonClient, daemonInstanceId } from './daemonclient.ts'
+// T-43 b：daemon.log 的滚动（阈值判据与搬动计划是纯函数，测试直接钉它们）。
+export { DAEMON_LOG_KEEP, DAEMON_LOG_MAX_BYTES, planDaemonLogRotation, rotateDaemonLog, shouldRotateDaemonLog } from './daemonlog.ts'
+export type { DaemonLogRotationOptions, DaemonLogRotationPlan, DaemonLogRotationResult, DaemonLogShift } from './daemonlog.ts'
 // T-13 二期第一阶段：平台账本（spool）消费者骨架 —— 只读契约 + 纯函数判据。
 // 本阶段没有任何调用方切到它（投递路径仍是 watch.ts），导出是为了让测试与
 // 后续阶段（以及 msg9_status 的滞后读数）有稳定的公共面。

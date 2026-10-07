@@ -397,6 +397,12 @@ class InboxRunner {
     if (ws.isClosed) {
       this.log(`msg9 daemon: ws for ${this.projectKey} was already closed before attach — retrying`)
       this.releaseWs()
+      // 必须 return（T-43 a）：这条 socket 已经死了，再往下就会给**死连接**装一次
+      // 看门狗 —— 阈值一到它就喊 "silent past the watchdog window"（外加 destroy()
+      // 触发的 "ws closed"），把"出生即死"记成"活着但沉默"：两种故障的处置完全不同，
+      // 日志一旦分不清就只能靠猜。releaseWs() 已经放掉了 waiter，这条死连接不需要
+      // 后面任何一个动作。
+      return
     }
     if (this.watchdog) clearInterval(this.watchdog)
     // 检查节奏**从阈值推导**，不再硬编码 15 秒。
