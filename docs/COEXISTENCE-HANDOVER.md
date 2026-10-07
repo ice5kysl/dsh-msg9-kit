@@ -258,4 +258,6 @@ cat ~/.dsh/msg9-daemon/daemon.json 2>/dev/null
   **无法追踪真进程**（只能靠 `StartInterval` 这种"定期检查再拉起"的间接看守）。正解应由平台提供
   `--foreground` 或 `msg9 daemon install` 的自托管模板。
 
+**运维坑（2026-10-07 实测）**：**重载 launchd agent（`bootout` + `bootstrap`）会终止该 job 进程组里的进程** ⇒ 正在跑的 daemon 会被带走（我们实测：重载瞬间 daemon 从 pid 55422 变成 68722，启动时间 11:57:24 → 12:05:26）。**这不是不稳定，而是重载的副作用** —— 而且**看门狗在同一分钟内自动把它救回来了**（`runs` +1、`last exit code = 0`、err 日志无增长）＝ 常驻机制的一次真实演练。**要改 plist 就预期一次短暂重启**；只想拉起不必重载（`launchctl kickstart gui/$UID/io.msg9.daemon` 即可）。
+
 
