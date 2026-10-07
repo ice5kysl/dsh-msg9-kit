@@ -35,6 +35,8 @@ import { fileURLToPath } from 'node:url'
 import { DAEMON_PROTOCOL } from './daemon/main.ts'
 import type { WorkspaceRow } from './daemon/engine.ts'
 import { daemonHome, readDaemonInfo, type DaemonInfo } from './daemon/state.ts'
+// T-13 阶段三：死 pid 自愈（只读判断）。
+import { isPidAlive } from './cutover.ts'
 
 export interface DaemonClientDeps {
   /** Daemon home override (tests point at a temp dir; default ~/.dsh/msg9-daemon). */
@@ -206,6 +208,14 @@ export function createDaemonClient(deps: DaemonClientDeps): DaemonClient {
   async function findDaemon(): Promise<DaemonInfo | undefined> {
     const info = await readDaemonInfo(home)
     if (!info) return undefined
+    // T-13 阶段三（死 pid 自愈）：daemon.json 可能指向**已经不在的**进程
+    // （历史 56926；平台侧的同类是本机 `daemon.lock.machine-Jiker` 里的 75656）。
+    // 死了就当没有 —— 连 800ms 的 /healthz 探测都不必做，也绝不因此拒绝启动：
+    // ensureDaemon 会照常 spawn 一个新的。**只读判断，绝不改用户文件。**
+    if (!isPidAlive(info.pid)) {
+      log(`msg9 daemon: daemon.json points at dead pid ${info.pid}; treating it as absent`)
+      return undefined
+    }
     if (!(await healthy(info))) return undefined
     return info
   }

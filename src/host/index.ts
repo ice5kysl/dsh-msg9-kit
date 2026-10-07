@@ -22,10 +22,24 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { listInbox, streamInbox } from './api.ts'
 import { registerMsg9Commands } from './commands.ts'
-import { deriveProjectKey, resolveCredentials } from './credentials.ts'
+import { deriveProjectKey, msg9Home, resolveCredentials } from './credentials.ts'
 import { BRIDGE_PREFIX, BridgeError, createMsg9Bridge, defaultBridgeDeps, computeUnread, createBridgeEventBus, noteInboxSnapshot, clearInboxSnapshot } from './http.ts'
 import { L } from './locale.ts'
 import { loadState, setWatchState, getNotifyPaused, type LiveInbox } from './store.ts'
+// T-13 阶段三：共存交接判据层（ingest 开关 / --scope 选择器 / 死 pid 自愈）。
+// 判据全是纯函数；接线只**读**它们，不因此改变 self 模式的任何行为。
+import {
+  INGEST_ENV,
+  assertSingleWakeSource,
+  assessDaemonCoverage,
+  planIngest,
+  platformDaemonHealth,
+  readDaemonLocks,
+  readDaemonPidState,
+  resolveIngestMode,
+  type IngestPlan,
+} from './cutover.ts'
+import { consumerCursorPath, ledgerPath, spoolDir } from './ledger.ts'
 import { registerMsg9Tools } from './tools.ts'
 import { matchWorkspaceByPath, setWorkspaceRegistry, type WorkspaceRegistryLike } from './workspace.ts'
 import { createDaemonClient, type DaemonClient } from './daemonclient.ts'
@@ -39,11 +53,14 @@ import {
   deliverDaemonBatch,
   pluginNotice,
   pollOnce,
+  startLedgerIngestLoop,
   streamInboxLoop,
   type DaemonDelivery,
+  type LedgerIngestLoop,
   type StreamWatchDeps,
   type WatchAgent,
   type WatchDeps,
+  type WatchRuntime,
 } from './watch.ts'
 
 export const name = 'msg9-kit'
@@ -80,7 +97,48 @@ export {
 } from './credentials.ts'
 export { harnessAgentName, HARNESS_AGENT_NAMES, listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
 export { loadState, stateFilePath, upsertWorkspaceInbox, withStateLock } from './store.ts'
-export { WakeBudget, createNonReentrant, createWatchRuntime, deliverDaemonBatch, flushBatch, pluginNotice, pollOnce, renderMailNotice, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
+export { WakeBudget, createLedgerIngest, createNonReentrant, createWatchRuntime, deliverBatch, deliverDaemonBatch, flushBatch, pluginNotice, pollOnce, renderMailNotice, startLedgerIngestLoop, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
+export type { LedgerIngest, LedgerIngestLoop, LedgerIngestOptions } from './watch.ts'
+// T-13 阶段三：共存交接的判据层（默认 self 的 ingest 开关、--scope 的**选择器**
+// 语义、死 pid 自愈、daemon 覆盖判定、账本分支的投递计划）。
+export {
+  DEFAULT_INGEST,
+  INGEST_ENV,
+  SCOPE_CONTRACT,
+  addressTenant,
+  assertSingleWakeSource,
+  assessDaemonCoverage,
+  daemonHealthFromStatus,
+  daemonScopeCovers,
+  isPidAlive,
+  observePlatformDaemon,
+  parseScopeFlag,
+  planIngest,
+  planLedgerBatch,
+  platformDaemonHealth,
+  readDaemonLocks,
+  readDaemonPidState,
+  readDaemonStatuses,
+  resolveIngestMode,
+  resolveWakeSources,
+  scopeFlagForAddress,
+  scopeFromStatusFile,
+  scopeNeededFor,
+  tryParseScopeFlag,
+} from './cutover.ts'
+export type {
+  AddressTenant,
+  DaemonCoverageReport,
+  DaemonLock,
+  DaemonPidState,
+  DaemonScope,
+  IngestMode,
+  IngestPlan,
+  IngestResolution,
+  LedgerBatchPlan,
+  PlatformDaemonStatus,
+  WakeSource,
+} from './cutover.ts'
 // The watcher daemon's public surface (bin entry + integration tests).
 export { DAEMON_PROTOCOL, createDaemon, runDaemon } from './daemon/main.ts'
 export { createEngine, createRegistry, defaultEngineConfig, DeliverHttpError, INSTANCE_STALE_MS, wsUrlFor } from './daemon/engine.ts'
@@ -169,9 +227,18 @@ interface SessionStartPayload {
 
 const WATCH_POLL_MS = Math.max(1_000, Number(process.env.MSG9_WATCH_MS ?? 30_000) || 30_000)
 
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config?: unknown): void {
   const log = ctx.logger('msg9-kit')
   log.info('msg9-kit loaded')
+
+  // T-13 阶段三：ingest 开关（**默认 self**）。默认行为一字不改；只有显式配置
+  // （cordis 插件配置的 `ingest`）或 `MSG9_INGEST` 才切到平台账本。值写错 ⇒
+  // 回落 self 并大声记一笔 —— 写错一个字母就静默换掉唤醒路径是最坏的结果。
+  const ingestOptions = config && typeof config === 'object' ? (config as Record<string, unknown>) : {}
+  const ingest = resolveIngestMode({ config: ingestOptions.ingest, env: process.env[INGEST_ENV] })
+  const plan = planIngest(ingest.mode, { daemonDisabled: process.env.MSG9_WATCH_DAEMON === '0' })
+  log.info(`msg9 ingest: ${plan.mode} (from ${ingest.source}) — ledger loop=${plan.ledgerLoop}, self daemon=${plan.selfDaemon}, in-process watcher=${plan.inProcessWatcher}`)
+  if (ingest.warning) log.warn(ingest.warning)
 
   registerMsg9Tools(ctx)
   log.info('msg9 tools registered (setup, inbox, outbox, send, read, done, message, notify, resolve, contacts, peers, rotate, status)')
@@ -318,9 +385,90 @@ export function apply(ctx: Context): void {
       () => webServerRef?.port ?? 0,
       daemonDelivery,
       daemonUnread,
+      plan,
     )
-    log.info(`msg9 new-mail watcher started (daemon-first, in-process fallback every ${WATCH_POLL_MS / 1000}s)`)
+    log.info(plan.ledgerLoop
+      ? `msg9 new-mail watcher started (ingest=ledger: platform ledger every ${WATCH_POLL_MS / 1000}s)`
+      : `msg9 new-mail watcher started (ingest=self: daemon-first, in-process fallback every ${WATCH_POLL_MS / 1000}s)`)
   })
+}
+
+/**
+ * T-13 阶段三：`ingest: 'ledger'` 的接线 —— **唯一的唤醒来源**是账本消费者。
+ *
+ * 另外两个可能的来源在这里**刻意不启动**：自研 daemon 客户端不创建（于是
+ * /dsh-msg9/deliver 拿不到 token，它不可能投递唤醒），进程内 watcher 也不挂载。
+ * 唤醒只走 `startLedgerIngestLoop`。
+ *
+ * 顺带把两条只读观测落到日志里：
+ *   · **死 pid 自愈** —— `~/.dsh/msg9-daemon/daemon.json` 指向死 pid 时当它没有
+ *     （只读判断，绝不改用户文件，也绝不因此拒绝启动）；
+ *   · **daemon 覆盖** —— 没有任何 daemon 覆盖的地址必须"响亮地"报出来（判据 ③）。
+ */
+function startLedgerIngest(
+  ctx: Context,
+  deps: WatchDeps,
+  rt: WatchRuntime,
+  plan: IngestPlan,
+  log: (message: string) => void,
+): void {
+  const loops = new Map<string, { address: string; loop: LedgerIngestLoop }>()
+  ctx.effect(() => {
+    log(`msg9 ingest(ledger): the only wake source is ${assertSingleWakeSource(plan, false)}`)
+
+    // 死 pid 自愈（只读）：daemon.json 可能指着早就没了的进程。
+    void readDaemonPidState().then(
+      (state) => log(`msg9 cutover: self daemon ${state.present ? (state.alive ? `alive (pid ${state.pid})` : `DEAD (pid ${state.pid}) — treated as absent`) : 'absent'}: ${state.detail}`),
+      () => {},
+    )
+
+    let seenAddresses = ''
+    const reconcile = async (): Promise<void> => {
+      const state = await deps.loadState()
+      const addresses: string[] = []
+      for (const [key, row] of Object.entries(state.workspaces)) {
+        const inbox = row as LiveInbox
+        if (!inbox.api_key || !inbox.api_url || !inbox.address) continue
+        addresses.push(inbox.address)
+        const existing = loops.get(key)
+        if (existing && existing.address === inbox.address) continue
+        if (existing) {
+          existing.loop.stop()
+          loops.delete(key)
+        }
+        const loop = startLedgerIngestLoop(deps, rt, key, inbox, {
+          intervalMs: WATCH_POLL_MS,
+          // 平台 daemon 健康（只读）：.daemon-status*.json + 活锁。没有活 daemon
+          // ⇒ 'dead' ⇒ decideTopUp 走 inbox unread 补齐 —— 这就是「停 daemon →
+          // 发信 → 重启必须补上」赖以成立的那条判据（账本零滞后时它是唯一一条）。
+          daemonHealth: () => platformDaemonHealth(inbox.address, { spoolDir: spoolDir(), msg9Home: msg9Home() }),
+        })
+        loops.set(key, { address: inbox.address, loop })
+        log(`msg9 ingest(ledger): ${key} consumes ${ledgerPath(inbox.address)} with our own cursor ${consumerCursorPath(inbox.address)}`)
+      }
+      // daemon 覆盖：地址集合变了才检查一次（别每 60s 刷一遍同样的告警）。
+      const signature = [...addresses].sort().join('\n')
+      if (signature === seenAddresses) return
+      seenAddresses = signature
+      const locks = await readDaemonLocks(msg9Home())
+      const scopes = locks.filter((lock) => lock.alive && lock.scope).map((lock) => lock.scope!)
+      const report = assessDaemonCoverage(addresses, scopes, {
+        unparsedScopes: locks.filter((lock) => lock.alive && !lock.scope).map((lock) => lock.file),
+        staleLocks: locks.filter((lock) => lock.stale).map((lock) => lock.file),
+      })
+      for (const warning of report.warnings) log(warning.text)
+      if (addresses.length > 0 && report.warnings.length === 0) {
+        log(`msg9 cutover: all ${addresses.length} inbox(es) covered by a live daemon (${scopes.map((scope) => scope.label).join(', ')})`)
+      }
+    }
+    void reconcile()
+    const timer = setInterval(() => void reconcile(), 60_000)
+    return () => {
+      clearInterval(timer)
+      for (const row of loops.values()) row.loop.stop()
+      loops.clear()
+    }
+  }, 'msg9-kit: ledger ingest')
 }
 
 /** Cordis wiring of the watcher: session lookup + interval + session-start. */
@@ -334,6 +482,7 @@ function startWatcher(
   getPort: () => number,
   daemonDelivery: { token?: string; handle?: (body: DaemonDelivery) => Promise<unknown> },
   daemonUnread: { read?: () => Promise<Record<string, { unread?: number; total?: number; at?: number }>> },
+  plan: IngestPlan,
 ): void {
   const rt = createWatchRuntime()
 
@@ -418,7 +567,12 @@ function startWatcher(
     return { delivered: body.messages.length, mode: body.mode }
   }
 
-  if (process.env.MSG9_WATCH !== '0') {
+  // T-13 阶段三：**唤醒来源恰好一个**。ledger 模式把账本消费者接上，自研 daemon
+  // 与进程内 watcher 都**不**启动；self 模式与改前逐项一致（daemon-first，连不上
+  // 才退回进程内 watcher）。两条路径不会同时喂唤醒。
+  if (plan.ledgerLoop && process.env.MSG9_WATCH !== '0') {
+    startLedgerIngest(ctx, deps, rt, plan, log)
+  } else if (process.env.MSG9_WATCH !== '0') {
     // NOTE: do NOT probe ctx.interval here — in cordis, reading a service the
     // plugin never injected throws ("cannot get property without inject"),
     // which killed this fiber before the first poll. Plain timers tied to the
@@ -522,6 +676,7 @@ function startWatcher(
           return
         }
         if (connected) {
+          assertSingleWakeSource(plan, true)
           log('msg9 watcher daemon connected; this instance is a delivery target only')
           // T-23：把 daemon 手上的未读读数接到徽章上。project_key → workspace key
           // 的映射与注册时同源（state 的 project_key，缺省按 title/path 派生）。
@@ -548,6 +703,7 @@ function startWatcher(
             return out
           }
         } else {
+          assertSingleWakeSource(plan, false)
           if (daemonClient) log('msg9 watcher daemon unavailable; falling back to the in-process watcher')
           daemonClient = undefined
           daemonDelivery.token = undefined

@@ -23,6 +23,8 @@
 import type { InboxMessage, InboxPage } from './api.ts'
 import { bodyText, truncate } from '../shared/message.ts'
 import type { LiveInbox, State } from './store.ts'
+import { DEFAULT_LAG_TOPUP_MS, createLedgerConsumer, type DaemonHealth } from './ledger.ts'
+import { planLedgerBatch } from './cutover.ts'
 
 /** The live-agent face the watcher delivers to (subset of dsh's agent). */
 export interface WatchAgent {
@@ -375,7 +377,12 @@ async function enqueueDelivery(deps: WatchDeps, rt: WatchRuntime, key: string, i
     return
   }
   const windowMs = deps.batchWindowMs ?? 12_000
-  if (windowMs <= 0) return deliverBatch(deps, rt, key, inbox, messages)
+  if (windowMs <= 0) {
+    // deliverBatch 现在会回一个「活会话收下了吗」的布尔（账本路径要拿它决定
+    // 是否推进游标）；这里仍然只关心投递本身。
+    await deliverBatch(deps, rt, key, inbox, messages)
+    return
+  }
   const batch = rt.batches.get(key) ?? { messages: new Map<string, InboxMessage>() }
   for (const message of messages) batch.messages.set(message.message_id, message)
   rt.batches.set(key, batch)
@@ -430,12 +437,28 @@ export async function onlyUnprocessed(
   }
 }
 
-async function deliverBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbox: LiveInbox, messages: InboxMessage[]): Promise<void> {
-  // v1.13 alignment + v1.20 hardening: a message already closed ANYWHERE
-  // (panel, this agent via tools, another client) must not wake anyone again.
-  // The cursor tracks "notified", not "handled", so the server decides here.
-  const actionable = await onlyUnprocessed(deps, inbox, messages)
-  if (actionable.length === 0) return
+/**
+ * The last mile: reconcile, resolve the session, spend the budgets, deliver.
+ *
+ * Returns whether a live session ACCEPTED the batch — the ledger ingest needs
+ * that answer to decide whether the consumer cursor may advance (no live
+ * session ⇒ do not commit ⇒ retry next tick, exactly like the daemon's
+ * 409 ⇒ pending semantics).
+ *
+ * `options.reconcile: false` skips the `folder=unprocessed` re-check: the
+ * ledger path already built this batch FROM that very page, so a second call
+ * would only repeat the same truth for another unit of quota.
+ */
+export async function deliverBatch(
+  deps: WatchDeps,
+  rt: WatchRuntime,
+  key: string,
+  inbox: LiveInbox,
+  messages: InboxMessage[],
+  options: { reconcile?: boolean } = {},
+): Promise<boolean> {
+  const actionable = options.reconcile === false ? messages : await onlyUnprocessed(deps, inbox, messages)
+  if (actionable.length === 0) return false
 
   // Sticky target: notices keep going to the session they went to last time
   // while it stays alive, instead of drifting to whatever session is newest.
@@ -447,7 +470,7 @@ async function deliverBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbo
     agent = await deps.resolveAgent({ key, inbox })
     if (agent) await deps.setWatchState(key, { last_wake_agent_id: agent.id })
   }
-  if (!agent) return // no live session: the mail waits for the next session start
+  if (!agent) return false // no live session: the mail waits for the next session start
 
   const { text, summary } = renderMailNotice(inbox.address, actionable)
   const message = pluginNotice(deps.uuid(), text, summary)
@@ -464,6 +487,179 @@ async function deliverBatch(deps: WatchDeps, rt: WatchRuntime, key: string, inbo
   } else {
     agent.inject(message)
     deps.log(`watch: wake budget spent for ${agent.id}/${inbox.address}; injected ${actionable.length} mail(s) as context`)
+  }
+  return true
+}
+
+// ------------------------------------------------------------ ledger ingest
+
+/**
+ * T-13 阶段三：`ingest: 'ledger'` 分支的投递循环（**默认关**，见 cutover.ts）。
+ *
+ * 与 self 路径的差别只有「触发源」：唤醒不再来自自研 daemon 的 WS/REST 推送，
+ * 而来自**平台账本** `~/.msg9/spool/<address>.jsonl`（门铃 best-effort，账本是
+ * 真相源）。最后一段投递（对账 → 找活会话 → 风暴预算 → followup/inject）
+ * 复用同一个 `deliverBatch`，所以两条路径的语义、预算、粘性目标完全一致。
+ *
+ * 三条纪律：
+ *   1. **只有一个唤醒来源**：ledger 模式下自研 daemon 与进程内 watcher 都不启动
+ *      （由 index.ts 按 `planIngest` 分支，不靠"跑起来再看"）；
+ *   2. **一轮最多一次 REST**：账本行没有正文（契约第 1 条），正文必须去 server
+ *      拿；我们用**同一页** `folder=unprocessed` 既当正文来源，又当 v1.20 的权威
+ *      对账（已在别处闭环的信不在这一页里 ⇒ 不唤醒）；
+ *   3. **取不到那一页 ⇒ 绝不 commit**：游标不推进，下一轮重投。宁可重复一次，
+ *      也不静默吞掉唤醒。
+ */
+export interface LedgerIngestOptions {
+  /** 我们自己的 consumer 名（默认 `ledger.ts` 的 `DEFAULT_CONSUMER`）。 */
+  consumer?: string
+  /** spool 目录覆盖（测试传临时目录；生产用默认 `~/.msg9/spool`）。 */
+  spoolDir?: string
+  /** 滞后补齐阈值（默认 5 分钟，与阶段一骨架同源）。 */
+  lagThresholdMs?: number
+  /** 平台 daemon 健康（只读观测）；缺省 unknown ⇒ 只按滞后判。 */
+  daemonHealth?(): Promise<DaemonHealth>
+  /** 每轮 unprocessed 页的条数上限（默认 100）。 */
+  unprocessedLimit?: number
+}
+
+export interface LedgerIngest {
+  /** 跑一轮：读账本 + 游标 → 取正文对账 → 投递 → 确认后才 commit。 */
+  tick(): Promise<void>
+  /** 最近一轮的只读观测（诊断/测试用）。 */
+  readonly last: {
+    lagSeconds?: number
+    freshEvents: number
+    toppedUp: number
+    reconciledAway: number
+  }
+}
+
+export function createLedgerIngest(
+  deps: WatchDeps,
+  rt: WatchRuntime,
+  key: string,
+  inbox: LiveInbox,
+  options: LedgerIngestOptions = {},
+): LedgerIngest {
+  const log = deps.log
+  const limit = options.unprocessedLimit ?? 100
+  // 阶段一骨架的默认阈值（5 分钟）—— 在这里显式展开，免得"默认值藏在两处"。
+  const lagThresholdMs = options.lagThresholdMs ?? DEFAULT_LAG_TOPUP_MS
+  const last: LedgerIngest['last'] = { freshEvents: 0, toppedUp: 0, reconciledAway: 0 }
+  let pagePromise: Promise<InboxMessage[] | undefined> | undefined
+
+  /** 本轮那一页 `folder=unprocessed` —— **一轮只付一次 API 调用**。 */
+  const unprocessedOnce = (): Promise<InboxMessage[] | undefined> => {
+    pagePromise ??= (async () => {
+      try {
+        const page = await deps.listInbox(inbox.api_url, inbox.api_key, { folder: 'unprocessed', limit })
+        // `unread_count` 是**地址级**的（与查询无关）⇒ 顺手喂徽章，省掉一次 REST。
+        // 这里 `total` 是 folder=unprocessed 的命中数，不是信箱大小 ⇒ 刻意不传。
+        deps.onInboxSnapshot?.(key, { unread: page.unread_count, at: deps.now() })
+        return page.messages ?? []
+      } catch (error) {
+        log(`msg9 ledger: unprocessed fetch failed for ${inbox.address} (${(error as Error)?.message ?? String(error)})`)
+        return undefined
+      }
+    })()
+    return pagePromise
+  }
+
+  const consumer = createLedgerConsumer({
+    address: inbox.address,
+    ...(options.consumer === undefined ? {} : { consumer: options.consumer }),
+    ...(options.spoolDir === undefined ? {} : { spoolDir: options.spoolDir }),
+    lagThresholdMs,
+    // 补齐来源与投递来源是**同一页**（见上面第 2 条）。
+    fetchUnread: async () => {
+      const page = await unprocessedOnce()
+      if (!page) throw new Error('unprocessed page unavailable')
+      return page
+    },
+    ...(options.daemonHealth === undefined ? {} : { daemonHealth: options.daemonHealth }),
+    // 时钟与 watcher 同源：滞后判据必须可注入（测试要确定，生产是 Date.now）。
+    now: () => deps.now(),
+    log,
+  })
+
+  return {
+    last,
+    async tick() {
+      pagePromise = undefined
+      const poll = await consumer.pollOnce()
+      if (poll.baseline) {
+        // 与 self 路径同一条规矩：第一次观测只立基线，绝不把历史邮件倒进会话。
+        await poll.commit()
+        log(`msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path}`)
+        return
+      }
+      last.lagSeconds = poll.lag?.lag_seconds
+      const needed = poll.fresh.length > 0 || poll.top_up.topUp
+      const page = needed ? await unprocessedOnce() : []
+      const plan = planLedgerBatch(poll, page)
+      last.freshEvents = plan.fresh_events
+      last.toppedUp = plan.topped_up.length
+      last.reconciledAway = plan.reconciled_away.length
+
+      if (plan.retry) {
+        // 取不到 unprocessed 页：游标不动，下一轮重投（信在服务器，不丢）。
+        log(`msg9 ledger: ${plan.fresh_events} ledger event(s) for ${inbox.address} stay unconfirmed (retry next tick)`)
+        return
+      }
+      if (plan.deliver.length === 0) {
+        if (plan.fresh_events > 0 || poll.top_up.topUp) {
+          // 账本说有，但服务器说"已经没有未处理的了" ⇒ 已在别处闭环：跨过去，不唤醒。
+          if (plan.reconciled_away.length > 0) {
+            log(`msg9 ledger: skipped ${plan.reconciled_away.length} mail(s) already closed server-side for ${inbox.address}`)
+          }
+          await poll.commit()
+        }
+        return
+      }
+      if (await deps.isPaused?.()) {
+        // 与 self 路径同义：暂停期间照样跟踪（推进游标），但绝不投递、也不回放。
+        log(`msg9 ledger: notify paused — ${plan.deliver.length} mail(s) for ${inbox.address} tracked silently`)
+        await poll.commit()
+        return
+      }
+      // reconcile:false —— 这一批就来自 folder=unprocessed 那一页（权威对账已完成）。
+      const delivered = await deliverBatch(deps, rt, key, inbox, plan.deliver, { reconcile: false })
+      if (!delivered) {
+        // 没有活会话：**不 commit** ⇒ 下一轮重投（与自研 daemon 的 409 ⇒ pending 同义）。
+        log(`msg9 ledger: no live session for ${inbox.address}; ${plan.deliver.length} mail(s) wait for the next tick`)
+        return
+      }
+      await poll.commit()
+    },
+  }
+}
+
+export interface LedgerIngestLoop {
+  readonly ingest: LedgerIngest
+  stop(): void
+}
+
+/**
+ * 把一个地址的账本消费者挂在定时器上（与 self 路径的轮询同节奏，间隔由调用方给）。
+ * 第一轮**立刻**跑（建立基线），不等一个间隔；防重入与 self 路径同一个守卫。
+ */
+export function startLedgerIngestLoop(
+  deps: WatchDeps,
+  rt: WatchRuntime,
+  key: string,
+  inbox: LiveInbox,
+  options: LedgerIngestOptions & { intervalMs: number },
+): LedgerIngestLoop {
+  const ingest = createLedgerIngest(deps, rt, key, inbox, options)
+  const tick = createNonReentrant(() => ingest.tick())
+  const timer = setInterval(tick, Math.max(1_000, options.intervalMs))
+  void tick()
+  return {
+    ingest,
+    stop() {
+      clearInterval(timer)
+    },
   }
 }
 
