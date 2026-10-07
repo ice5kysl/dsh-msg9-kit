@@ -260,4 +260,23 @@ cat ~/.dsh/msg9-daemon/daemon.json 2>/dev/null
 
 **运维坑（2026-10-07 实测）**：**重载 launchd agent（`bootout` + `bootstrap`）会终止该 job 进程组里的进程** ⇒ 正在跑的 daemon 会被带走（我们实测：重载瞬间 daemon 从 pid 55422 变成 68722，启动时间 11:57:24 → 12:05:26）。**这不是不稳定，而是重载的副作用** —— 而且**看门狗在同一分钟内自动把它救回来了**（`runs` +1、`last exit code = 0`、err 日志无增长）＝ 常驻机制的一次真实演练。**要改 plist 就预期一次短暂重启**；只想拉起不必重载（`launchctl kickstart gui/$UID/io.msg9.daemon` 即可）。
 
+### 观察期结果（2026-10-07 12:07，**含一次真实的"杀掉→救回"演练**）
+
+| 指标 | 读数 | 判 |
+|---|---|---|
+| daemon 存活 | pid 68736（12:05:26 起）· `last_beat` **1s 前** | ✅ |
+| 连接健康 | `tenants` 11 个 · connected **8** · **stalled 无** · `reconnects` 合计 **0** | ✅（3 个待确认，见下） |
+| 账本（**重启之后**） | 自测信 `msg_qDyA1ENOTxsT` `received_at=12:07:09` 落进 `dsh@dsh.ice.msg9.io.jsonl` | ✅ |
+
+**没连上的 3 个**：`cc-dsh-audit@ccd.ice.msg9.io`（**已知死 key** —— 我们在查 cc 接入时证实过它的 key 无效）、
+`kimi.code`、`dsh@kimi.ice.msg9.io`。前者的性质已确定（**死凭据，不是 daemon 故障**）；后两者未定。
+⇒ **一条平台侧建议**：健康文件里"连接失败"与"stalled"目前**不可区分**，而 `connected:false` 背后的原因
+（key 失效 / 网络 / 平台侧拒绝）对使用者意义完全不同 —— 建议在 `tenants[]` 里带上**失败原因**，
+否则使用者只能靠猜（这正是我们这周一直在治的"失败与正常不可区分"）。
+
+**演练**：我重载 launchd agent 时把正在跑的 daemon 带走了（见上"运维坑"），**看门狗在同一分钟内把它救回**
+（`runs`+1、`last exit code = 0`、err 日志零增长），随后重启后的账本写入也被验证 ✅
+⇒ **常驻机制不是纸面设计，已经过一次真实故障演练。**
+
+
 
