@@ -260,17 +260,35 @@ export interface CoverageVerdict {
   tenant: AddressTenant
   /** 覆盖它的 scope（可能多条：machine + 精准 tenant）。 */
   covered_by: DaemonScope[]
+  /**
+   * scope 轴 + 凭据轴的合取：**"该有人盯它"**（不代表此刻真的盯得住）。
+   * `credentialed` 没给（unknown）时，这一项就退化成纯粹的 scope 判定（改前行为）。
+   */
   covered: boolean
   /** 该地址**需要**的 scope 种类。flat ⇒ machine（默认 scope）。 */
   needs: 'machine' | 'tenant'
   /** 它自己那条 `--scope` 取值（flat 没有）。 */
   scope_flag?: string
+  /** 凭据轴：本机有没有它的凭据（平台 daemon 想盯也盯不了的情形）。 */
+  credential: 'present' | 'absent' | 'unknown'
+  /** 连接轴：健康文件里这个地址（或它的租户）此刻连没连上。 */
+  connection: 'connected' | 'disconnected' | 'stalled' | 'unreported'
+  /**
+   * **唤醒来源**的最终裁决（T-46 ②）：
+   *   - `ledger`：scope + 凭据 + 连接三轴都过 ⇒ 新邮件会进账本、会唤醒；
+   *   - `top-up-only`：scope 覆盖，但连接轴是断的（`connected:false` / `stalled`）
+   *     ⇒ 这个地址的信**不会进账本**，ledger 模式下唯一兜底是 inbox unread 补齐；
+   *   - `unconfirmed`：有健康文件，但没有任何一条提到它/它的租户 ⇒ **无法确认**
+   *     它真在被盯（不能假装"已覆盖"）；
+   *   - `none`：没有 scope 覆盖，或者本机根本没有它的凭据 ⇒ **没有任何唤醒来源**。
+   */
+  wake_source: 'ledger' | 'top-up-only' | 'unconfirmed' | 'none'
   reason: string
 }
 
 export interface DaemonCoverageWarning {
   /** 稳定标识，便于判据与日志过滤。 */
-  code: 'no-daemon-coverage'
+  code: 'no-daemon-coverage' | 'no-wake-source' | 'wake-source-unconfirmed'
   address: string
   flat: boolean
   text: string
@@ -295,26 +313,68 @@ export interface DaemonCoverageReport {
  * 轮不到 `a@msg9.io` 这种没有 pod 的地址。没有覆盖 ⇒ 新邮件不会进账本，
  * 唯一兜底是 inbox unread 补齐。所以这里必须**明确报警**（可判据），
  * 而不是让"没覆盖"表现成"账本莫名不长了"。
+ *
+ * ⚠️ T-46 ② 补上的那一课：**scope 覆盖 ≠ 凭据可用 ≠ 连接可用**。活锁写着
+ * `machine` 时，这一函数对**全部**地址都判"已覆盖"，而真实健康文件里
+ * `kimi.code` / `dsh@kimi.ice.msg9.io` / `cc-dsh-audit@ccd.ice.msg9.io` 三条是
+ * `connected:false` —— 这些地址的信根本不会进账本。所以：
+ *   - 传了 `statuses` ⇒ 连接轴参与裁决（断连的地址判 `top-up-only` 并**显式告警**）；
+ *   - 传了 `credentialed` ⇒ 凭据轴兜底（本机没有凭据的地址判 `none`）。
+ * 两个可选参数都不传时，行为与改前**逐字一致**（纯 scope 判定）。
  */
 export function assessDaemonCoverage(
   addresses: readonly string[],
   scopes: readonly DaemonScope[],
-  options: { org?: string; unparsedScopes?: readonly string[]; staleLocks?: readonly string[] } = {},
+  options: {
+    org?: string
+    unparsedScopes?: readonly string[]
+    staleLocks?: readonly string[]
+    /**
+     * 平台健康文件的只读读数（`.daemon-status*.json`）。给了它，覆盖判定就同时看
+     * **连接轴**：scope 只说明"该盯"，`connected` 才说明"此刻盯得住"。
+     */
+    statuses?: readonly PlatformDaemonStatus[]
+    /**
+     * 本机**有凭据**的地址（凭据存在性兜底）。缺省 = 不知道，不参与判定；
+     * 给了以后，不在列表里的地址一律判 `credential: 'absent'`。
+     */
+    credentialed?: readonly string[]
+  } = {},
 ): DaemonCoverageReport {
   const verdicts: CoverageVerdict[] = []
   const uncovered: string[] = []
   const warnings: DaemonCoverageWarning[] = []
+  const statuses = options.statuses ?? []
+  const credentialed = options.credentialed === undefined ? undefined : new Set(options.credentialed.map((address) => address.trim().toLowerCase()))
   for (const address of addresses) {
     const tenant = addressTenant(address, options)
     const coveredBy = scopes.filter((scope) => daemonScopeCovers(scope, address, options))
     const needs = tenant.kind === 'pod' ? 'tenant' : 'machine'
     const scopeFlag = scopeForAddressTenant(tenant)
-    const covered = coveredBy.length > 0
-    const reason = covered
-      ? `covered by ${coveredBy.map((scope) => scope.label).join(', ')}`
-      : tenant.kind === 'pod'
+    const credential: CoverageVerdict['credential'] = credentialed === undefined ? 'unknown' : credentialed.has(address.trim().toLowerCase()) ? 'present' : 'absent'
+    const connection = connectionAxis(address, statuses, options)
+    const scopeCovered = coveredBy.length > 0
+    // 凭据轴兜底：本机没有凭据 ⇒ 平台 daemon 想盯也盯不了（它不是"该盯没盯"，
+    // 而是"根本没法盯"）⇒ 与没有 scope 覆盖同级。
+    const covered = scopeCovered && credential !== 'absent'
+    const wakeSource: CoverageVerdict['wake_source'] = !covered
+      ? 'none'
+      : connection === 'disconnected' || connection === 'stalled'
+        ? 'top-up-only'
+        : connection === 'unreported' && statuses.length > 0
+          ? 'unconfirmed'
+          : 'ledger'
+    const reason = !scopeCovered
+      ? tenant.kind === 'pod'
         ? `no daemon covers ${address}: it needs a default-scope daemon or one started with --scope ${scopeFlag}`
         : `no daemon covers ${address}: a flat mailbox (no pod) can only be watched by a default-scope (machine) daemon`
+      : credential === 'absent'
+        ? `no credential for ${address} on this machine: no daemon can watch it (it is not in the credentialed set)`
+        : wakeSource === 'top-up-only'
+          ? `scope covers ${address} (${coveredBy.map((scope) => scope.label).join(', ')}) but the platform daemon reports it ${connection}: nothing is ledgered for it; only inbox-unread top-up will wake it`
+          : wakeSource === 'unconfirmed'
+            ? `scope covers ${address} (${coveredBy.map((scope) => scope.label).join(', ')}) but no .daemon-status entry mentions it or its tenant: this wake source is unconfirmed`
+            : `covered by ${coveredBy.map((scope) => scope.label).join(', ')}`
     verdicts.push({
       address,
       tenant,
@@ -322,21 +382,14 @@ export function assessDaemonCoverage(
       covered,
       needs,
       ...(scopeFlag === undefined ? {} : { scope_flag: scopeFlag }),
+      credential,
+      connection,
+      wake_source: wakeSource,
       reason,
     })
-    if (covered) continue
-    uncovered.push(address)
-    warnings.push({
-      code: 'no-daemon-coverage',
-      address,
-      flat: tenant.kind === 'flat',
-      text:
-        `msg9 cutover: no daemon covers ${address} — ${tenant.kind === 'flat'
-          ? 'flat mailbox (no pod): only a default-scope (machine) daemon can watch it'
-          : `start one with --scope ${scopeFlag}`}. ` +
-        `Nothing is ledgered for it; the only fallback is inbox-unread top-up.` +
-        `（「${address}」没有任何 daemon 覆盖：新邮件不会进账本，只能靠 inbox unread 补齐。）`,
-    })
+    if (wakeSource === 'ledger') continue
+    if (wakeSource === 'none') uncovered.push(address)
+    warnings.push(coverageWarning({ address, tenant, scopeFlag, coveredBy, credential, connection, wakeSource }))
   }
   return {
     verdicts,
@@ -344,6 +397,73 @@ export function assessDaemonCoverage(
     warnings,
     unparsed_scopes: [...(options.unparsedScopes ?? [])],
     stale_locks: [...(options.staleLocks ?? [])],
+  }
+}
+
+/** 一个地址在**连接轴**上的状态（只看覆盖它的健康文件）。 */
+function connectionAxis(
+  address: string,
+  statuses: readonly PlatformDaemonStatus[],
+  options: { org?: string },
+): CoverageVerdict['connection'] {
+  if (statuses.length === 0) return 'unreported'
+  // scope 认不出来的健康文件（文件名不合契约）保守地算"可能覆盖"：宁可说
+  // "连接存疑"，也不要因为一个坏文件名就假装这个地址没人管。
+  const covering = statuses.filter((status) => status.scope === undefined || daemonScopeCovers(status.scope, address, options))
+  const rows = covering.flatMap((status) => relevantStatusTenants(status.tenants, address, options.org))
+  if (rows.length === 0) return 'unreported'
+  if (rows.some((row) => row.state === 'stalled')) return 'stalled'
+  if (rows.some((row) => row.state === 'disconnected')) return 'disconnected'
+  return rows.some((row) => row.state === 'connected') ? 'connected' : 'unreported'
+}
+
+/** 每条告警只说**一件事**（每个地址最多一条），按严重程度取最重的那条。 */
+function coverageWarning(input: {
+  address: string
+  tenant: AddressTenant
+  scopeFlag: string | undefined
+  coveredBy: readonly DaemonScope[]
+  credential: CoverageVerdict['credential']
+  connection: CoverageVerdict['connection']
+  wakeSource: CoverageVerdict['wake_source']
+}): DaemonCoverageWarning {
+  const flat = input.tenant.kind === 'flat'
+  const scopes = input.coveredBy.map((scope) => scope.label).join(', ')
+  if (input.wakeSource === 'none') {
+    return {
+      code: 'no-daemon-coverage',
+      address: input.address,
+      flat,
+      text:
+        `msg9 cutover: no daemon covers ${input.address} — ${input.credential === 'absent'
+          ? 'no credential for it exists on this machine'
+          : flat
+            ? 'flat mailbox (no pod): only a default-scope (machine) daemon can watch it'
+            : `start one with --scope ${input.scopeFlag}`}. ` +
+        `Nothing is ledgered for it; the only fallback is inbox-unread top-up.` +
+        `（「${input.address}」没有任何 daemon 覆盖：新邮件不会进账本，只能靠 inbox unread 补齐。）`,
+    }
+  }
+  if (input.wakeSource === 'top-up-only') {
+    return {
+      code: 'no-wake-source',
+      address: input.address,
+      flat,
+      text:
+        `msg9 cutover: ${input.address} is scope-covered (${scopes}) but the platform daemon reports it ${input.connection} — ` +
+        `nothing is ledgered for it, so in ingest=ledger mode the ONLY wake source is inbox-unread top-up.` +
+        `（「${input.address}」scope 上"已覆盖"，但该租户/票据连接状态是 ${input.connection}：它的信不会进账本，` +
+        `切到 ledger 后唯一唤醒来源是 inbox unread 补齐。）`,
+    }
+  }
+  return {
+    code: 'wake-source-unconfirmed',
+    address: input.address,
+    flat,
+    text:
+      `msg9 cutover: ${input.address} is scope-covered (${scopes}) but no .daemon-status entry mentions it or its tenant — ` +
+      `we cannot confirm that anything is ledgering for it.` +
+      `（「${input.address}」scope 上"已覆盖"，但健康文件里没有任何一条提到它或它的租户 —— 无法确认它真在被盯。）`,
   }
 }
 
@@ -480,8 +600,15 @@ export interface PlatformDaemonStatus {
   scope?: DaemonScope
   /** `last_beat` 的 epoch ms（可解析时）。 */
   last_beat_ms?: number
-  /** 每个租户的连接状态（`stalled` = 该租户掉线 >60s 且 daemon 自己说了）。 */
-  tenants: { tenant?: string; state: 'connected' | 'stalled' | 'unknown' }[]
+  /**
+   * 每个租户的连接状态。
+   *
+   *   - `connected`：`connected:true`（流/票据真的连着）；
+   *   - `stalled`：`stalled:true`（daemon 自己说这个租户掉线 >60s）；
+   *   - `disconnected`：**显式** `connected:false`（本机实测 3 条，见 T-46 ②）；
+   *   - `unknown`：两个字段都没给（老版本/半写状态）——不猜。
+   */
+  tenants: { tenant?: string; state: 'connected' | 'stalled' | 'disconnected' | 'unknown' }[]
 }
 
 function numberField(row: Record<string, unknown>, keys: readonly string[]): number | undefined {
@@ -541,9 +668,14 @@ export async function readDaemonStatuses(spoolDir: string): Promise<PlatformDaem
         const item = row as Record<string, unknown>
         const stalled = item.stalled === true || item.state === 'stalled' || item.status === 'stalled'
         const connected = item.connected === true || item.state === 'connected' || item.status === 'connected'
+        // ⚠️ T-46 ②：**显式** `connected:false` 必须与"没有这个字段"分开。
+        // 原来两者都落到 `unknown` ⇒ `daemonHealthFromStatus` 看不见断连，
+        // 真实数据里 3 条连不上的租户/票据就这么静默了。
+        const disconnected =
+          item.connected === false || item.state === 'disconnected' || item.status === 'disconnected' || item.connected === 'false'
         tenants.push({
           ...(typeof item.tenant === 'string' ? { tenant: item.tenant } : typeof item.scope === 'string' ? { tenant: item.scope } : typeof item.address === 'string' ? { tenant: item.address } : {}),
-          state: stalled ? 'stalled' : connected ? 'connected' : 'unknown',
+          state: stalled ? 'stalled' : disconnected ? 'disconnected' : connected ? 'connected' : 'unknown',
         })
       }
     }
@@ -558,25 +690,75 @@ export async function readDaemonStatuses(spoolDir: string): Promise<PlatformDaem
 }
 
 /**
- * 由健康文件判「进程还活着吗 / 连接还通吗」（契约里的两条正交轴）。
+ * 心跳过期阈值（T-46 ④）—— **保守侧**，可配（`options.staleMs`）。
  *
- * `last_beat` 超过 `staleMs`（默认 15s = 3× flush tick，平台自己推荐的口径）
- * ⇒ `dead`；新鲜但某租户 `stalled` ⇒ `stalled`；新鲜且都连着 ⇒ `up`；
- * 根本没有 `last_beat` 字段 ⇒ `unknown`（**不猜**）。
+ * 依据：平台 daemon 的 `last_beat` 每 **5s** 写一次，所以 15s 只有 **3 拍**
+ * 的余量 —— 一次 GC / 负载尖峰 / iCloud 拉回（本机实测过 439→0 的驱逐）
+ * 就可能把它判成 `dead`，于是 `decideTopUp` 白跑一轮补齐。观测期内没误判，
+ * 不代表不会；而 API 配额正是这一阶段要省的东西。
+ * 45s = **9 拍**：容忍连续丢 8 拍，同时远小于"一封急信该等多久"。
+ * 代价是真实死亡的检出延迟变大 —— 但我们的轮询间隔本身就是 30s
+ *（`WATCH_POLL_MS`），补齐全靠下一轮 poll，秒级精度没有意义。
+ */
+export const DEFAULT_DAEMON_STALE_MS = 45_000
+
+/**
+ * 从健康文件的行里挑出**与这个地址有关**的那些（T-46 ②）。
+ *
+ * 平台按「租户」记行（`<pod>.<org>`，例如 `dsh.ice`），对**票据**模式则按
+ * **完整地址**记行（实测 `dsh@kimi.ice.msg9.io`）。所以匹配要分两级、
+ * **地址级优先**：票据行比租户行更具体（同一个 `kimi.ice` 租户下，
+ * `dsh@kimi.ice` 的票据连不上，不代表 `kimi@kimi.ice` 也连不上）。
+ * 一条都对不上（例如 flat 地址没有租户标签可对）⇒ 空数组 = "没有报道"。
+ */
+export function relevantStatusTenants(
+  tenants: PlatformDaemonStatus['tenants'],
+  address: string,
+  org?: string,
+): PlatformDaemonStatus['tenants'] {
+  const wanted = address.trim().toLowerCase()
+  const exact = tenants.filter((row) => typeof row.tenant === 'string' && row.tenant.trim().toLowerCase() === wanted)
+  if (exact.length > 0) return exact
+  const tenant = addressTenant(address, org === undefined ? {} : { org })
+  if (tenant.kind !== 'pod') return []
+  const label = `${tenant.pod}.${tenant.org}`
+  return tenants.filter((row) => typeof row.tenant === 'string' && row.tenant.trim().toLowerCase() === label)
+}
+
+/**
+ * 由健康文件判「进程还活着吗 / 连接还通吗」（**两条正交轴**）。
+ *
+ *   - **进程轴**：`last_beat` 超过 `staleMs`（默认 `DEFAULT_DAEMON_STALE_MS`）⇒ `dead`；
+ *   - **连接轴**：有 `address` 时只看**与它有关**的行（`relevantStatusTenants`，
+ *     地址级 ticket 优先）—— `stalled` / `connected:false` ⇒ 对应状态；
+ *   - 新鲜、连接也 OK ⇒ `up`；没有 `last_beat` 字段 ⇒ `unknown`（**不猜**）。
+ *
+ * ⚠️ 不传 `address`（或该地址一条行都对不上）时退回**整份文件的聚合**判断，
+ * 与改前逐字一致 —— 但**只有地址级判断才能区分"这个租户连不上"与"别的租户
+ * 连不上"**：`decideTopUp` 之类按地址纠偏的调用方必须把 `address` 传进来，
+ * 否则一条 `connected:false` 会让整份文件覆盖的所有地址都去补齐。
  */
 export function daemonHealthFromStatus(
   status: PlatformDaemonStatus | undefined,
-  options: { now: number; staleMs?: number },
+  options: { now: number; staleMs?: number; address?: string; org?: string },
 ): DaemonHealth {
   if (!status) return 'unknown'
-  const staleMs = options.staleMs ?? 15_000
+  const staleMs = options.staleMs ?? DEFAULT_DAEMON_STALE_MS
+  const relevant = options.address === undefined ? status.tenants : relevantStatusTenants(status.tenants, options.address, options.org)
+  const connection = connectionHealth(relevant)
   if (status.last_beat_ms === undefined) {
-    // 没有心跳字段：只有明确说 stalled 才敢说 stalled。
-    return status.tenants.some((tenant) => tenant.state === 'stalled') ? 'stalled' : 'unknown'
+    // 没有心跳字段：只有明确说 stalled / disconnected 才敢下结论（"进程活着"证不了）。
+    return connection ?? 'unknown'
   }
   if (options.now - status.last_beat_ms > staleMs) return 'dead'
-  if (status.tenants.some((tenant) => tenant.state === 'stalled')) return 'stalled'
-  return 'up'
+  return connection ?? 'up'
+}
+
+/** 一组行里的**最坏**连接状态（`stalled` > `disconnected` > `connected`）；都是 unknown ⇒ undefined。 */
+function connectionHealth(rows: PlatformDaemonStatus['tenants']): DaemonHealth | undefined {
+  if (rows.some((row) => row.state === 'stalled')) return 'stalled'
+  if (rows.some((row) => row.state === 'disconnected')) return 'disconnected'
+  return rows.some((row) => row.state === 'connected') ? 'up' : undefined
 }
 
 export interface PlatformDaemonObservation {
@@ -612,7 +794,15 @@ export async function observePlatformDaemon(
   // 精准的 tenant scope 优先于 machine scope（同一地址可能被两个 daemon 盯）。
   const best = matching.find((status) => status.scope!.kind === 'tenant') ?? matching[0]
   if (best) {
-    const health = daemonHealthFromStatus(best, { now, ...(options.staleMs === undefined ? {} : { staleMs: options.staleMs }) })
+    // ⚠️ 必须把 **address** 交给健康判定（T-46 ②）：健康文件是**一份文件装多个租户**的，
+    // 聚合判断会让"某个别的租户 connected:false"污染这个地址；反过来，少了它
+    // "这个地址自己连不上"就永远看不见。
+    const health = daemonHealthFromStatus(best, {
+      now,
+      ...(options.staleMs === undefined ? {} : { staleMs: options.staleMs }),
+      address,
+      ...(options.org === undefined ? {} : { org: options.org }),
+    })
     return {
       health,
       source: 'status',

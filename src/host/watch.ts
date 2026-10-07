@@ -509,6 +509,12 @@ export async function deliverBatch(
  *      对账（已在别处闭环的信不在这一页里 ⇒ 不唤醒）；
  *   3. **取不到那一页 ⇒ 绝不 commit**：游标不推进，下一轮重投。宁可重复一次，
  *      也不静默吞掉唤醒。
+ *
+ * T-46 ① 的例外（**只在空账本/无账本时**）：基线轮本来一次 REST 都不打。但
+ * "账本文件还不存在"的地址恰恰是**第一封信会被静默吞掉**的那一群，所以这一种
+ * 基线轮额外打一次 `folder=unprocessed` —— **只为了可观测**（把"服务器上还有
+ * N 封未处理、本轮一封都不唤醒"写进日志），**绝不投递**（bootstrap 不变量：
+ * 第一次观测不许把历史邮件倒进会话）。有历史的账本行为一字未改（仍然是零 REST）。
  */
 export interface LedgerIngestOptions {
   /** 我们自己的 consumer 名（默认 `ledger.ts` 的 `DEFAULT_CONSUMER`）。 */
@@ -517,6 +523,8 @@ export interface LedgerIngestOptions {
   spoolDir?: string
   /** 滞后补齐阈值（默认 5 分钟，与阶段一骨架同源）。 */
   lagThresholdMs?: number
+  /** 单轮唤醒上限（默认 `DEFAULT_MAX_PER_ROUND` = 20，见那里对依据的说明）。 */
+  maxPerRound?: number
   /** 平台 daemon 健康（只读观测）；缺省 unknown ⇒ 只按滞后判。 */
   daemonHealth?(): Promise<DaemonHealth>
   /** 每轮 unprocessed 页的条数上限（默认 100）。 */
@@ -532,6 +540,8 @@ export interface LedgerIngest {
     freshEvents: number
     toppedUp: number
     reconciledAway: number
+    /** 上一轮因为单轮唤醒上限被推到下一轮的事件数（T-46 ③）。 */
+    deferred: number
   }
 }
 
@@ -546,7 +556,7 @@ export function createLedgerIngest(
   const limit = options.unprocessedLimit ?? 100
   // 阶段一骨架的默认阈值（5 分钟）—— 在这里显式展开，免得"默认值藏在两处"。
   const lagThresholdMs = options.lagThresholdMs ?? DEFAULT_LAG_TOPUP_MS
-  const last: LedgerIngest['last'] = { freshEvents: 0, toppedUp: 0, reconciledAway: 0 }
+  const last: LedgerIngest['last'] = { freshEvents: 0, toppedUp: 0, reconciledAway: 0, deferred: 0 }
   let pagePromise: Promise<InboxMessage[] | undefined> | undefined
 
   /** 本轮那一页 `folder=unprocessed` —— **一轮只付一次 API 调用**。 */
@@ -571,6 +581,7 @@ export function createLedgerIngest(
     ...(options.consumer === undefined ? {} : { consumer: options.consumer }),
     ...(options.spoolDir === undefined ? {} : { spoolDir: options.spoolDir }),
     lagThresholdMs,
+    ...(options.maxPerRound === undefined ? {} : { maxPerRound: options.maxPerRound }),
     // 补齐来源与投递来源是**同一页**（见上面第 2 条）。
     fetchUnread: async () => {
       const page = await unprocessedOnce()
@@ -591,10 +602,27 @@ export function createLedgerIngest(
       if (poll.baseline) {
         // 与 self 路径同一条规矩：第一次观测只立基线，绝不把历史邮件倒进会话。
         await poll.commit()
-        log(`msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path}`)
+        if (poll.ledger_events === 0) {
+          // T-46 ①：**空账本/无账本**的基线轮额外对账一次 —— 只为把"不再静默"
+          // 落到实处：这一轮到底有多少封服务器上未处理的信被跳过。
+          // ⚠️ 只观测，不投递（bootstrap 不变量）。`unprocessedOnce` 会缓存这一页，
+          // 所以即便后面还有别的分支用到它，也仍然只有一次 REST。
+          const page = await unprocessedOnce()
+          const pending = page === undefined ? undefined : page.length
+          log(
+            `msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path} ` +
+              `(ledger ${poll.ledger_exists ? 'file is empty' : 'file does not exist yet'}; sentinel cursor written —— ` +
+              `${pending === undefined ? 'server unprocessed count unavailable' : `${pending} unprocessed mail(s) on the server`} ` +
+              `are NOT announced this round; the next arrival will wake. ` +
+              `账本为空/无账本 ⇒ 已立哨兵基线，本轮${pending === undefined ? '（未处理数取不到）' : ` ${pending} 封`}不唤醒。)`,
+          )
+          return
+        }
+        log(`msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path} (ledger already has ${poll.ledger_events} event(s); none of them is announced)`)
         return
       }
       last.lagSeconds = poll.lag?.lag_seconds
+      last.deferred = poll.deferred
       const needed = poll.fresh.length > 0 || poll.top_up.topUp
       const page = needed ? await unprocessedOnce() : []
       const plan = planLedgerBatch(poll, page)

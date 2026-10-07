@@ -7,6 +7,11 @@
  * 覆盖卡面要求的四条：① 坏行容错 ② 幂等（重复事件只唤醒一次）
  * ③ 游标滞后计算 ④ 补齐路径触发条件。
  *
+ * T-46 追加（切换前的三条必修 + 一项调参）：
+ *   ⑤ 空账本/无账本 ⇒ 哨兵游标（第一封信不再被静默吞掉）+ 日志；
+ *   ⑥ 乱序/回填账本 ⇒ 单轮唤醒上限（文件序前 N 条，剩余下轮，绝不丢）；
+ *   ⑦ `connected:false` ⇒ `decideTopUp` 必须看得见（reason=daemon-disconnected）。
+ *
  * Run: node tests/ledger.test.mjs (or: npm test)
  */
 
@@ -21,16 +26,20 @@ process.env.MSG9_HOME = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-ledger-home-'
 
 const {
   DEFAULT_CONSUMER,
+  DEFAULT_MAX_PER_ROUND,
+  EMPTY_LEDGER_CURSOR,
   assertConsumerName,
   computeCursorLag,
   consumerCursorPath,
   createLedgerConsumer,
   decideTopUp,
+  isEmptyLedgerCursor,
   ledgerPath,
   parseLedgerLine,
   parseLedgerLines,
   readConsumerCursor,
   readConsumerLag,
+  readLedger,
   selectFreshEvents,
   selectTopUpMessages,
   writeConsumerCursor,
@@ -311,6 +320,7 @@ await check('decideTopUp: 判据表（显式 / bootstrap / 锚点丢失 / daemon
   assert.equal(decideTopUp({ ...base, anchorFound: false }).reason, 'anchor-lost')
   assert.equal(decideTopUp({ ...base, daemon: 'stalled' }).reason, 'daemon-down')
   assert.equal(decideTopUp({ ...base, daemon: 'dead' }).reason, 'daemon-down')
+  assert.equal(decideTopUp({ ...base, daemon: 'disconnected' }).reason, 'daemon-disconnected', 'T-46②：connected:false 与掉线是同一个缺口')
   assert.equal(decideTopUp({ ...base, daemon: 'up' }).topUp, false)
   assert.equal(decideTopUp({ ...base, daemon: 'unknown' }).topUp, false, '健康未知就不猜，只按滞后判')
 
@@ -464,6 +474,219 @@ await check('坏行 + 消费：一条坏账不能让消费者瞎掉（照投好�
   assert.deepEqual(poll.fresh.map((e) => e.message_id), ['m1'])
   await poll.commit()
   assert.equal((await readFile(cursorFile, 'utf8')).trim(), 'm1', '锚点跨过坏行前进（信不因为通知行坏了而丢：服务器才是真相源）')
+})
+
+// ======================================================================
+// T-46 ⑤：空账本 / 无账本 ⇒ 哨兵游标（第一封信不再被静默吞掉）
+// ======================================================================
+
+await check('⑤ T-46①：账本文件还不存在 ⇒ 落**哨兵游标**（不再"永远 bootstrap"）；第一封信必须被唤醒', async () => {
+  const dir = await tempSpool()
+  const file = ledgerPath(ADDRESS, dir)
+  const cursorFile = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  const logs = []
+  const now = () => Date.parse('2026-10-01T09:30:00Z')
+  const make = () => createLedgerConsumer({ address: ADDRESS, consumer: CONSUMER, spoolDir: dir, now, log: (message) => logs.push(message) })
+
+  // ① 账本文件还不存在（平台 daemon 收到第一封信才创建它）。
+  const consumer = make()
+  const step1 = await consumer.pollOnce()
+  assert.equal(step1.baseline, true, '没有游标 ⇒ 首轮仍是 bootstrap（不变量）')
+  assert.equal(step1.ledger_exists, false, 'poll 必须告诉我们账本文件在不在')
+  assert.equal(step1.ledger_events, 0)
+  assert.deepEqual(step1.fresh, [], '空账本没有历史可报')
+  await step1.commit()
+  assert.equal(
+    (await readFile(cursorFile, 'utf8')).trim(),
+    EMPTY_LEDGER_CURSOR,
+    '**空账本基线必须写出哨兵游标** —— 否则 commit 无字可写、下一轮还是 bootstrap',
+  )
+  assert.equal(await readConsumerCursor(cursorFile), EMPTY_LEDGER_CURSOR)
+  assert.equal(isEmptyLedgerCursor(EMPTY_LEDGER_CURSOR), true)
+  assert.equal(isEmptyLedgerCursor('msg_first_ever'), false)
+  assert.ok(
+    logs.some((message) => message.includes('哨兵基线') && message.includes(ADDRESS)),
+    `空账本必须留下日志（这件事不许再静默）：${JSON.stringify(logs)}`,
+  )
+
+  // ② **第一封信到达** ⇒ 账本文件第一次出现，而且文件里只有这一行。
+  //    T-45 §5c 实测的缺陷正是这里：这一行被当成"基线历史"静默吞掉。
+  await writeFile(file, `${ledgerLine('msg_first_ever', '2026-10-01T09:00:00Z')}\n`, 'utf8')
+  const step2 = await consumer.pollOnce()
+  assert.equal(step2.baseline, false, '哨兵之后不再是首次消费')
+  assert.deepEqual(step2.fresh.map((event) => event.message_id), ['msg_first_ever'], '**第一封信不许被吞**')
+  await step2.commit()
+  assert.equal((await readFile(cursorFile, 'utf8')).trim(), 'msg_first_ever', '真实 id 覆盖哨兵')
+
+  // ③ 第二封照常唤醒（哨兵只影响"文件起点"这一次）。
+  await appendFile(file, `${ledgerLine('msg_second', '2026-10-01T09:05:00Z')}\n`)
+  const step3 = await consumer.pollOnce()
+  assert.deepEqual(step3.fresh.map((event) => event.message_id), ['msg_second'])
+})
+
+await check('⑤b 哨兵 = "文件起点之前"：既不是锚点丢失（不白跑补齐），也不吞掉后来的行', async () => {
+  const dir = await tempSpool()
+  const file = ledgerPath(ADDRESS, dir)
+  const cursorFile = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  const now = Date.parse('2026-10-01T09:30:00Z')
+
+  // 空账本 + 哨兵：位置是明确的、没有积压 ⇒ 不该触发 anchor-lost 补齐。
+  await writeConsumerCursor(cursorFile, EMPTY_LEDGER_CURSOR)
+  const parsed = await readLedger(file)
+  assert.equal(parsed.exists, false, 'readLedger 把"文件不存在"与"文件为空"都当空账本，但如实报告 exists')
+  const empty = selectFreshEvents(parsed.events, { anchor: EMPTY_LEDGER_CURSOR })
+  assert.equal(empty.anchor_found, true, '哨兵是**明确的位置**，不是"找不到的锚点"')
+  assert.equal(empty.unconsumed, 0)
+  assert.equal(empty.next_anchor, EMPTY_LEDGER_CURSOR, '没有新行 ⇒ 游标原地不动（还是哨兵）')
+  assert.equal(
+    decideTopUp({ hasCursor: true, anchorFound: empty.anchor_found, lagSeconds: 0, lagThresholdMs: 5 * 60_000 }).topUp,
+    false,
+    '哨兵 + 空账本不许被当成"锚点丢失"（否则每轮白跑一次补齐）',
+  )
+  const emptyLag = await readConsumerLag(ADDRESS, CONSUMER, { spoolDir: dir, now })
+  assert.equal(emptyLag.anchor_found, true)
+  assert.equal(emptyLag.lag_seconds, 0)
+
+  // 后来一行到了：哨兵语义 = 所有行都在它之后 ⇒ 滞后 = 最老那一行的年龄。
+  await writeFile(file, `${ledgerLine('m1', '2026-10-01T09:00:00Z')}\n`, 'utf8')
+  const lag = await readConsumerLag(ADDRESS, CONSUMER, { spoolDir: dir, now })
+  assert.equal(lag.anchor_found, true)
+  assert.equal(lag.unconsumed, 1)
+  assert.equal(lag.lag_seconds, 1800, '哨兵之后那行等了 30 分钟 —— 补齐判据必须看得见它')
+
+  // 文件存在但 0 行（被 truncate 过）走同一条路。
+  const dir2 = await tempSpool()
+  const file2 = ledgerPath(ADDRESS, dir2)
+  await writeFile(file2, '', 'utf8')
+  const consumer = createLedgerConsumer({ address: ADDRESS, consumer: CONSUMER, spoolDir: dir2, now: () => now })
+  const poll = await consumer.pollOnce()
+  assert.equal(poll.ledger_exists, true, '文件在')
+  assert.equal(poll.ledger_events, 0, '但一行都没有')
+  await poll.commit()
+  assert.equal((await readFile(consumerCursorPath(ADDRESS, CONSUMER, dir2), 'utf8')).trim(), EMPTY_LEDGER_CURSOR)
+})
+
+// ======================================================================
+// T-46 ⑥：账本不是按 received_at 有序追加 ⇒ 单轮唤醒上限（剩余下轮）
+// ======================================================================
+
+/** 真实形状：一行"断档前最后的"，后面跟着一整块**更早的**回填事件（逆序）。 */
+function backfilledLines(count, anchorAt = '2026-10-07T09:00:00Z') {
+  const rows = Array.from({ length: count }, (_, index) => ({
+    id: `msg_back_${String(index).padStart(2, '0')}`,
+    at: new Date(Date.parse('2026-09-25T00:00:00Z') - index * 60_000).toISOString(),
+  }))
+  return { rows, lines: [ledgerLine('msg_anchor', anchorAt), ...rows.map((row) => ledgerLine(row.id, row.at))] }
+}
+
+await check('⑥ T-46③：回填块（30 条逆序积压）⇒ 单轮只交 20 条（按**文件序**切），剩余下轮，一条不丢', async () => {
+  const dir = await tempSpool()
+  const file = ledgerPath(ADDRESS, dir)
+  const cursorFile = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  const { rows, lines } = backfilledLines(30)
+  await writeLedgerFile(file, lines)
+  await writeConsumerCursor(cursorFile, 'msg_anchor')
+  const consumer = createLedgerConsumer({ address: ADDRESS, consumer: CONSUMER, spoolDir: dir, now: () => Date.parse('2026-10-07T12:00:00Z') })
+
+  const first = await consumer.pollOnce()
+  assert.equal(first.fresh.length, DEFAULT_MAX_PER_ROUND, `一轮最多 ${DEFAULT_MAX_PER_ROUND} 条（默认单轮上限）`)
+  assert.equal(first.deferred, 10, '剩下 10 条推到下一轮')
+  assert.equal(first.lag.unconsumed, 30, 'unconsumed 报的是**真实积压**，不被上限裁剪')
+  assert.equal(first.fresh[0].message_id, rows[19].id, '交回的是"文件序前 20 条"里时间最早的那条（批内仍按 received_at 升序）')
+  await first.commit()
+  assert.equal(
+    (await readFile(cursorFile, 'utf8')).trim(),
+    rows[19].id,
+    '游标推进到**文件序**第 20 条 —— 按时间挑"最老 20 条"会把文件序在它之后的行永久跳过（真丢信）',
+  )
+
+  const second = await consumer.pollOnce()
+  assert.equal(second.fresh.length, 10, '下一轮接着来')
+  assert.equal(second.deferred, 0)
+  assert.equal(second.lag.unconsumed, 10)
+  await second.commit()
+  assert.equal((await readFile(cursorFile, 'utf8')).trim(), rows[29].id)
+
+  const third = await consumer.pollOnce()
+  assert.deepEqual(third.fresh, [], '第三轮干净了')
+  assert.deepEqual(
+    [...first.fresh, ...second.fresh].map((event) => event.message_id).sort(),
+    rows.map((row) => row.id).sort(),
+    '两轮合起来 = 全部 30 条：**一条不丢、一条不重**',
+  )
+})
+
+await check('⑥b 单轮上限**不作用于基线轮**（否则剩下的历史会被当成新信倒进会话）', async () => {
+  const dir = await tempSpool()
+  const file = ledgerPath(ADDRESS, dir)
+  const cursorFile = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  const { rows, lines } = backfilledLines(30)
+  await writeLedgerFile(file, lines)
+  const consumer = createLedgerConsumer({ address: ADDRESS, consumer: CONSUMER, spoolDir: dir, now: () => Date.parse('2026-10-07T12:00:00Z') })
+
+  const baseline = await consumer.pollOnce()
+  assert.equal(baseline.baseline, true)
+  assert.deepEqual(baseline.fresh, [], '基线轮一条都不唤醒')
+  await baseline.commit()
+  assert.equal((await readFile(cursorFile, 'utf8')).trim(), rows[29].id, '基线必须落到**文件末尾**（不是第 20 条）')
+  const after = await consumer.pollOnce()
+  assert.deepEqual(after.fresh, [], '基线之后没有新信 ⇒ 一条都不唤醒（30 条历史没有被倒出来）')
+})
+
+await check('⑥c 单轮上限也管住补齐批次：没交回的那些留在服务器上，下轮还取得到', async () => {
+  const dir = await tempSpool()
+  const file = ledgerPath(ADDRESS, dir)
+  const cursorFile = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  await writeLedgerFile(file, [ledgerLine('m1', '2026-10-01T00:00:00Z')])
+  await writeConsumerCursor(cursorFile, 'm1')
+  const page = Array.from({ length: 30 }, (_, index) => ({ message_id: `up_${index}` }))
+  const consumer = createLedgerConsumer({
+    address: ADDRESS,
+    consumer: CONSUMER,
+    spoolDir: dir,
+    now: () => Date.parse('2026-10-01T00:00:01Z'),
+    lagThresholdMs: 0,
+    maxPerRound: 5,
+    daemonHealth: async () => 'stalled',
+    fetchUnread: async () => page,
+  })
+  const poll = await consumer.pollOnce()
+  assert.equal(poll.top_up.reason, 'daemon-down')
+  assert.deepEqual(poll.top_up_messages.map((message) => message.message_id), ['up_0', 'up_1', 'up_2', 'up_3', 'up_4'], '补齐也只交回 5 封')
+  await poll.commit()
+  const again = await consumer.pollOnce()
+  assert.deepEqual(
+    again.top_up_messages.map((message) => message.message_id),
+    ['up_5', 'up_6', 'up_7', 'up_8', 'up_9'],
+    '上一轮没交回的**不在去重环里** ⇒ 下轮接着取（不是丢弃）',
+  )
+})
+
+// ======================================================================
+// T-46 ⑦：connected:false（进程活着、租户连不上）必须被 decideTopUp 看见
+// ======================================================================
+
+await check('⑦ T-46②：daemon 报 disconnected ⇒ 账本零滞后也要走 inbox 补齐（那些信根本没进账本）', async () => {
+  const dir = await tempSpool()
+  const file = ledgerPath(ADDRESS, dir)
+  const cursorFile = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  await writeLedgerFile(file, [ledgerLine('m1', '2026-10-01T00:00:00Z')])
+  await writeConsumerCursor(cursorFile, 'm1')
+
+  const consumer = createLedgerConsumer({
+    address: ADDRESS,
+    consumer: CONSUMER,
+    spoolDir: dir,
+    now: () => Date.parse('2026-10-01T00:00:01Z'),
+    lagThresholdMs: 0, // 关掉滞后判据：只剩"连接断了"这一条
+    daemonHealth: async () => 'disconnected',
+    fetchUnread: async () => [{ message_id: 'm-never-ledgered' }],
+  })
+  const poll = await consumer.pollOnce()
+  assert.equal(poll.lag.lag_seconds, 0, '账本没长 ⇒ 滞后必然是 0（这就是滞后判据覆盖不到的缺口）')
+  assert.equal(poll.top_up.topUp, true, '连不上的租户的信不会进账本 ⇒ 必须补齐')
+  assert.equal(poll.top_up.reason, 'daemon-disconnected')
+  assert.deepEqual(poll.top_up_messages.map((message) => message.message_id), ['m-never-ledgered'])
 })
 
 console.log(failed > 0 ? `\n${failed} check(s) failed` : '\nall checks passed')

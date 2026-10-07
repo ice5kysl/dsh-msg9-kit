@@ -36,6 +36,7 @@ import {
   platformDaemonHealth,
   readDaemonLocks,
   readDaemonPidState,
+  readDaemonStatuses,
   resolveIngestMode,
   type IngestPlan,
 } from './cutover.ts'
@@ -102,6 +103,7 @@ export type { LedgerIngest, LedgerIngestLoop, LedgerIngestOptions } from './watc
 // T-13 阶段三：共存交接的判据层（默认 self 的 ingest 开关、--scope 的**选择器**
 // 语义、死 pid 自愈、daemon 覆盖判定、账本分支的投递计划）。
 export {
+  DEFAULT_DAEMON_STALE_MS,
   DEFAULT_INGEST,
   INGEST_ENV,
   SCOPE_CONTRACT,
@@ -119,6 +121,7 @@ export {
   readDaemonLocks,
   readDaemonPidState,
   readDaemonStatuses,
+  relevantStatusTenants,
   resolveIngestMode,
   resolveWakeSources,
   scopeFlagForAddress,
@@ -128,7 +131,9 @@ export {
 } from './cutover.ts'
 export type {
   AddressTenant,
+  CoverageVerdict,
   DaemonCoverageReport,
+  DaemonCoverageWarning,
   DaemonLock,
   DaemonPidState,
   DaemonScope,
@@ -172,6 +177,8 @@ export type { DaemonLogRotationOptions, DaemonLogRotationPlan, DaemonLogRotation
 export {
   DEFAULT_CONSUMER,
   DEFAULT_LAG_TOPUP_MS,
+  DEFAULT_MAX_PER_ROUND,
+  EMPTY_LEDGER_CURSOR,
   LEDGER_SCHEMA_VERSION,
   SEEN_RING_CAP,
   assertConsumerName,
@@ -179,6 +186,7 @@ export {
   consumerCursorPath,
   createLedgerConsumer,
   decideTopUp,
+  isEmptyLedgerCursor,
   ledgerPath,
   mergeSeenIds,
   parseLedgerLine,
@@ -200,6 +208,7 @@ export type {
   LedgerEvent,
   LedgerParse,
   LedgerPoll,
+  LedgerRead,
   TopUpDecision,
   TopUpInput,
   TopUpReason,
@@ -458,6 +467,12 @@ function startLedgerIngest(
       const report = assessDaemonCoverage(addresses, scopes, {
         unparsedScopes: locks.filter((lock) => lock.alive && !lock.scope).map((lock) => lock.file),
         staleLocks: locks.filter((lock) => lock.stale).map((lock) => lock.file),
+        // T-46 ②：**scope 覆盖 ≠ 凭据可用 ≠ 连接可用**。这两个只读输入把后两轴接进来：
+        //   - `statuses`：健康文件里的 `connected:false` ⇒ 该地址判 top-up-only 并告警；
+        //   - `credentialed`：这一批地址全是"state 里有 api_key"的工作区（上面的循环
+        //     就是这么筛的）⇒ 凭据轴上它们都算"有"，其余地址没有。
+        statuses: await readDaemonStatuses(spoolDir()),
+        credentialed: addresses,
       })
       for (const warning of report.warnings) log(warning.text)
       if (addresses.length > 0 && report.warnings.length === 0) {

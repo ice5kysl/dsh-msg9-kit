@@ -43,12 +43,14 @@ const {
   scopeNeededFor,
   tryParseScopeFlag,
   // 覆盖 / 健康观测
+  DEFAULT_DAEMON_STALE_MS,
   assessDaemonCoverage,
   daemonHealthFromStatus,
   observePlatformDaemon,
   platformDaemonHealth,
   readDaemonLocks,
   readDaemonStatuses,
+  relevantStatusTenants,
   scopeFromStatusFile,
   // 死 pid 自愈
   isPidAlive,
@@ -59,6 +61,7 @@ const {
   createWatchRuntime,
   planLedgerBatch,
   DEFAULT_CONSUMER,
+  EMPTY_LEDGER_CURSOR,
   consumerCursorPath,
   ledgerPath,
   readConsumerCursor,
@@ -443,7 +446,15 @@ await check('⑤ 平台侧健康观测（只读）：活锁/死锁、健康文�
   assert.equal(daemonHealthFromStatus(undefined, { now }), 'unknown')
   assert.equal(daemonHealthFromStatus({ file: 'x', last_beat_ms: now - 1_000, tenants: [] }, { now }), 'up')
   assert.equal(daemonHealthFromStatus({ file: 'x', last_beat_ms: now - 1_000, tenants: [{ tenant: 'ice', state: 'stalled' }] }, { now }), 'stalled')
-  assert.equal(daemonHealthFromStatus({ file: 'x', last_beat_ms: now - 20_000, tenants: [] }, { now }), 'dead')
+  // T-46 ④：默认阈值从 15s（=3 拍）放宽到 DEFAULT_DAEMON_STALE_MS（=9 拍）。
+  assert.equal(DEFAULT_DAEMON_STALE_MS, 45_000, '默认按 9×5s 心跳取值（保守侧）')
+  assert.equal(daemonHealthFromStatus({ file: 'x', last_beat_ms: now - 20_000, tenants: [] }, { now }), 'up', '20s（4 拍）在保守默认下**不再**误判 dead')
+  assert.equal(daemonHealthFromStatus({ file: 'x', last_beat_ms: now - 90_000, tenants: [] }, { now }), 'dead')
+  assert.equal(
+    daemonHealthFromStatus({ file: 'x', last_beat_ms: now - 20_000, tenants: [] }, { now, staleMs: 15_000 }),
+    'dead',
+    '阈值仍然可配：显式传 15s 就回到改前的口径',
+  )
   assert.equal(daemonHealthFromStatus({ file: 'x', tenants: [] }, { now }), 'unknown')
   assert.equal(scopeFromStatusFile('.daemon-status.json').kind, 'machine')
   assert.deepEqual(scopeFromStatusFile('.daemon-status-tenant-dsh.ice.json'), { kind: 'tenant', pod: 'dsh', org: 'ice', label: 'tenant:dsh.ice' })
@@ -620,6 +631,162 @@ await check('⑥ planLedgerBatch：账本事件 → 真邮件（对账掉已闭�
   assert.deepEqual(allGone.deliver, [])
   assert.deepEqual(allGone.reconciled_away, ['m2'])
   assert.equal(allGone.retry, false)
+})
+
+await check('⑥ 空账本基线（T-46①）：立哨兵 + **只对账不投递**，日志说清"本轮 N 封不唤醒"；第一封信随后必须唤醒', async () => {
+  const dir = await tempSpool()
+  const now = Date.parse('2026-10-07T02:00:00Z')
+  const logs = []
+  const followups = []
+  let unprocessedCalls = 0
+  const agent = { id: 's1', followup: (message) => followups.push(message), inject: () => {} }
+  const deps = {
+    loadState: async () => ({ workspaces: {} }),
+    setWatchState: async () => {},
+    listInbox: async () => {
+      unprocessedCalls += 1
+      return { messages: [mail('old-1'), mail('old-2')], unread_count: 2 }
+    },
+    resolveAgent: () => agent,
+    uuid: () => 'u-empty-baseline',
+    now: () => now,
+    log: (message) => logs.push(message),
+  }
+  const ingest = createLedgerIngest(deps, createWatchRuntime(), 'ws-a', { address: ADDRESS, api_key: 'k', api_url: 'http://fake' }, {
+    consumer: CONSUMER,
+    spoolDir: dir,
+    daemonHealth: async () => 'up',
+  })
+
+  // 账本文件还不存在（平台 daemon 收到第一封信才创建它）。
+  await ingest.tick()
+  assert.equal(followups.length, 0, '空账本基线**绝不投递**（第一次观测不许把历史倒进会话）')
+  assert.equal(unprocessedCalls, 1, '空账本基线额外对账一次 —— 只为可观测（有历史的账本仍然是零 REST）')
+  assert.equal(
+    (await readFile(consumerCursorPath(ADDRESS, CONSUMER, dir), 'utf8')).trim(),
+    EMPTY_LEDGER_CURSOR,
+    '空账本基线落哨兵 ⇒ 不再"永远 bootstrap"',
+  )
+  assert.ok(
+    logs.some((message) => message.includes('不唤醒') && message.includes('2 封')),
+    `日志必须说清"本轮几封不唤醒"（这件事不许再静默）：${JSON.stringify(logs)}`,
+  )
+
+  // 第一封信到达 ⇒ 账本文件第一次出现 ⇒ 必须唤醒（T-46 ① 的核心）。
+  await writeFile(ledgerPath(ADDRESS, dir), `${ledgerLine('m-new', '2026-10-07T01:59:00Z')}\n`, 'utf8')
+  unprocessedCalls = 0
+  deps.listInbox = async () => {
+    unprocessedCalls += 1
+    return { messages: [mail('m-new', { created_at: '2026-10-07T01:59:00Z' })], unread_count: 1 }
+  }
+  await ingest.tick()
+  assert.equal(followups.length, 1, '**账本文件刚出现的那第一封信必须唤醒**（改前它被当成基线吞掉）')
+  assert.match(followups[0].content[0].text, /subject m-new/)
+  assert.equal(unprocessedCalls, 1, '真正投递的那一轮仍然只打一次 REST')
+  assert.equal((await readFile(consumerCursorPath(ADDRESS, CONSUMER, dir), 'utf8')).trim(), 'm-new', '游标从哨兵推进到真实 id')
+})
+
+// ============================================= ⑦ T-46② scope 覆盖 ≠ 凭据可用
+
+await check('⑦ T-46②：connected:false 必须被健康判定看见（进程活着 ≠ 这个租户连得上）', async () => {
+  const now = Date.parse('2026-10-07T12:00:00Z')
+  const spool = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-cutover-status-'))
+  const home = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-cutover-statushome-'))
+  await writeFile(join(home, 'daemon.lock.machine-TEST'), `${process.pid}\n`, 'utf8')
+  // 形状照抄真实 `.daemon-status.json`（本机 2026-10-07）：一份文件里既有
+  // `connected:true` 的租户、也有 `connected:false` 的租户与票据。
+  await writeFile(join(spool, '.daemon-status.json'), JSON.stringify({
+    scope: 'machine-Jiker',
+    pid: 68736,
+    last_beat: new Date(now - 1_000).toISOString(),
+    tenants: [
+      { tenant: 'msg9.ice', mode: 'stream', connected: true, stalled: false },
+      { tenant: 'kimi.code', mode: 'stream', connected: false, stalled: false },
+      { tenant: 'dsh@kimi.ice.msg9.io', mode: 'ticket', connected: false, stalled: false },
+      { tenant: 'mum.ice', mode: 'stream', connected: false, stalled: true },
+    ],
+  }), 'utf8')
+
+  const [status] = await readDaemonStatuses(spool)
+  const stateOf = (name) => status.tenants.find((row) => row.tenant === name)?.state
+  assert.equal(stateOf('msg9.ice'), 'connected')
+  assert.equal(stateOf('kimi.code'), 'disconnected', '**显式 connected:false 不能再落到 unknown**（改前就是这里看不到的）')
+  assert.equal(stateOf('dsh@kimi.ice.msg9.io'), 'disconnected')
+  assert.equal(stateOf('mum.ice'), 'stalled')
+
+  const opts = { now }
+  const statusOf = (address) => daemonHealthFromStatus(status, { ...opts, address })
+  // 连接轴必须**按地址**看：同一份文件里，好的租户不许被坏的拖下水。
+  assert.equal(statusOf('dsh@msg9.ice.msg9.io'), 'up', 'msg9.ice 是好的 ⇒ up（改前也是 up，但改前所有地址都恒为 up）')
+  assert.equal(statusOf('kimi@kimi.code.msg9.io'), 'disconnected', '租户行 connected:false ⇒ 该租户的地址都看得见')
+  assert.equal(statusOf('dsh@kimi.ice.msg9.io'), 'disconnected', '**地址级票据行优先**：它比租户行更具体')
+  assert.equal(statusOf('kimi@mum.ice.msg9.io'), 'stalled', 'stalled 仍然报 stalled')
+  assert.equal(daemonHealthFromStatus(status, opts), 'stalled', '不传 address ⇒ 退回整份文件的聚合判断（改前行为）')
+  assert.deepEqual(relevantStatusTenants(status.tenants, 'dsh@kimi.ice.msg9.io').map((row) => row.tenant), ['dsh@kimi.ice.msg9.io'])
+
+  // 端到端：`observePlatformDaemon` 也必须按地址给结论（否则 decideTopUp 还是瞎的）。
+  const disconnected = await observePlatformDaemon('dsh@kimi.ice.msg9.io', { spoolDir: spool, msg9Home: home, now })
+  assert.equal(disconnected.health, 'disconnected')
+  assert.equal(disconnected.source, 'status')
+  const healthy = await observePlatformDaemon('dsh@msg9.ice.msg9.io', { spoolDir: spool, msg9Home: home, now })
+  assert.equal(healthy.health, 'up', '同一个活 daemon 下，另一个地址照样是 up（不许一刀切）')
+  // 心跳新鲜但 20s 前 ⇒ 保守默认（45s）不判死（T-46 ④）。
+  await writeFile(join(spool, '.daemon-status.json'), JSON.stringify({
+    last_beat: new Date(now - 20_000).toISOString(),
+    tenants: [{ tenant: 'msg9.ice', connected: true }],
+  }), 'utf8')
+  assert.equal((await observePlatformDaemon('dsh@msg9.ice.msg9.io', { spoolDir: spool, msg9Home: home, now })).health, 'up')
+})
+
+await check('⑦b T-46②：assessDaemonCoverage 把"连接轴 + 凭据轴"接进来，并**显式告警**没有唤醒来源的地址', async () => {
+  const now = Date.parse('2026-10-07T12:00:00Z')
+  const machine = parseScopeFlag(undefined)
+  const status = {
+    file: '.daemon-status.json',
+    scope: machine,
+    last_beat_ms: now - 1_000,
+    tenants: [
+      { tenant: 'msg9.ice', state: 'connected' },
+      { tenant: 'dsh@kimi.ice.msg9.io', state: 'disconnected' },
+    ],
+  }
+  const addresses = ['dsh@msg9.ice.msg9.io', 'dsh@kimi.ice.msg9.io', 'ghost@ghost.ice.msg9.io']
+  const report = assessDaemonCoverage(addresses, [machine], {
+    statuses: [status],
+    credentialed: ['dsh@msg9.ice.msg9.io', 'dsh@kimi.ice.msg9.io'],
+  })
+  const verdict = (address) => report.verdicts.find((row) => row.address === address)
+
+  assert.equal(verdict('dsh@msg9.ice.msg9.io').wake_source, 'ledger')
+  assert.equal(verdict('dsh@msg9.ice.msg9.io').connection, 'connected')
+  assert.equal(verdict('dsh@msg9.ice.msg9.io').credential, 'present')
+
+  // ⚠️ 核心断言：scope 说"已覆盖"，但连接轴是断的 ⇒ 必须判 top-up-only + 告警。
+  assert.equal(verdict('dsh@kimi.ice.msg9.io').covered, true, 'scope 轴确实覆盖（活锁是 machine）')
+  assert.equal(verdict('dsh@kimi.ice.msg9.io').connection, 'disconnected')
+  assert.equal(verdict('dsh@kimi.ice.msg9.io').wake_source, 'top-up-only')
+  const noWake = report.warnings.find((warning) => warning.address === 'dsh@kimi.ice.msg9.io')
+  assert.equal(noWake.code, 'no-wake-source', '必须产出**显式**告警（改前这里一条告警都没有）')
+  assert.ok(noWake.text.includes('dsh@kimi.ice.msg9.io') && noWake.text.includes('inbox'), `告警要说清兜底是什么：${noWake.text}`)
+
+  // 凭据轴兜底：本机没有凭据的地址 ⇒ 与"没有 scope 覆盖"同级。
+  assert.equal(verdict('ghost@ghost.ice.msg9.io').credential, 'absent')
+  assert.equal(verdict('ghost@ghost.ice.msg9.io').wake_source, 'none')
+  assert.deepEqual(report.uncovered, ['ghost@ghost.ice.msg9.io'])
+  assert.equal(report.warnings.find((warning) => warning.address === 'ghost@ghost.ice.msg9.io').code, 'no-daemon-coverage')
+  assert.ok(report.warnings.find((warning) => warning.address === 'ghost@ghost.ice.msg9.io').text.includes('credential'))
+
+  // 有健康文件、但一条都没提到它 ⇒ "无法确认"（不许假装已覆盖）。
+  const unmentioned = assessDaemonCoverage(['nobody@nowhere.ice.msg9.io'], [machine], { statuses: [status] })
+  assert.equal(unmentioned.verdicts[0].connection, 'unreported')
+  assert.equal(unmentioned.verdicts[0].wake_source, 'unconfirmed')
+  assert.equal(unmentioned.warnings[0].code, 'wake-source-unconfirmed')
+
+  // 不传 statuses / credentialed ⇒ 与改前逐字一致（纯 scope 判定，零告警）。
+  const legacy = assessDaemonCoverage(['ghost@ghost.ice.msg9.io'], [machine])
+  assert.deepEqual(legacy.warnings, [])
+  assert.equal(legacy.verdicts[0].wake_source, 'ledger')
+  assert.equal(legacy.verdicts[0].credential, 'unknown')
 })
 
 console.log(failed > 0 ? `\n${failed} check(s) failed` : '\nall checks passed')

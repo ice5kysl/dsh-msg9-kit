@@ -80,6 +80,8 @@ function assertUnderWork(dir) {
 // lib 必须在 MSG9_HOME 重定向之后再加载（与 tests/*.test.mjs 同一条纪律）。
 const {
   DEFAULT_CONSUMER,
+  DEFAULT_MAX_PER_ROUND,
+  EMPTY_LEDGER_CURSOR,
   assessDaemonCoverage,
   consumerCursorPath,
   createLedgerConsumer,
@@ -350,31 +352,48 @@ async function main() {
   out('## 2. 平台 daemon 健康与覆盖（判据层只读观测）')
   out('')
   out('```')
-  out(`${pad('地址', 32)}${pad('账本', 6)}${pad('health', 9)}${pad('判据来源', 12)}${pad('scope 覆盖', 13)}详情`)
+  out(`${pad('地址', 32)}${pad('账本', 6)}${pad('health', 14)}${pad('判据来源', 12)}${pad('唤醒来源', 15)}详情`)
   const observations = []
+  const credentialed = [...new Set(discovery.credentials.map((row) => row.address))]
   for (const reading of readings) {
     const observation = await observePlatformDaemon(reading.address, {
       spoolDir: REAL_SPOOL,
       msg9Home: REAL_MSG9,
       now: Date.now(),
     })
-    const coverage = assessDaemonCoverage([reading.address], liveScopes)
+    const coverage = assessDaemonCoverage([reading.address], liveScopes, { statuses, credentialed })
+    const verdict = coverage.verdicts[0]
     observations.push({ address: reading.address, observation, coverage })
     out(
-      `${pad(reading.address, 32)}${pad(reading.exists ? '有' : '无', 6)}${pad(observation.health, 9)}${pad(observation.source, 12)}${pad(coverage.verdicts[0].covered ? observation.live_scopes.join(',') || 'machine' : '未覆盖', 13)}${observation.detail}`,
+      `${pad(reading.address, 32)}${pad(reading.exists ? '有' : '无', 6)}${pad(observation.health, 14)}${pad(observation.source, 12)}${pad(verdict.wake_source, 15)}${observation.detail}`,
     )
   }
   out('```')
   out('')
-  out(`> 覆盖判据用的是 **scope**（`+"`machine`"+` 覆盖"所有地址"），不是**凭据**：`)
-  out(`> 当前活锁 ${liveScopes.map((s) => s.label).join(', ') || '（无）'} ⇒ \`assessDaemonCoverage\` 对全部 ${readings.length} 个地址都判"已覆盖"。`)
+  out(`> **T-46 ② 之后**：覆盖判定同时看三轴 —— **scope**（活锁：${liveScopes.map((s) => s.label).join(', ') || '（无）'}）· **凭据存在性** · **连接状态**（健康文件里的 \`connected\`）。`)
+  out(`> 活锁是 \`machine\` ⇒ 全部 ${readings.length} 个地址在 **scope 轴**上都算"已覆盖"；真正决定"它的信会不会进账本"的是另外两轴。`)
   if (staleLocks.length > 0) out(`> 指向死 pid 的锁（自愈，当没有）：${staleLocks.map((l) => l.file).join(', ')}`)
   out('')
 
-  // 2b：健康文件里的**逐 tenant/逐地址连接状态**。`daemonHealthFromStatus` 只看
-  // `stalled`，不看 `connected` —— 于是"某几个租户/地址的 ticket 根本连不上"这件事
-  // 对 `decideTopUp` 完全不可见。这里把**原始字段**摆出来（只读）。
-  out('### 2b. 健康文件里的逐条连接状态（`connected:false` 是判据的盲区）')
+  // 2a：把**全部**地址一起过一遍覆盖判据（生产接线 index.ts 就是这么调的），
+  //     把告警原样打出来 —— 这就是"没有任何唤醒来源的地址必须显式告警"的落点。
+  const coverageAll = assessDaemonCoverage(addresses, liveScopes, { statuses, credentialed })
+  const bySource = { ledger: 0, 'top-up-only': 0, unconfirmed: 0, none: 0 }
+  for (const verdict of coverageAll.verdicts) bySource[verdict.wake_source] += 1
+  out('### 2a. 全部地址的唤醒来源裁决 + 告警（`assessDaemonCoverage`，只读）')
+  out('')
+  out(`- 唤醒来源分布：**ledger ${bySource.ledger}** · **top-up-only ${bySource['top-up-only']}**（scope 覆盖但连接断了）· unconfirmed ${bySource.unconfirmed} · none ${bySource.none}`)
+  out(`- 告警 ${coverageAll.warnings.length} 条：`)
+  for (const warning of coverageAll.warnings) out(`  - \`${warning.code}\` ${warning.text}`)
+  if (coverageAll.warnings.length === 0) out('  - （无）')
+  out('')
+
+
+  // 2b：健康文件里的**逐 tenant/逐地址连接状态**。
+  // T-45 时这里是判据的盲区（`daemonHealthFromStatus` 只看 `stalled`）；
+  // T-46 ② 之后 `connected:false` ⇒ `disconnected` ⇒ `decideTopUp` 走补齐。
+  // 这里仍然把**原始字段**摆出来（只读），好让"判据看到的"与"文件里写的"能对上。
+  out('### 2b. 健康文件里的逐条连接状态（`connected:false` 现在会被判成 `disconnected`）')
   out('')
   out('```')
   const disconnected = []
@@ -397,10 +416,12 @@ async function main() {
   }
   out('```')
   out('')
-  out(`- 判据此刻算出的 health = \`up\`（last_beat 新鲜、没人报 stalled）。`)
-  out(`- 但健康文件里有 **${disconnected.length}** 条 \`connected:false\`：${disconnected.join(', ') || '（无）'}`)
-  out(`- \`daemonHealthFromStatus\` 只看 \`stalled\`，**不看 \`connected\`** ⇒ 这些连接失败对 \`decideTopUp\` 不可见；`)
-  out(`  与"scope 覆盖 ≠ 凭据可用"是同一个盲区的两面（见结论 §8）。`)
+  const disconnectedAddresses = coverageAll.verdicts.filter((verdict) => verdict.connection === 'disconnected' || verdict.connection === 'stalled')
+  out(`- 健康文件里有 **${disconnected.length}** 条 \`connected:false\`：${disconnected.join(', ') || '（无）'}`)
+  out(`- 判据层把它们映射成 **${disconnectedAddresses.length} 个地址**的 \`connection=disconnected\`，health 相应报 \`disconnected\`：`)
+  out(`  ${disconnectedAddresses.map((verdict) => `${verdict.address}(${verdict.wake_source})`).join(' · ') || '（无）'}`)
+  out(`- ⇒ \`decideTopUp\` 走 **daemon-disconnected** 补齐：这些地址**有唤醒来源**（inbox unread），`)
+  out(`  并且 §2a 里会有一条 \`no-wake-source\` 告警 —— 不再是"既没有唤醒来源、也没有任何告警"。`)
   out('')
 
   // ---------------------------------------------------------------- 3. 三类路由推演
@@ -420,15 +441,18 @@ async function main() {
     let route
     let expected
     if (!reading.exists) {
-      route = 'bootstrap（无账本文件 → 永不立基线）'
-      expected = '0（也永远补不了）'
+      // T-46 ①：改前这里写的是"永不立基线、也永远补不了"（永久静默）；
+      // 现在空账本会落**哨兵游标** ⇒ 基线立得起来，下一封信就是"新事件"。
+      route = 'bootstrap → 哨兵基线（立得住；下一封信唤醒）'
+      expected = '0（本轮无历史；下一封信会响）'
     } else if (lag === undefined) {
       route = 'bootstrap 只立基线'
-      expected = `0（历史 ${reading.parsed.events.length} 条静默吞掉）`
+      expected = `0（历史 ${reading.parsed.events.length} 条静默吞掉，下一封信唤醒）`
     } else if (!lag.anchor_found) {
       route = '滞后补齐（anchor-lost）'
       expected = String(lag.unconsumed)
-    } else if (observation.health === 'dead' || observation.health === 'stalled') {
+    } else if (observation.health === 'dead' || observation.health === 'stalled' || observation.health === 'disconnected') {
+      // T-46 ②：disconnected 也走这条 —— 连不上的租户的信根本不会进账本。
       route = `滞后补齐（daemon-${observation.health}）`
       expected = String(lag.unconsumed)
     } else if (lag.lag_seconds * 1000 > 300_000) {
@@ -445,6 +469,8 @@ async function main() {
   out('')
   out(`> **真实态一律是 bootstrap** —— 真实 spool 里一个 \`*${CURSOR_SUFFIX}\` 都没有，\`readConsumerLag()\` 全部返回 \`undefined\`。`)
   out('> 也就是说：切换那一刻，**每个地址都只立基线、一条历史邮件都不唤醒**（这正是 `ledger.ts` 的不变量，不是 bug）。')
+  out('> T-46 ① 之后，有历史的账本与空账本走**两条不同的基线**：有历史 ⇒ 游标落到文件末行（历史不唤醒）；')
+  out('> 空账本/无账本 ⇒ 游标落**哨兵**（"文件起点之前"）⇒ 让文件出现的**第一封信**是新事件、会唤醒（见 §5c）。')
   out('')
 
   // ---------------------------------------------------------------- 4. 幂等实测
@@ -490,7 +516,7 @@ async function main() {
     await pollC.commit()
 
     out(
-      `${pad(address, 32)}${pad(String(pollA.baseline), 11)} ${padLeft(pollA.fresh.length, 8)} ${padLeft(pollA.bad_lines, 6)}  ${pad(String(pollB.baseline), 11)} ${padLeft(pollB.fresh.length, 8)} ${pad(pollB.top_up.topUp ? String(pollB.top_up.reason) : 'false', 10)} ${padLeft(pollC.fresh.length, 8)} ${pad(cursorAfterA === undefined ? '否(空账本)' : '是', 11)}${(cursorAfterB ?? '').trim() || '-'}`,
+      `${pad(address, 32)}${pad(String(pollA.baseline), 11)} ${padLeft(pollA.fresh.length, 8)} ${padLeft(pollA.bad_lines, 6)}  ${pad(String(pollB.baseline), 11)} ${padLeft(pollB.fresh.length, 8)} ${pad(pollB.top_up.topUp ? String(pollB.top_up.reason) : 'false', 10)} ${padLeft(pollC.fresh.length, 8)} ${pad(cursorAfterA === undefined ? '否(!)' : (cursorAfterA.trim() === EMPTY_LEDGER_CURSOR ? '哨兵' : '是'), 11)}${(cursorAfterB ?? '').trim() || '-'}`,
     )
 
     must(pollA.fresh.length === 0, `${address}: bootstrap 轮不该唤醒任何事件，实际 ${pollA.fresh.length} 条`)
@@ -501,8 +527,14 @@ async function main() {
       must(pollB.baseline === false, `${address}: 提交过游标之后不该还是 baseline`)
       must(cursorAfterA !== undefined, `${address}: 非空账本的 baseline 轮也必须落游标，否则永远立不起基线`)
     } else {
-      // 空账本：next_anchor 是 undefined ⇒ commit 不写游标 ⇒ 永远停在 baseline。
-      must(cursorAfterA === undefined, `${address}: 空账本不该写出游标（与实现一致）`)
+      // T-46 ①：空账本 ⇒ commit 写**哨兵游标**（"文件起点之前"）⇒ 基线立得住，
+      // 而且让文件出现的那第一封信是"新事件"而不是"历史"（见 §5c）。
+      must(cursorAfterA !== undefined, `${address}: 空账本的基线轮也必须落**哨兵**游标，否则永远停在 bootstrap`)
+      must(
+        (cursorAfterA ?? '').trim() === EMPTY_LEDGER_CURSOR,
+        `${address}: 空账本基线写的必须是哨兵 ${EMPTY_LEDGER_CURSOR}（实际 ${JSON.stringify((cursorAfterA ?? '').trim())}）`,
+      )
+      must(pollB.baseline === false, `${address}: 落过哨兵之后不该还是 baseline（改前这里恒为 true = 永久静默）`)
       if (pollB.baseline === true) emptyLedgerForever.push(address)
     }
     idempotence.push({ address, pollA, pollB, pollC, cursorAfterA, cursorAfterB, logs })
@@ -510,9 +542,14 @@ async function main() {
   out('```')
   out('')
   if (emptyLedgerForever.length > 0) {
-    out(`> ⚠ **${emptyLedgerForever.length} 个地址的账本文件根本不存在** ⇒ \`next_anchor\` 是 \`undefined\` ⇒ \`commit()\` 写不出游标 ⇒ **永远停在 bootstrap**（永久黑洞）：`)
-    out(`> ${emptyLedgerForever.join(', ')}`)
-    out(`> 更糟的是组合 5c：其中**任何**地址一旦收到第一封信，账本文件才出现，而那时那封信正好就是基线 ⇒ **第一封信不响**。`)
+    out(`> ⚠ **${emptyLedgerForever.length} 个地址仍停在 bootstrap**（哨兵没写进去）：${emptyLedgerForever.join(', ')}`)
+    out('')
+  }
+  const emptyLedgerAddresses = idempotence.filter((row) => row.pollA.ledger_events === 0)
+  if (emptyLedgerAddresses.length > 0) {
+    out(`> ✓ **T-46 ① 修复实测**：${emptyLedgerAddresses.length} 个地址的账本**不存在或为空**（${emptyLedgerAddresses.map((row) => row.address).join(', ')}）——`)
+    out(`> 改前 \`commit()\` 写不出游标 ⇒ 永远停在 bootstrap（"永不立基线、也永远补不了"）；`)
+    out(`> 现在它们都落了哨兵游标 \`${EMPTY_LEDGER_CURSOR}\`，\`A:baseline=true / B:baseline=false\` ⇒ **基线立得起来，下一封信会唤醒**。`)
     out('')
   }
   const secondRoundTotal = idempotence.reduce((n, r) => n + r.pollB.fresh.length, 0)
@@ -588,15 +625,17 @@ async function main() {
   must(Number.isNaN(lostPoll?.fresh.find((e) => e.message_id === 'msg_good_2')?.received_ms ?? 0), '时间不可解析的事件应保留、received_ms 记 NaN，而不是当坏行丢掉')
   out('')
 
-  // ---------------------------------------------------------------- 5c. 账本"第一次出现"时第一条事件被吞
+  // ---------------------------------------------------------------- 5c. 账本"第一次出现"时的第一条事件
   //
-  // 这是把两条各自正确的规则放在一起才暴露的问题：
-  //   ① bootstrap 轮**不写游标**（`next_anchor` 是 undefined ⇒ `commit()` 什么也不写，
-  //      见 `createLedgerConsumer.commit`）；
+  // T-45 在这里量到的是缺陷：把两条各自正确的规则放在一起就出问题 ——
+  //   ① bootstrap 轮**不写游标**（`next_anchor` 是 undefined ⇒ `commit()` 什么也不写）；
   //   ② 账本文件是**平台 daemon 收到第一封信时才创建**的。
   // 于是"账本还不存在 ⇒ 空账本 ⇒ 永远 baseline"与"第一封信一到，文件里就只有这一行"
   // 撞在一起：那一行正好是 baseline，被静默吞掉。
-  out('### 5c. 账本文件"第一次出现"时的第一封信（两条正确规则的合谋）')
+  //
+  // T-46 ① 的修法在这里被**钉住**：空账本基线写哨兵（"文件起点之前"）⇒ 让文件出现的
+  // 那第一封信是"新事件"，必须被唤醒。
+  out('### 5c. 账本文件"第一次出现"时的第一封信（T-46 ① 已修：不再被吞）')
   out('')
   const FRESH_ADDRESS = 'rehearsal@fresh.ice.msg9.io'
   const FRESH_DIR = join(WORK, 'fresh')
@@ -604,7 +643,14 @@ async function main() {
   await mkdir(FRESH_DIR, { recursive: true })
   const freshLedger = join(FRESH_DIR, `${FRESH_ADDRESS}${LEDGER_SUFFIX}`)
   const freshCursor = consumerCursorPath(FRESH_ADDRESS, DEFAULT_CONSUMER, FRESH_DIR)
-  const freshPoll = () => createLedgerConsumer({ address: FRESH_ADDRESS, consumer: DEFAULT_CONSUMER, spoolDir: FRESH_DIR, now: () => Date.now() }).pollOnce()
+  const freshLogs = []
+  const freshPoll = () => createLedgerConsumer({
+    address: FRESH_ADDRESS,
+    consumer: DEFAULT_CONSUMER,
+    spoolDir: FRESH_DIR,
+    now: () => Date.now(),
+    log: (message) => freshLogs.push(message),
+  }).pollOnce()
   const row = (id, at) => `${JSON.stringify({ v: 1, type: 'new_message', address: FRESH_ADDRESS, message_id: id, received_at: at })}\n`
 
   const step1 = await freshPoll() // 账本文件还不存在
@@ -622,18 +668,26 @@ async function main() {
   const step4 = await freshPoll()
 
   out('```')
-  out(`① 账本还不存在                    → baseline=${step1.baseline} fresh=${step1.fresh.length} 游标写入=${step1Cursor === undefined ? '否（next_anchor 是 undefined）' : '是'}`)
-  out(`② 第一封信到达（账本出现，只有这 1 行） → baseline=${step2.baseline} fresh=${step2.fresh.length}   ← 这封信被当成"历史"，静默吞掉`)
+  out(`① 账本还不存在                    → baseline=${step1.baseline} fresh=${step1.fresh.length} 游标写入=${step1Cursor === undefined ? '否（next_anchor 是 undefined）' : `是：哨兵 ${(step1Cursor ?? '').trim()}`}`)
+  out(`② 第一封信到达（账本出现，只有这 1 行） → baseline=${step2.baseline} fresh=${step2.fresh.length}${step2.fresh.length === 1 ? `  ← **第一封信被唤醒**（${step2.fresh.map((e) => e.message_id).join(', ')}）` : '  ← 警告：第一封信又被吞了'}`)
   out(`③ 再跑一轮（基线已立）            → baseline=${step3.baseline} fresh=${step3.fresh.length}`)
   out(`④ 第二封信到达                    → baseline=${step4.baseline} fresh=${step4.fresh.length}（${step4.fresh.map((e) => e.message_id).join(', ')}）`)
   out('```')
   out('')
-  must(step1.baseline === true && step1Cursor === undefined, '空账本轮不该写出游标（否则这个演示的前提不成立）')
-  must(step2.baseline === true && step2.fresh.length === 0, '账本文件刚出现时仍是 baseline ⇒ 第一封信被吞（这就是待修的风险）')
+  must(step1.baseline === true, '账本还不存在时首轮必须是 baseline')
+  must((step1Cursor ?? '').trim() === EMPTY_LEDGER_CURSOR, `空账本基线必须写哨兵游标（实际 ${JSON.stringify((step1Cursor ?? '').trim())}）`)
+  must(
+    freshLogs.some((message) => message.includes('哨兵基线')),
+    `空账本这件事必须留日志（不许再静默）：${JSON.stringify(freshLogs)}`,
+  )
+  must(step2.baseline === false && step2.fresh.length === 1, '**账本文件刚出现时的那第一封信必须被唤醒**（改前它是 baseline 被静默吞掉）')
+  must(step2.fresh[0]?.message_id === 'msg_first_ever', `被唤醒的必须是 msg_first_ever，实际 ${step2.fresh.map((e) => e.message_id).join(',') || '空'}`)
+  must(step3.fresh.length === 0, '立完基线之后没有新信 ⇒ 不重复唤醒')
   must(step4.fresh.length === 1 && step4.fresh[0].message_id === 'msg_second', `第二封信必须被唤醒，实际 fresh=${step4.fresh.map((e) => e.message_id).join(',') || '空'}`)
-  out('> **风险（不是断言失败，是真实行为）**：任何"账本文件还不存在"的地址，收到的**第一封信**都会被当成基线吞掉。')
-  out('> 生产影响：`dsh-3@dsh.ice`、`diansuan@dsh.ice`、`dsh-ws-*@msg9.ice` 这类**今天还没有账本**的工作区信箱，')
-  out('> 一旦第一封信到了，它不会响 —— 而且没有任何日志说"我吞了一封"。')
+  out('> **T-46 ① 前后对照**：改前 ② 是 `baseline=true fresh=0`（第一封信被当成"历史"吞掉），')
+  out('> 现在是 `baseline=false fresh=1`；① 也从"写不出游标"变成"写入哨兵 `' + EMPTY_LEDGER_CURSOR + '`"。')
+  out('> 生产影响面：`dsh-3@dsh.ice`、`diansuan@dsh.ice`、`dsh-ws-*@msg9.ice` 这类**今天还没有账本**的工作区信箱，')
+  out('> 收到第一封信时现在会响（改前不响、且没有任何日志）。')
   out('')
 
   // ---------------------------------------------------------------- 6. 滞后补齐推演
@@ -643,7 +697,7 @@ async function main() {
   out('> 真实 spool 仍然只读；这里写的是拷贝。')
   out('')
   out('```')
-  out(`${pad('地址', 32)} ${padLeft('锚点文件序', 12)}  ${pad('锚点 received_at', 21)} ${padLeft('anchor_found', 12)} ${padLeft('unconsumed', 10)} ${padLeft('lag', 8)}  ${pad('decideTopUp', 18)} ${padLeft('fresh', 6)}`)
+  out(`${pad('地址', 32)} ${padLeft('锚点文件序', 12)}  ${pad('锚点 received_at', 21)} ${padLeft('anchor_found', 12)} ${padLeft('unconsumed', 10)} ${padLeft('lag', 8)}  ${pad('decideTopUp', 18)} ${padLeft('fresh', 6)} ${padLeft('deferred', 9)}`)
   const gapSims = []
   for (const reading of readings) {
     if (!reading.exists || reading.parsed.events.length === 0) continue
@@ -679,7 +733,7 @@ async function main() {
     }).pollOnce()
     gapSims.push({ address: reading.address, cut, anchorEvent, lag, poll })
     out(
-      `${pad(reading.address, 32)} ${padLeft(`L${cut + 1}/${events.length}`, 12)}  ${pad(iso(anchorEvent.received_ms), 21)} ${padLeft(String(lag?.anchor_found), 12)} ${padLeft(lag?.unconsumed ?? '-', 10)} ${padLeft(dur((lag?.lag_seconds ?? 0) * 1000), 8)}  ${pad(`${poll.top_up.topUp}${poll.top_up.reason ? ` (${poll.top_up.reason})` : ''}`, 18)} ${padLeft(poll.fresh.length, 6)}`,
+      `${pad(reading.address, 32)} ${padLeft(`L${cut + 1}/${events.length}`, 12)}  ${pad(iso(anchorEvent.received_ms), 21)} ${padLeft(String(lag?.anchor_found), 12)} ${padLeft(lag?.unconsumed ?? '-', 10)} ${padLeft(dur((lag?.lag_seconds ?? 0) * 1000), 8)}  ${pad(`${poll.top_up.topUp}${poll.top_up.reason ? ` (${poll.top_up.reason})` : ''}`, 18)} ${padLeft(poll.fresh.length, 6)} ${padLeft(poll.deferred, 9)}`,
     )
   }
   out('```')
@@ -687,6 +741,8 @@ async function main() {
   out('> `unconsumed` = 锚点之后（文件序）还有多少条；`lag` = 其中**最老**一条距今多久（`readConsumerLag` 的口径）。')
   out('> 注意「回填块」会让最老未消费事件**比锚点本身还老**（真实数据里就有：锚点是 10-01、回填块里却有 09-29 的行）——')
   out('> 这正是 `lag` 取最老而不是取最新的价值：它算出的是"积压里最急的那封等了多久"。')
+  out(`> **T-46 ③**：\`fresh\` 一列被**单轮唤醒上限**（默认 ${DEFAULT_MAX_PER_ROUND}）截住，超出部分记在 \`deferred\`（下一轮再来）——`)
+  out('> 改前这一格会直接是 100+（实测 `dsh@msg9.ice` 127 条 / `kimi@msg9.ice` 150 条 = 一次把几天的旧信全倒进会话）。')
   out('')
 
   // 锚点缺失（真实地址上重放一遍，用 GAP 目录）
@@ -733,17 +789,25 @@ async function main() {
   out(`- 真实 spool 里 **0 个游标** ⇒ 切换首轮**全部走 bootstrap**，只立基线、不唤醒任何历史（含断档期间积压的信）。`)
   out(`- 幂等：第二轮（新对象、空 seen 环）全部地址合计新事件 **${secondRoundTotal}** 条；第三轮同样 0。`)
   out(`- 坏行容错：夹具 ${fixtureLines.length} 行里 5 行坏行，全部跳过并计数，\`pollOnce\`/\`readConsumerLag\` 均未抛。`)
-  out(`- 账本并非按 \`received_at\` 顺序追加：**${outOfOrder.length}/${withLedger.length}** 份有逆序行（回填块）。`)
+  out(`- 账本并非按 \`received_at\` 顺序追加：**${outOfOrder.length}/${withLedger.length}** 份有逆序行（回填块）⇒ 游标语义只能按**文件序**，分批也只能按文件序切。`)
   out(`- 末行是迟到补写的账本：**${backfilled.length}/${withLedger.length}** 份（\`mtime - 末行 received_at > 2min\`）。`)
   out(`- 最大断档 > 1 天的地址：**${withGap.length}** 个（最长 ${dur(Math.max(...readings.map((r) => r.maxGapMs)))}）。`)
-  out(`- 健康文件里 \`connected:false\` 的条目：**${disconnected.length}** 条，但 \`daemonHealthFromStatus\` 仍报 \`up\`。`)
-  out(`- **5c 实测（最该修的一条）**：账本文件"第一次出现"时，第一条事件被 bootstrap 静默吞掉 —— 地址的**第一封信不响**。`)
-  out(`- 走不通的路（无账本 ⇒ 永停在 bootstrap）：${noLedger.length > 0 ? noLedger.map((r) => r.address).join(', ') : '（无）'}`)
+  out('')
+  out('**T-46 三条必修 + 一项调参 的实测结论：**')
+  out('')
+  out(`- ① 空账本/无账本（**${noLedger.length}** 个地址${noLedger.length > 0 ? `：${noLedger.map((r) => r.address).join(', ')}` : ''}）：`)
+  out(`  改前 \`commit()\` 写不出游标 ⇒ **永远停在 bootstrap（永不立基线、也永远补不了）**，第一封信被静默吞掉；`)
+  out(`  现在基线轮写**哨兵游标** \`${EMPTY_LEDGER_CURSOR}\`（§4 的"游标已写=哨兵"一列 + §5c）⇒ 第一封信 \`fresh=1\` 被唤醒，并留日志。`)
+  out(`- ② \`connected:false\` **${disconnected.length}** 条（${disconnected.join(', ') || '（无）'}）：`)
+  out(`  改前 \`daemonHealthFromStatus\` 只看 \`stalled\` ⇒ 一律报 \`up\`、\`decideTopUp\` 完全看不见；`)
+  out(`  现在判成 \`disconnected\` ⇒ 这些地址走 \`daemon-disconnected\` 补齐，并在 §2a 产出 \`no-wake-source\` 告警（共 ${disconnectedAddresses.length} 个地址）。`)
+  out(`- ③ 单轮唤醒上限 \`${DEFAULT_MAX_PER_ROUND}\`：§6 的 \`fresh/deferred\` 两列即实测 —— 100+ 条的积压被切成每轮 ${DEFAULT_MAX_PER_ROUND} 条，剩余下轮，**不丢信**。`)
+  out(`- ④ 心跳阈值默认 \`45s\`（9×5s 心跳；改前 15s = 3 拍），仍可用 \`staleMs\` 配置 —— 抖动误判 dead ⇒ 白跑补齐的窗口变小。`)
   out('')
 
   out(`## 9. 断言汇总`)
   out('')
-  if (failures.length === 0) out('✅ 全部断言通过（只读护栏 / 幂等 / 坏行容错 / 路由判据）')
+  if (failures.length === 0) out('✅ 全部断言通过（只读护栏 / 幂等 / 坏行容错 / 路由判据 / T-46 ①②③）')
   else {
     out(`❌ ${failures.length} 条断言失败：`)
     for (const f of failures) out(`   - ${f}`)
