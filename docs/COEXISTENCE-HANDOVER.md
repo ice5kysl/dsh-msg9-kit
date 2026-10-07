@@ -235,3 +235,27 @@ cat ~/.dsh/msg9-daemon/daemon.json 2>/dev/null
 ⇒ **本机现在绝不能切到 `ledger`**：今天维持唤醒链的是自研 daemon（活着、在投递）。
 等平台 daemon 复活、账本重新流动，再回来重跑本节三条。
 
+### §6 更新（2026-10-07 12:20，同日稍后）—— **三条前置现已全部满足，但仍不立刻切**
+
+主人要求把平台 daemon 拉起来并保障其持续运行，已用 **launchd** 做完（见下）。实测：
+
+| 前置 | 现状 | 证据 |
+|---|---|---|
+| ① 平台 daemon 活着 | ✅ | pid **55422**（PPID=1，被 launchd 收养），锁 `daemon.lock.machine-Jiker` 内容 = 55422 |
+| ② 账本在长 | ✅ | `*.jsonl` mtime 回到 **11:59+**；自测信落进 `dsh@dsh.ice.msg9.io.jsonl`：`{"v":1,"type":"new_message","message_id":"msg_GfMPAnucNaNa",...}`（12:01） |
+| ③ 健康文件存在 | ✅ | `~/.msg9/spool/.daemon-status.json`（**machine scope 无后缀**）：`scope=machine-Jiker` · `pid=55422` · `last_beat` 25s 内刷新 · **`tenants` 11 个全部 `connected:true` / `stalled:false`（mode=stream）** |
+
+**仍然不切**的理由（与"能跑≠该切"同源）：**账本刚恢复流动，需要一段观察期证明它"持续在长"**，而不是"刚被我们叫醒"。
+观察指标：① 每 60s 看 `last_beat` 是否比上次新（launchd 看守）；② 每次有新信时对应 `.jsonl` 是否追加
+（可用自测信）；③ `tenants[].stalled` 是否出现过。**观察期内任一指标掉线 ⇒ 不切，并回到自研 daemon 路径。**
+
+### 持续运行是怎么保障的（本机实现，属机器级运维，不在本仓代码里）
+
+- `~/Library/LaunchAgents/io.msg9.daemon.plist`（`RunAtLoad` + **`StartInterval: 60`** + `ThrottleInterval: 60`）；
+- `~/.local/bin/msg9-daemon-guard`：先读锁里的 pid，**活着就退出 0（不打扰、不打日志），死了才 `exec msg9 daemon`**
+  —— 语义与我们自研 daemon 的「死 pid 自愈」一致，避免"每 60s 打印一次 scope 已被持有"的噪声；
+- **已知的结构性问题（已反馈平台）**：`msg9 daemon` **自己 daemonize（fork 后父进程退出）** ⇒ launchd/systemd
+  **无法追踪真进程**（只能靠 `StartInterval` 这种"定期检查再拉起"的间接看守）。正解应由平台提供
+  `--foreground` 或 `msg9 daemon install` 的自托管模板。
+
+
