@@ -796,11 +796,24 @@ class InboxRunner {
    * old limit=100 truncation): pages of 100 until a short page. Falls back to
    * the payload's processed_at when the reconcile call itself fails — a broken
    * reconcile degrades to the old behaviour, never to "wake for everything".
+   *
+   * T-54（省配额二轮）：**本批要判的 id 全都见过了就立刻停**。`live` 只增不减
+   * （每页只往里加 id），全集一旦覆盖本批，后面几页无论返回什么都**不可能**翻转
+   * `messages.filter(live.has)` 的结论 ⇒ 多翻的那几页纯粹是把配额花在"再确认一次
+   * 已知事实"上。语义零变化，只是把"翻完整个未处理文件夹"变成"翻到够用为止"。
+   *
+   * 为什么正常情况下就是 1 次：本批的信是**刚到**的，而服务端
+   * `folder=unprocessed` 按 `created_at DESC` 排序
+   * （msg9.io `backend/internal/repository/message.go` 的 `Order("created_at DESC")`）
+   * ⇒ 第一页必有它们。只有「未处理积压 > 100 封且本批的信排在后面」才会继续翻页，
+   * 而那时翻页是**语义必需**的：不翻就会把仍未处理的信误判成已闭环 ⇒ 静默漏唤醒
+   * （v1.20 的另一半，和"重复唤醒"同样不可接受）。
    */
   private async onlyUnprocessed(identity: DaemonIdentity, messages: InboxMessage[]): Promise<InboxMessage[]> {
     const { deps } = this.engine
     if (messages.length === 0) return messages
     try {
+      const wanted = new Set(messages.map((message) => message.message_id))
       const live = new Set<string>()
       let offset = 0
       for (let page = 0; page < deps.config.unprocessedMaxPages; page += 1) {
@@ -808,6 +821,8 @@ class InboxRunner {
         const rows = result.messages ?? []
         for (const row of rows) live.add(row.message_id)
         if (rows.length < 100) break
+        // 早停：本批的每个 id 都已经在手里（结论已定，再翻只多付配额）。
+        if (wanted.size > 0 && [...wanted].every((id) => live.has(id))) break
         offset += rows.length
       }
       return messages.filter((message) => live.has(message.message_id))

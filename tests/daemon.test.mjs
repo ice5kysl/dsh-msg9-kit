@@ -269,7 +269,9 @@ async function makeEngine({ sincePages = {}, bootstrapPage, unprocessed = [], de
     now: () => Date.now(),
     listInbox: async (_url, _key, query) => {
       listCalls.push(query)
-      if (query.folder === 'unprocessed') return { messages: unprocessed() }
+      // T-54：offset 透传给 thunk —— 大积压的分页/早停要靠它才测得出来
+      // （既有的 `() => [...]` thunk 忽略参数，行为一字未变）。
+      if (query.folder === 'unprocessed') return { messages: unprocessed(query.offset ?? 0) }
       if (!query.since) return bootstrapPage
       const page = sincePages[query.since]
       if (!page) throw new Error(`unexpected since=${query.since}`)
@@ -320,6 +322,87 @@ await check('engine: new_message → ack → since fetch → coalesced delivery 
     assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C2', 'cursor advanced only after the delivery ack')
     assert.equal(store.get().inboxes['pk-1'].batch, undefined, 'the batch is gone after a successful flush')
     assert.equal(store.get().pending.length, 0)
+  } finally {
+    await engine.stop()
+  }
+})
+
+await check('engine: 服务器说已闭环 ⇒ 一封都不投、也不唤醒（v1.20 权威对账；关掉它对账这条必红）', async () => {
+  const logs = []
+  const { engine, store, registry, ws, delivered, instance } = await makeEngine({
+    bootstrapPage: { messages: [mail('m0')], next_cursor: 'C1', has_more: false },
+    sincePages: { C1: { messages: [mail('m2')], next_cursor: 'C2', has_more: false } },
+    // 瘦投影里这封信**没有** processed_at（正是幽灵唤醒的形状），但服务器的未处理
+    // 视图里已经没有它了 ⇒ 权威对账必须把它拦下来。这就是 v1.20 的那条语义，
+    // 也是 T-54 评估里"不能砍"的那部分。
+    unprocessed: () => [],
+    logs,
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    await waitFor(() => ws.ontext && store.get().inboxes['pk-1']?.watch_cursor === 'C1')
+    ws.ontext(JSON.stringify({ type: 'new_message', message: { message_id: 'm2' } }))
+    // 等**日志本身**（T-39 教训：别拿 state 的形状猜"那条路走完了"）
+    await waitForLog(logs, /already closed server-side; skipping delivery/, '必须走到"服务器说已闭环"这一步')
+    // 日志写在 ackBatch **之前**，游标/批次的落盘在它之后 ⇒ 等状态落定再断言。
+    await waitFor(() => store.get().inboxes['pk-1']?.watch_cursor === 'C2' && !store.get().inboxes['pk-1']?.batch, 3000, '跳过投递后的 ack 落盘')
+    assert.equal(delivered.length, 0, '已在别处闭环的信不许再唤醒任何人')
+    assert.equal(store.get().inboxes['pk-1'].watch_cursor, 'C2', '跳过投递也要把游标跨过去，否则下一轮还会唤醒')
+    assert.equal(store.get().inboxes['pk-1'].batch, undefined, '批次要收掉（否则每次扫描都重来一遍）')
+    assert.equal(store.get().pending.length, 0)
+  } finally {
+    await engine.stop()
+  }
+})
+
+// ------------------------------------------------- T-54：对账的批次口径（配额）
+
+await check('engine: 未处理积压多页 ⇒ 本批 id 已在第一页就早停（每批 1 次对账，不再翻完整个文件夹）', async () => {
+  // 满页（100 行），且本批的 m2 就在第一页最前 —— 真服务端 `created_at DESC`
+  // 就是这个形状。没有早停时这个桩会让引擎一路翻到 unprocessedMaxPages。
+  const page1 = Array.from({ length: 100 }, (_, i) => mail(i === 0 ? 'm2' : `old-${i}`))
+  let unprocessedCalls = 0
+  const { engine, store, registry, ws, delivered, instance } = await makeEngine({
+    bootstrapPage: { messages: [mail('m0')], next_cursor: 'C1', has_more: false },
+    sincePages: { C1: { messages: [mail('m2')], next_cursor: 'C2', has_more: false } },
+    unprocessed: () => { unprocessedCalls += 1; return page1 },
+    extraConfig: { unprocessedMaxPages: 5 },
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    await waitFor(() => ws.ontext && store.get().inboxes['pk-1']?.watch_cursor === 'C1')
+    ws.ontext(JSON.stringify({ type: 'new_message', message: { message_id: 'm2' } }))
+    await waitFor(() => delivered.length === 1 && !store.get().inboxes['pk-1']?.batch)
+    assert.equal(delivered.length, 1, '本批该投的照投（早停不许影响投递）')
+    assert.deepEqual(delivered[0].body.messages.map((message) => message.message_id), ['m2'])
+    assert.equal(unprocessedCalls, 1, '本批的 id 已经见过 ⇒ 结论已定，再翻页纯属白付配额')
+  } finally {
+    await engine.stop()
+  }
+})
+
+await check('engine: 本批的信排在积压后面 ⇒ 必须继续翻页（漏唤醒比多花配额更贵）', async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => mail(`old-${i}`))
+  const page2 = [mail('m2')] // 短页 ⇒ 翻页自然终止
+  let unprocessedCalls = 0
+  const { engine, store, registry, ws, delivered, instance } = await makeEngine({
+    bootstrapPage: { messages: [mail('m0')], next_cursor: 'C1', has_more: false },
+    sincePages: { C1: { messages: [mail('m2')], next_cursor: 'C2', has_more: false } },
+    unprocessed: (offset) => {
+      unprocessedCalls += 1
+      return offset === 0 ? page1 : page2
+    },
+  })
+  try {
+    await engine.start()
+    registry.upsert(instance, Date.now())
+    await waitFor(() => ws.ontext && store.get().inboxes['pk-1']?.watch_cursor === 'C1')
+    ws.ontext(JSON.stringify({ type: 'new_message', message: { message_id: 'm2' } }))
+    await waitFor(() => delivered.length === 1 && !store.get().inboxes['pk-1']?.batch)
+    assert.equal(unprocessedCalls, 2, '第一页没有它 ⇒ 早停不成立，必须翻到找到为止')
+    assert.deepEqual(delivered[0].body.messages.map((message) => message.message_id), ['m2'], '翻页找回来的信照投（漏唤醒是不可接受的另一半）')
   } finally {
     await engine.stop()
   }

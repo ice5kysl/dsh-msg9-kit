@@ -50,6 +50,8 @@ function makeDeps({ state, pages = [], unprocessedPages, agent, batchWindowMs = 
   // pre-v1.20 semantics (whatever the page carried minus its processed_at rows);
   // pass unprocessedPages to simulate the server disagreeing with the payload.
   const seen = []
+  /** T-54：把"投递路径上到底打了几次 folder=unprocessed"变成可观测事实。 */
+  const calls = { unprocessed: 0 }
   const fakeAgent = agent === null
     ? undefined
     : {
@@ -63,6 +65,7 @@ function makeDeps({ state, pages = [], unprocessedPages, agent, batchWindowMs = 
     setWatchState: async (key, patch) => Object.assign(state.workspaces[key], patch),
     listInbox: async (_url, _key, query = {}) => {
       if (query && query.folder === 'unprocessed') {
+        calls.unprocessed += 1
         if (unprocessedPages) {
           const queued = unprocessedPages.shift()
           if (queued instanceof Error) throw queued
@@ -82,7 +85,7 @@ function makeDeps({ state, pages = [], unprocessedPages, agent, batchWindowMs = 
     now: () => 1_000_000,
     log: () => {},
   }
-  return { deps, delivered, state, seen }
+  return { deps, delivered, state, seen, calls }
 }
 
 console.log('dsh-msg9-kit watcher test:')
@@ -295,6 +298,32 @@ await check('v1.20: payload 缺 processed_at 的幽灵信也不唤醒（按服�
   })
   await pollOnce(broken.deps, createWatchRuntime())
   assert.equal(broken.delivered.followup.length, 1, '降级后仍只唤醒未处理的那封')
+})
+
+await check('T-54: 没有活会话时连 folder=unprocessed 对账都不打（那一次配额不该花）', async () => {
+  const state = { workspaces: { 'ws-a': { ...INBOX, watch_cursor: 'W1' } } }
+  const { deps, delivered, calls } = makeDeps({
+    state,
+    pages: [{ messages: [mail('m-new')], next_cursor: 'W2' }],
+    unprocessedPages: [{ messages: [mail('m-new')] }],
+    agent: null, // 没有活会话：本批谁都唤不醒（信还在服务器 inbox 上）
+  })
+  await pollOnce(deps, createWatchRuntime())
+  assert.equal(delivered.followup.length, 0, '没有活会话 ⇒ 一封都不投')
+  assert.equal(delivered.inject.length, 0)
+  assert.equal(calls.unprocessed, 0, '对账结论没有任何用处 ⇒ 一次上游调用都不该付')
+})
+
+await check('T-54: 有活会话时对账仍是每批 1 次（与批次内的封数无关）', async () => {
+  const state = { workspaces: { 'ws-a': { ...INBOX, watch_cursor: 'W1' } } }
+  const batch = ['m-1', 'm-2', 'm-3', 'm-4', 'm-5'].map((id) => mail(id))
+  const { deps, delivered, calls } = makeDeps({
+    state,
+    pages: [{ messages: batch, next_cursor: 'W2' }],
+  })
+  await pollOnce(deps, createWatchRuntime())
+  assert.equal(delivered.followup.length, 1, '一个批次 ⇒ 一次通知')
+  assert.equal(calls.unprocessed, 1, '5 封信也只有 1 次对账（批次口径，不随封数放大）')
 })
 
 await check('stream loop: a 429 honors Retry-After when present', async () => {

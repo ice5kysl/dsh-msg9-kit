@@ -438,6 +438,27 @@ export async function onlyUnprocessed(
 }
 
 /**
+ * 这一批该叫醒谁：**粘性目标优先** —— 通知继续送到上次那个会话，只要它还活着，
+ * 而不是漂到"最新的那个会话"。
+ *
+ * 纯本地查，**0 次上游调用**。**不落盘**：什么时候把粘性目标写下去由调用方决定
+ * —— `deliverBatch` 要等对账确认"真的要投"才写（与改前同一时机），
+ * `deliverDaemonBatch` 没有对账这一步，拿到就写。
+ */
+async function findWakeTarget(
+  deps: Pick<WatchDeps, 'resolveAgent' | 'resolveAgentById'>,
+  key: string,
+  inbox: LiveInbox,
+): Promise<{ agent: WatchAgent; sticky: boolean } | undefined> {
+  if (inbox.last_wake_agent_id && deps.resolveAgentById) {
+    const sticky = deps.resolveAgentById(inbox.last_wake_agent_id)
+    if (sticky) return { agent: sticky, sticky: true }
+  }
+  const agent = await deps.resolveAgent({ key, inbox })
+  return agent ? { agent, sticky: false } : undefined
+}
+
+/**
  * The last mile: reconcile, resolve the session, spend the budgets, deliver.
  *
  * Returns whether a live session ACCEPTED the batch — the ledger ingest needs
@@ -448,6 +469,12 @@ export async function onlyUnprocessed(
  * `options.reconcile: false` skips the `folder=unprocessed` re-check: the
  * ledger path already built this batch FROM that very page, so a second call
  * would only repeat the same truth for another unit of quota.
+ *
+ * T-54（省配额二轮，**批次口径**）：先问"有没有活会话"（纯本地查），再决定要不要
+ * 付那一次对账调用。没有活会话 ⇒ 这一批谁都唤不醒（信仍在服务器 inbox 上，等下一次
+ * 会话建立后由 `msg9_inbox` / 下一批兜底）⇒ 对账结论**没有任何用处**，那次 API
+ * 不该花。对账本身一个字没动：它仍然决定哪些信可以唤醒（v1.20 的幂等语义），
+ * 只是不再为"注定不投递的一批"付费。
  */
 export async function deliverBatch(
   deps: WatchDeps,
@@ -457,20 +484,18 @@ export async function deliverBatch(
   messages: InboxMessage[],
   options: { reconcile?: boolean } = {},
 ): Promise<boolean> {
+  // Sticky target: notices keep going to the session they went to last time
+  // while it stays alive, instead of drifting to whatever session is newest.
+  // 先做这一步（纯本地查）再看要不要付对账 —— 没有活会话时那一次调用不该花。
+  const target = await findWakeTarget(deps, key, inbox)
+  if (!target) return false // no live session: the mail waits for the next session start
+
   const actionable = options.reconcile === false ? messages : await onlyUnprocessed(deps, inbox, messages)
   if (actionable.length === 0) return false
 
-  // Sticky target: notices keep going to the session they went to last time
-  // while it stays alive, instead of drifting to whatever session is newest.
-  let agent: WatchAgent | undefined
-  if (inbox.last_wake_agent_id && deps.resolveAgentById) {
-    agent = deps.resolveAgentById(inbox.last_wake_agent_id)
-  }
-  if (!agent) {
-    agent = await deps.resolveAgent({ key, inbox })
-    if (agent) await deps.setWatchState(key, { last_wake_agent_id: agent.id })
-  }
-  if (!agent) return false // no live session: the mail waits for the next session start
+  // 真的要投了才把粘性目标落下（与改前同一时机：对账没过就不记）。
+  if (!target.sticky) await deps.setWatchState(key, { last_wake_agent_id: target.agent.id })
+  const agent = target.agent
 
   const { text, summary } = renderMailNotice(inbox.address, actionable)
   const message = pluginNotice(deps.uuid(), text, summary)
@@ -738,17 +763,13 @@ export async function deliverDaemonBatch(
   const messages = body.messages.filter((message) => message && typeof message.message_id === 'string')
   if (messages.length === 0) return true
 
-  // Sticky target, same rule as deliverBatch: notices keep going to the session
-  // they went to last time while it stays alive.
-  let agent: WatchAgent | undefined
-  if (inbox.last_wake_agent_id && deps.resolveAgentById) {
-    agent = deps.resolveAgentById(inbox.last_wake_agent_id)
-  }
-  if (!agent) {
-    agent = await deps.resolveAgent({ key, inbox })
-    if (agent) await deps.setWatchState(key, { last_wake_agent_id: agent.id })
-  }
-  if (!agent) return false
+  // Sticky target, same rule (and the same helper) as deliverBatch: notices keep
+  // going to the session they went to last time while it stays alive. 这条路径
+  // 没有"投递前的对账"那一步 ⇒ 拿到目标就把粘性记下来（与改前一致）。
+  const target = await findWakeTarget(deps, key, inbox)
+  if (!target) return false
+  if (!target.sticky) await deps.setWatchState(key, { last_wake_agent_id: target.agent.id })
+  const agent = target.agent
 
   const address = body.inbox || inbox.address
   const rendered = renderMailNotice(address, messages)

@@ -24,6 +24,18 @@
  *       （`readLocalSnapshots`；旧代码不认识这个字段，于是退回 REST 轮询）。
  *   S3 「/resolve 热路径」：22 次同一地址 + 8 个不同地址（面板/Agent 的真实形态）。
  *
+ * T-54 追加三个场景（**只在自研 daemon / 进程内 watcher 的投递路径上**，与上面三个
+ * 徽章场景互不干扰）：`onlyUnprocessed`（v1.20 的权威对账）到底花掉多少次 API：
+ *
+ *   S4 「daemon 批次对账，大积压」：真实 `createEngine` 跑一批投递，服务端
+ *       `folder=unprocessed` 有 250 封（3 页）。改前 = 每批翻到最后一页（3 次），
+ *       改后 = 本批 id 已在第一页就早停（1 次）。
+ *   S5 「没有活会话的一批」：真实 `deliverBatch`（进程内 watcher 的最内层），
+ *       `resolveAgent` 返回 undefined ⇒ 本批谁都唤不醒。改前 = 每批照样对账（1 次），
+ *       改后 = 0 次。
+ *   S6 「有活会话的一批」：同一路径、每批 5 封 —— 证明对账是**每批 1 次**，
+ *       不随批次内的封数放大（这条改前改后应当相同，是"必要性"的对照）。
+ *
  * 用法：node scripts/quota-probe.mjs [--json <out.json>] [--label 改前|改后]
  */
 
@@ -70,19 +82,46 @@ const countsFor = (prefix) => table().reduce((sum, [bucket, n]) => (bucket.start
 
 const envelope = (data) => JSON.stringify({ code: 0, message: 'ok', data })
 
+/**
+ * S4/S5/S6 的可编程投递页（S1–S3 一字不用，保持原口径）。
+ *   · bootstrap：无 `since` 的 `folder=all` 页（首观测留基线用）；
+ *   · since：带游标的那一页（新到的信从这里来）；
+ *   · unprocessedRows：`folder=unprocessed` 的全量行，按 offset/limit 切片
+ *     —— 与真服务端同形（`created_at DESC`，本批的信在最前）。
+ */
+const delivery = {
+  bootstrap: null,
+  since: null,
+  unprocessedRows: [],
+}
+
+function send(res, data) {
+  res.writeHead(200, { 'Content-Type': 'application/json' })
+  res.end(envelope(data))
+}
+
 const server = createServer((req, res) => {
   const url = new URL(req.url, 'http://fake')
   bump(bucketOf(req, url))
 
   // 未读轮询 / 列表：unread_count 与 total 是 REST 的同名字段
   if (req.method === 'GET' && url.pathname === '/api/v1/inbox/messages') {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    return res.end(envelope({
+    const folder = url.searchParams.get('folder')
+    if (folder === 'unprocessed') {
+      const offset = Number(url.searchParams.get('offset') ?? 0) || 0
+      const limit = Number(url.searchParams.get('limit') ?? 100) || 100
+      const rows = delivery.unprocessedRows.slice(offset, offset + limit)
+      // unread_count 是地址级的（与查询无关）；total = 该 folder 的命中数
+      return send(res, { messages: rows, total: delivery.unprocessedRows.length, unread_count: rows.length })
+    }
+    if (url.searchParams.has('since') && delivery.since) return send(res, delivery.since)
+    if (!url.searchParams.has('since') && !url.searchParams.has('offset') && delivery.bootstrap) return send(res, delivery.bootstrap)
+    return send(res, {
       messages: [],
       total: 9,
       unread_count: 3,
       ...(url.searchParams.has('since') ? {} : { next_cursor: 'c-rest' }),
-    }))
+    })
   }
 
   // 长轮询：v1.41.5 T-74 之后 Total 与 REST 同义，且每条返回路径都带 unread_count
@@ -236,6 +275,172 @@ report.scenarios.S3_resolve_hot_path = {
   resolveRequests: countsFor('GET /api/v1/resolve/'),
 }
 
+// S7（T-54 ②）：`ingest: 'ledger'`（**计划中的默认**）下没有任何快照来源 ——
+// 自研 daemon 与进程内 watcher 都不启动（planIngest 的单一唤醒来源约束），账本
+// 消费者只为"有事件/需补齐"的信箱取那一页 unprocessed ⇒ **安静的信箱没有快照**
+// ⇒ 徽章对账（120s 一跳）对每个信箱各退一次 REST 直查 = 28 × 30 = 840 次/小时。
+// 这正是 `T-23` 砍掉的 840 以另一种形态回来，也是"平台侧帧自带未读数"能省掉的那一层。
+resetInboxSnapshots()
+resetCounts()
+const s7 = await reconcileHour()
+report.scenarios.S7_ledger_mode_without_snapshot_source = {
+  reconcilePhaseRequests: s7.requests,
+  unreadPollRequests: s7.unreadPollRequests,
+}
+
+// ------------------------------------------- S4/S5/S6：投递路径的 v1.20 对账口径
+
+const { createEngine, createRegistry, defaultEngineConfig, openDaemonStore, deliverBatch, DAEMON_PROTOCOL } = mod
+
+const UNPROCESSED_BUCKET = 'GET /api/v1/inbox/messages?folder=unprocessed'
+const mailRow = (id) => ({
+  message_id: id,
+  from_address: 'peer@msg9.io',
+  subject: `s-${id}`,
+  body: { text: `body ${id}` },
+  created_at: new Date(Date.UTC(2026, 9, 7, 0, 0, 0)).toISOString(),
+})
+
+async function waitFor(predicate, what, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`[probe] timed out waiting for ${what}`)
+}
+
+/**
+ * S4：真实 `createEngine`（自研 daemon 的核心）跑一批投递，服务端未处理积压 250 封。
+ * 只数 `folder=unprocessed` 那一条路径 —— 这就是 v1.20 权威对账的全部配额。
+ */
+const BACKLOG = Number(process.env.PROBE_BACKLOG ?? 250)
+
+async function runDaemonReconcile() {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-msg9-probe-daemon-'))
+  const store = await openDaemonStore(home)
+  const registry = createRegistry()
+  const delivered = []
+  const ws = {
+    sent: [],
+    lastFrameAt: Date.now(),
+    isClosed: false,
+    ontext: undefined,
+    onerror: undefined,
+    onclose: undefined,
+    sendText(data) { this.sent.push(data) },
+    close() { this.onclose?.(1000, '') },
+    destroy() { this.onclose?.(1006, 'probe') },
+  }
+  const engine = createEngine({
+    store,
+    registry,
+    config: {
+      ...defaultEngineConfig(),
+      batchWindowMs: 20,
+      batchMaxWaitMs: 200,
+      // 场景只关心"一批投递"，其余定时器全部推远（安全网/看门狗/重扫不掺进来）
+      reconcileMs: 3_600_000,
+      safetyNetMs: 3_600_000,
+      pendingSweepMs: 3_600_000,
+      wsWatchdogMs: 3_600_000,
+    },
+    log: () => {},
+    uuid: (() => { let n = 0; return () => `probe-uuid-${(n += 1)}` })(),
+    now: () => Date.now(),
+    // 真的打 HTTP（假服务器会计数），不是本地造一个数字
+    listInbox: (url, apiKey, query) => realApi.listInbox(url, apiKey, query),
+    issueWsTicket: async () => ({ ticket: 'probe-ticket' }),
+    wsConnect: async () => ws,
+    deliverPost: async (_target, body) => { delivered.push(body) },
+    sleep: async () => {},
+    enumerate: async () => [{ project_key: 'pk-probe', address: 'probe@msg9.io', api_key: 'sk-probe', api_url: apiUrl }],
+  })
+  await engine.start()
+  registry.upsert({
+    instance_id: 'probe-inst', pid: process.pid, dsh_home: '/tmp', port: 4321,
+    deliver_token: 'probe-token', protocol: DAEMON_PROTOCOL,
+    workspaces: [{ project_key: 'pk-probe', key: 'ws-probe', title: 'probe', path: '/probe' }],
+  }, Date.now())
+  await waitFor(() => store.get().inboxes['pk-probe']?.watch_cursor === 'C1', 'daemon bootstrap baseline')
+  resetCounts()
+  ws.ontext(JSON.stringify({ type: 'new_message', message: { message_id: 'm-1' } }))
+  await waitFor(() => delivered.length === 1, 'daemon batch delivery')
+  const result = {
+    batches: 1,
+    mailsPerBatch: 2,
+    backlog: delivery.unprocessedRows.length,
+    delivered: delivered.length,
+    requests: Object.fromEntries(table()),
+    unprocessedRequests: countsFor(UNPROCESSED_BUCKET),
+  }
+  await engine.stop()
+  return result
+}
+
+// 服务端未处理积压：本批的两封在**第一页最前**（真服务端 `created_at DESC` 就是
+// 这个形状），后面 248 封是历史积压 ⇒ 改前每批要翻到最后一页才能确认。
+delivery.bootstrap = { messages: [mailRow('seed')], total: 9, unread_count: 3, next_cursor: 'C1', has_more: false }
+delivery.since = { messages: [mailRow('m-1'), mailRow('m-2')], total: 9, unread_count: 3, next_cursor: 'C2', has_more: false }
+delivery.unprocessedRows = [
+  mailRow('m-2'), mailRow('m-1'),
+  ...Array.from({ length: Math.max(0, BACKLOG - 2) }, (_, i) => mailRow(`old-${i}`)),
+]
+report.scenarios.S4_daemon_batch_reconcile = await runDaemonReconcile()
+
+/**
+ * S5/S6：进程内 watcher 的最内层 `deliverBatch`（self 路径真实代码）。
+ * S5 = 没有活会话（`resolveAgent` 返回 undefined）：本批谁都唤不醒；
+ * S6 = 有活会话，每批 5 封：证明对账是"每批一次"，与封数无关。
+ */
+async function runWatcherBatches({ batches, mailsPerBatch, agent }) {
+  const rt = createWatchRuntime()
+  const inbox = { address: 'ws-00@msg9.io', api_key: 'sk-ws-00', api_url: apiUrl }
+  const messages = Array.from({ length: mailsPerBatch }, (_, i) => mailRow(`w-${i}`))
+  const deps = {
+    loadState: async () => stateWith(),
+    setWatchState: async () => {},
+    listInbox: (url, apiKey, query) => realApi.listInbox(url, apiKey, query),
+    resolveAgent: () => agent,
+    uuid: (() => { let n = 0; return () => `probe-notice-${(n += 1)}` })(),
+    now: () => Date.now(),
+    log: () => {},
+  }
+  resetCounts()
+  for (let i = 0; i < batches; i += 1) {
+    await deliverBatch(deps, rt, 'ws-00', inbox, messages)
+  }
+  const delivered = agent ? agent.calls : 0
+  return {
+    batches,
+    mailsPerBatch,
+    deliveredNotices: delivered,
+    requests: Object.fromEntries(table()),
+    unprocessedRequests: countsFor(UNPROCESSED_BUCKET),
+    unprocessedRowsOnServer: delivery.unprocessedRows.length,
+  }
+}
+
+// 对账要能"看到"这批信 ⇒ 未处理页里必须有它们（S5/S6 用同一页）。
+delivery.unprocessedRows = [mailRow('w-0'), mailRow('w-1'), mailRow('w-2'), mailRow('w-3'), mailRow('w-4')]
+
+const noSessionAgent = undefined
+report.scenarios.S5_watcher_no_live_session = await runWatcherBatches({
+  batches: Number(process.env.PROBE_BATCHES ?? 20),
+  mailsPerBatch: 5,
+  agent: noSessionAgent,
+})
+
+const liveAgent = (() => {
+  const agent = { id: 'sess-probe', calls: 0, followup() { this.calls += 1 }, inject() { this.calls += 1 } }
+  return agent
+})()
+report.scenarios.S6_watcher_live_session = await runWatcherBatches({
+  batches: Number(process.env.PROBE_BATCHES ?? 20),
+  mailsPerBatch: 5,
+  agent: liveAgent,
+})
+
 // ------------------------------------------------------------------ 输出
 
 console.log(`\n=== T-23 配额探针（${label}）· ${INBOXES} 个信箱 · 对账 ${RECONCILE_PASSES} 轮/小时 ===\n`)
@@ -247,7 +452,7 @@ for (const [name, data] of Object.entries(report.scenarios)) {
   for (const [bucket, n] of Object.entries(data.reconcilePhaseRequests ?? data.requests ?? {})) {
     console.log(`    [req ] ${String(n).padStart(6)}  ${bucket}`)
   }
-  const headline = data.unreadPollRequests ?? data.resolveRequests
+  const headline = data.unreadPollRequests ?? data.resolveRequests ?? data.unprocessedRequests
   console.log(`    ⇒ 关键计数 = ${headline}\n`)
 }
 
