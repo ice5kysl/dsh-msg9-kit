@@ -132,11 +132,16 @@ console.log('dsh-msg9-kit host-fixes test:')
 
 // ------------------------------------------------------------- H1: 鉴权来源
 
-function fakeReq({ headers = {}, remoteAddress } = {}) {
+function fakeReq({ headers = {}, remoteAddress, encrypted } = {}) {
+  const socket = {
+    ...(remoteAddress ? { remoteAddress } : {}),
+    // T-58：TLS 连接用 socket.encrypted 表示 scheme（https），替身要能模拟。
+    ...(encrypted === undefined ? {} : { encrypted }),
+  }
   return {
     headers,
-    // 测试替身没有 socket 时退回旧的 Host 判定；给了 remoteAddress 就必须是 loopback。
-    ...(remoteAddress ? { socket: { remoteAddress } } : {}),
+    // 测试替身没有 socket 信息时退回旧的 Host 判定；给了 remoteAddress/encrypted 就走真判据。
+    ...(Object.keys(socket).length ? { socket } : {}),
   }
 }
 
@@ -160,6 +165,24 @@ await check('H1: 同源检查修好 [::1] 无端口的边角', () => {
   assert.equal(isTrustedRequest(fakeReq({ headers: { host: '[::1]:3080', origin: 'http://[::1]:3080' } })), true)
   assert.equal(isTrustedRequest(fakeReq({ headers: { host: '[::1]:3080', origin: 'http://[::1]:9999' } })), false)
   assert.equal(isTrustedRequest(fakeReq({ headers: { host: '[::1]', origin: 'http://evil.example' } })), false)
+})
+
+await check('H1b（T-58）：scheme 是 origin 的一部分 —— 我们从不服务的 scheme 不得驱动桥', () => {
+  // 移植 dsh-taskboard-kit 的 m20 修复（`http.ts:274`）：此前只比 host+port ⇒
+  // `Origin: https://127.0.0.1:3080` 会被判同源，任何页面都能驱动一个 plain-http 的桥 ✗。
+  assert.equal(
+    isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'https://127.0.0.1:3080' } })), false)
+  assert.equal(
+    isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' } })), true)
+  // 反向：TLS 连接（socket.encrypted=true ⇒ scheme=https）上，http origin 也必须被拒；
+  // 而同一 TLS 连接上的 https 同源 origin 仍应放行（否则就成了"一律拒 https"的过度修正 ✗）。
+  assert.equal(
+    isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' }, encrypted: true })), false)
+  assert.equal(
+    isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'https://127.0.0.1:3080' }, encrypted: true })), true)
+  // 端口仍要一致（scheme 相等不等于同源）
+  assert.equal(
+    isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'https://127.0.0.1:9999' }, encrypted: true })), false)
 })
 
 await check('H1: 真实 socket 下伪造 Host 被 403（端到端）', async () => {

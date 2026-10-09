@@ -572,7 +572,13 @@ export function isTrustedRequest(req: IncomingMessage): boolean {
   const host = hostnameOf(req.headers.host)
   if (!host) return false
   const origin = req.headers.origin
-  if (origin) return isSameOrigin(origin, req.headers.host ?? '')
+  if (origin) {
+    // 方案（scheme）是 origin 的一部分：`Origin: https://…` 与这个 plain-http 服务**不同源**。
+    // 只比 host+port 会让"我们从没服务过的 scheme"驱动桥（T-58；对齐 dsh-taskboard-kit `http.ts:274`）。
+    // `encrypted` 在 TLSSocket 上、不在 Socket 上 —— 结构化地读，普通 Socket 类型也成立。
+    const scheme = (req.socket as { encrypted?: boolean } | undefined)?.encrypted === true ? 'https:' : 'http:'
+    return isSameOrigin(origin, req.headers.host ?? '', scheme)
+  }
   const remote = req.socket?.remoteAddress
   if (remote && !isLoopbackAddress(remote)) return false
   return isLoopbackHostname(host)
@@ -590,10 +596,13 @@ function portOf(hostHeader: string): string | undefined {
   return colon > 0 ? hostHeader.slice(colon + 1) : undefined
 }
 
-/** `origin` addresses the same scheme/host/port as the `Host` header. */
-function isSameOrigin(origin: string, hostHeader: string): boolean {
+/** `origin` addresses the same scheme/host/port as this request. */
+function isSameOrigin(origin: string, hostHeader: string, scheme: string): boolean {
   try {
     const parsed = new URL(origin)
+    // 先比 scheme（T-58）：`Origin: https://localhost:3080` 对这个 plain-http 服务是**另一个源**；
+    // 此前只比 host+port ⇒ 任何"我们从不服务的 scheme"都能驱动桥。
+    if (parsed.protocol !== scheme) return false
     // WHATWG URL 给 IPv6 保留方括号（'[::1]'），hostnameOf 会去掉——对齐再比。
     const originHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '')
     if (originHost !== hostnameOf(hostHeader)) return false
