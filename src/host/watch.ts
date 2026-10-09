@@ -24,7 +24,7 @@ import type { InboxMessage, InboxPage } from './api.ts'
 import { bodyText, truncate } from '../shared/message.ts'
 import type { LiveInbox, State } from './store.ts'
 import { DEFAULT_LAG_TOPUP_MS, createLedgerConsumer, type DaemonHealth } from './ledger.ts'
-import { planLedgerBatch } from './cutover.ts'
+import { assertObservedWakeSources, planLedgerBatch, type WakeSource } from './cutover.ts'
 
 /** The live-agent face the watcher delivers to (subset of dsh's agent). */
 export interface WatchAgent {
@@ -146,10 +146,104 @@ export interface WatchRuntime {
   agentBudgets: Map<string, WakeBudget>
   inboxBudgets: Map<string, WakeBudget>
   batches: Map<string, { messages: Map<string, InboxMessage>; timer?: ReturnType<typeof setTimeout> }>
+  /**
+   * T-67：**本会话（进程）已经唤醒过**的 message_id —— 跨路径共享的去重环。
+   *
+   * 为什么放在这里：唤醒是不可撤销的副作用（`followup` 会真的开一轮、花钱），
+   * 而 `deliverBatch` 是**所有**唤醒路径唯一的出口。所以"同一封信被响应两次"
+   * 这件事只可能在**出口之前**被拦下来，且必须被**所有路径共享**地拦。
+   *
+   * ⚠️ 边界（说清楚，免得被当成万能药）：它是**进程内**的。桌面宿主与 `dsh web`
+   * 是两个进程，各有一份；**跨进程**的重复不在这一层 —— T-67 的现场观测结论是
+   * 「同一条信被两个 host 进程各响一次」，那一层要的是跨进程互斥，不是这个环。
+   */
+  announced: Set<string>
+  /** T-67：本进程**实际触发过**的唤醒来源（运行时观测，区别于接线计划）。 */
+  wakeSources: Set<WakeSource>
+  /** T-67：这份接线计划允许的来源；缺省（undefined）表示不做运行时校验。 */
+  allowedWakeSources?: readonly WakeSource[]
+  /** T-67：运行时实际违反「只有一个唤醒来源」时的原文（诊断 / 测试用）。 */
+  wakeViolation?: string
 }
 
-export function createWatchRuntime(): WatchRuntime {
-  return { agentBudgets: new Map(), inboxBudgets: new Map(), batches: new Map() }
+/** T-67：去重环的容量（与账本 `SEEN_RING_CAP` 同量级，超出按插入序淘汰最老的）。 */
+export const ANNOUNCED_RING_CAP = 500
+
+export function createWatchRuntime(options: { allowedWakeSources?: readonly WakeSource[] } = {}): WatchRuntime {
+  return {
+    agentBudgets: new Map(),
+    inboxBudgets: new Map(),
+    batches: new Map(),
+    announced: new Set(),
+    wakeSources: new Set(),
+    ...(options.allowedWakeSources ? { allowedWakeSources: options.allowedWakeSources } : {}),
+  }
+}
+
+/** 记一笔"这封信在本会话里叫过了"。环满就按插入序淘汰最老的。 */
+function noteAnnounced(rt: WatchRuntime, messageId: string): void {
+  rt.announced.add(messageId)
+  while (rt.announced.size > ANNOUNCED_RING_CAP) {
+    const oldest = rt.announced.values().next().value
+    if (oldest === undefined) break
+    rt.announced.delete(oldest)
+  }
+}
+
+/**
+ * T-67 的**唤醒出口观测行**（结构化、一行一封、可 grep）。
+ *
+ * 卡面要求的五件事逐项对应：
+ *   · 唤醒来源  → `source`（`ledger-consumer` / `in-process-watcher` / `self-daemon`）
+ *                 + `origin`（同一来源内部的来路：`ledger` / `unread-top-up` / `inbox-page`）
+ *   · message_id → `message_id`
+ *   · address    → `address`
+ *   · 已通知过   → `announced=yes|no`（本进程的去重环里有没有它）
+ *   · 时间戳     → `at`（ISO8601）
+ * 另外补两个**归因必需**的字段：
+ *   · `pid` —— 现场那条 2:1 的关键：同一条信被**两个 host 进程**各响一次，只报
+ *     `source` 是看不出来的（两个进程报的是同一个 source、同一个 message_id）；
+ *   · `session` —— 醒的是哪个会话（同一个 workspace 可以有两个活会话）。
+ */
+export function wakeLine(entry: {
+  source: WakeSource
+  origin: string
+  address: string
+  messageId: string
+  /** 本进程的去重环里有没有它（卡面的「已通知过=是/否」）。 */
+  announced: boolean
+  agent: string
+  decision: 'wake' | 'inject' | 'skip'
+  at: number
+}): string {
+  return 'msg9 wake:'
+    + ` source=${entry.source}`
+    + ` origin=${entry.origin}`
+    + ` message_id=${entry.messageId}`
+    + ` address=${entry.address}`
+    + ` announced=${entry.announced ? 'yes' : 'no'}`
+    + ` pid=${process.pid}`
+    + ` session=${entry.agent}`
+    + ` decision=${entry.decision}`
+    + ` at=${new Date(entry.at).toISOString()}`
+}
+
+/**
+ * T-67：记下"这次是谁响的"，并按计划校验。
+ *
+ * 生产里**只记日志、绝不抛**：投递本身是好事，为了"来源不合法"把信扔掉或把循环
+ * 炸掉（unhandledRejection 会带走宿主）都是更坏的失败。判据仍然只有一条
+ * （`assertObservedWakeSources`），这里只是把它的抛错包成一行响亮的日志。
+ */
+function noteWakeSource(rt: WatchRuntime, source: WakeSource, log: (message: string) => void): void {
+  rt.wakeSources.add(source)
+  if (!rt.allowedWakeSources) return
+  try {
+    assertObservedWakeSources(rt.wakeSources, rt.allowedWakeSources)
+  } catch (error) {
+    rt.wakeViolation = (error as Error).message
+    log(`msg9 wake: VIOLATION ${rt.wakeViolation}`)
+  }
 }
 
 /** Drop messages the watcher already reported (bootstrap baseline filter). */
@@ -379,8 +473,8 @@ async function enqueueDelivery(deps: WatchDeps, rt: WatchRuntime, key: string, i
   const windowMs = deps.batchWindowMs ?? 12_000
   if (windowMs <= 0) {
     // deliverBatch 现在会回一个「活会话收下了吗」的布尔（账本路径要拿它决定
-    // 是否推进游标）；这里仍然只关心投递本身。
-    await deliverBatch(deps, rt, key, inbox, messages)
+    // 是否推进游标）；这里仍然只关心投递本身。T-67：出处 = 进程内 watcher。
+    await deliverBatch(deps, rt, key, inbox, messages, { source: 'in-process-watcher' })
     return
   }
   const batch = rt.batches.get(key) ?? { messages: new Map<string, InboxMessage>() }
@@ -401,7 +495,8 @@ export async function flushBatch(deps: WatchDeps, rt: WatchRuntime, key: string,
     const bt = Date.parse(b.created_at ?? '') || 0
     return at - bt
   })
-  await deliverBatch(deps, rt, key, inbox, messages)
+  // T-67：出处 = 进程内 watcher（合批只改时机，不改唤醒来源）。
+  await deliverBatch(deps, rt, key, inbox, messages, { source: 'in-process-watcher' })
 }
 
 /**
@@ -459,6 +554,18 @@ async function findWakeTarget(
 }
 
 /**
+ * T-67：一次投递的**出处**（只用于观测与去重，不改变任何投递语义）。
+ */
+export interface WakeDeliveryOptions {
+  /** 跳过 `folder=unprocessed` 复核（账本路径已经用同一页做过权威对账）。 */
+  reconcile?: boolean
+  /** 这一批的**唤醒来源**（与接线计划里的同一个枚举）。缺省按进程内 watcher 记。 */
+  source?: WakeSource
+  /** 逐封的**来路**（`ledger` / `unread-top-up` / `inbox-page`）——只写进观测行。 */
+  originOf?(message: InboxMessage): string
+}
+
+/**
  * The last mile: reconcile, resolve the session, spend the budgets, deliver.
  *
  * Returns whether a live session ACCEPTED the batch — the ledger ingest needs
@@ -475,6 +582,9 @@ async function findWakeTarget(
  * 会话建立后由 `msg9_inbox` / 下一批兜底）⇒ 对账结论**没有任何用处**，那次 API
  * 不该花。对账本身一个字没动：它仍然决定哪些信可以唤醒（v1.20 的幂等语义），
  * 只是不再为"注定不投递的一批"付费。
+ *
+ * T-67：**所有唤醒路径的唯一出口**，所以"同一封信只准醒一次"也在这里落地
+ * （`rt.announced` 去重环 + 一行观测日志）。
  */
 export async function deliverBatch(
   deps: WatchDeps,
@@ -482,8 +592,10 @@ export async function deliverBatch(
   key: string,
   inbox: LiveInbox,
   messages: InboxMessage[],
-  options: { reconcile?: boolean } = {},
+  options: WakeDeliveryOptions = {},
 ): Promise<boolean> {
+  const source: WakeSource = options.source ?? 'in-process-watcher'
+  const originOf = options.originOf ?? (() => 'inbox-page')
   // Sticky target: notices keep going to the session they went to last time
   // while it stays alive, instead of drifting to whatever session is newest.
   // 先做这一步（纯本地查）再看要不要付对账 —— 没有活会话时那一次调用不该花。
@@ -493,11 +605,28 @@ export async function deliverBatch(
   const actionable = options.reconcile === false ? messages : await onlyUnprocessed(deps, inbox, messages)
   if (actionable.length === 0) return false
 
-  // 真的要投了才把粘性目标落下（与改前同一时机：对账没过就不记）。
-  if (!target.sticky) await deps.setWatchState(key, { last_wake_agent_id: target.agent.id })
   const agent = target.agent
+  // T-67：**唤醒前查一次**。去重键是 message_id，环由所有路径共享，所以"账本消费者
+  // 响一次 + 兜底路径再响一次"这种形态在这一行就被拦下（不管是谁先谁后）。
+  const repeat = actionable.filter((message) => rt.announced.has(message.message_id))
+  const fresh = actionable.filter((message) => !rt.announced.has(message.message_id))
+  for (const message of repeat) {
+    deps.log(wakeLine({
+      source, origin: originOf(message), address: inbox.address, messageId: message.message_id,
+      announced: true, agent: agent.id, decision: 'skip', at: deps.now(),
+    }))
+  }
+  if (fresh.length === 0) {
+    // 这一批**一封都不该再叫**（全都唤醒过本会话）。返回 true，而不是 false：
+    // 有活会话确实收下了，"没有新东西要说"也是一种收下。返回 false 会让账本路径
+    // 永不 commit ⇒ 下一轮把同一批再读一遍 ⇒ 空转到天荒地老。
+    return true
+  }
 
-  const { text, summary } = renderMailNotice(inbox.address, actionable)
+  // 真的要投了才把粘性目标落下（与改前同一时机：对账没过就不记）。
+  if (!target.sticky) await deps.setWatchState(key, { last_wake_agent_id: agent.id })
+
+  const { text, summary } = renderMailNotice(inbox.address, fresh)
   const message = pluginNotice(deps.uuid(), text, summary)
   const agentBudget = rt.agentBudgets.get(agent.id) ?? new WakeBudget()
   rt.agentBudgets.set(agent.id, agentBudget)
@@ -506,12 +635,24 @@ export async function deliverBatch(
   // Wake only when BOTH budgets allow: one busy session cannot be pinned, and
   // N sessions of one workspace cannot multiply the allowance.
   const decision = agentBudget.decide(deps.now()) === 'wake' && inboxBudget.decide(deps.now()) === 'wake' ? 'wake' : 'inject'
+  // 先记去重环再投递：投递是同步的，但"记"必须发生在**任何**后续观察之前，
+  // 否则同一次事件里第二次进来还会看到"没叫过"。
+  for (const mail of fresh) noteAnnounced(rt, mail.message_id)
+  noteWakeSource(rt, source, deps.log)
   if (decision === 'wake') {
     agent.followup(message)
-    deps.log(`watch: woke ${agent.id} with ${actionable.length} new mail(s) for ${inbox.address}`)
+    deps.log(`watch: woke ${agent.id} with ${fresh.length} new mail(s) for ${inbox.address}`)
   } else {
     agent.inject(message)
-    deps.log(`watch: wake budget spent for ${agent.id}/${inbox.address}; injected ${actionable.length} mail(s) as context`)
+    deps.log(`watch: wake budget spent for ${agent.id}/${inbox.address}; injected ${fresh.length} mail(s) as context`)
+  }
+  // T-67 观测行：一封一行 —— "到底是谁响了第二次"必须能只靠日志回答，
+  // 而不是靠推断（这是这张卡的起因）。
+  for (const mail of fresh) {
+    deps.log(wakeLine({
+      source, origin: originOf(mail), address: inbox.address, messageId: mail.message_id,
+      announced: false, agent: agent.id, decision, at: deps.now(),
+    }))
   }
   return true
 }
@@ -677,7 +818,15 @@ export function createLedgerIngest(
         return
       }
       // reconcile:false —— 这一批就来自 folder=unprocessed 那一页（权威对账已完成）。
-      const delivered = await deliverBatch(deps, rt, key, inbox, plan.deliver, { reconcile: false })
+      // T-67：出处逐封标清 —— `ledger`（账本里有这一行）还是 `unread-top-up`
+      // （账本没跟上、由 unread 补齐捞回来的）。两者**同属** `ledger-consumer`
+      // 这一次消费轮，不是两条唤醒路径（`planLedgerBatch` 已按 message_id 合并去重）。
+      const toppedUp = new Set(plan.topped_up)
+      const delivered = await deliverBatch(deps, rt, key, inbox, plan.deliver, {
+        reconcile: false,
+        source: 'ledger-consumer',
+        originOf: (message) => (toppedUp.has(message.message_id) ? 'unread-top-up' : 'ledger'),
+      })
       if (!delivered) {
         // 没有活会话：**不 commit** ⇒ 下一轮重投（与自研 daemon 的 409 ⇒ pending 同义）。
         log(`msg9 ledger: no live session for ${inbox.address}; ${plan.deliver.length} mail(s) wait for the next tick`)
@@ -759,30 +908,58 @@ export async function deliverDaemonBatch(
   key: string,
   inbox: LiveInbox,
   body: DaemonDelivery,
+  /** T-67：可选 ——给了就参与「同一封信只准醒一次」的去重与观测。 */
+  rt?: WatchRuntime,
 ): Promise<boolean> {
-  const messages = body.messages.filter((message) => message && typeof message.message_id === 'string')
-  if (messages.length === 0) return true
+  const all = body.messages.filter((message) => message && typeof message.message_id === 'string')
+  if (all.length === 0) return true
 
   // Sticky target, same rule (and the same helper) as deliverBatch: notices keep
   // going to the session they went to last time while it stays alive. 这条路径
   // 没有"投递前的对账"那一步 ⇒ 拿到目标就把粘性记下来（与改前一致）。
   const target = await findWakeTarget(deps, key, inbox)
   if (!target) return false
+
+  const address = body.inbox || inbox.address
+  // T-67：与 deliverBatch 同一条去重环（"跨路径共享"就是靠共用 `rt` 实现的）。
+  const duplicate = rt ? all.filter((message) => rt.announced.has(message.message_id)) : []
+  const messages = rt ? all.filter((message) => !rt.announced.has(message.message_id)) : all
+  for (const mail of duplicate) {
+    deps.log(wakeLine({
+      source: 'self-daemon', origin: 'daemon', address, messageId: mail.message_id,
+      announced: true, agent: target.agent.id, decision: 'skip', at: Date.now(),
+    }))
+  }
+  if (messages.length === 0) {
+    // 整批都唤醒过本会话：有活会话收下了（返回 true，daemon 不会重投）。
+    return true
+  }
+
   if (!target.sticky) await deps.setWatchState(key, { last_wake_agent_id: target.agent.id })
   const agent = target.agent
 
-  const address = body.inbox || inbox.address
   const rendered = renderMailNotice(address, messages)
   const text = body.downgraded
     ? `${rendered.text}\n（本批为降级投递：唤醒预算已用尽，仅注入上下文，不会主动唤醒会话。 / downgraded delivery: the wake budget was spent, so this batch is context-only.）`
     : rendered.text
   const message = pluginNotice(deps.uuid(), text, rendered.summary)
+  if (rt) {
+    for (const mail of messages) noteAnnounced(rt, mail.message_id)
+    noteWakeSource(rt, 'self-daemon', deps.log)
+  }
+  const decision = body.mode === 'followup' ? 'wake' : 'inject'
   if (body.mode === 'followup') {
     agent.followup(message)
     deps.log(`watch: daemon delivered ${messages.length} mail(s) for ${address} to ${agent.id} (followup)`)
   } else {
     agent.inject(message)
     deps.log(`watch: daemon delivered ${messages.length} mail(s) for ${address} to ${agent.id} (inject${body.downgraded ? ', downgraded' : ''})`)
+  }
+  for (const mail of messages) {
+    deps.log(wakeLine({
+      source: 'self-daemon', origin: 'daemon', address, messageId: mail.message_id,
+      announced: false, agent: agent.id, decision, at: Date.now(),
+    }))
   }
   return true
 }

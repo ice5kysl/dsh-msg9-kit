@@ -146,11 +146,70 @@ export function resolveWakeSources(plan: IngestPlan, daemonConnected: boolean): 
 }
 
 /**
+ * 一份计划**可能**用到的全部来源（把所有运行状态都展开）。
+ *
+ * `resolveWakeSources` 回答的是"此刻是谁"，这里回答的是"这份计划允许谁"——
+ * 两者的差额就是**计划没料到的那条唤醒路径**（T-67 要抓的东西）。
+ *
+ * 实测取值：`ledger` ⇒ `['ledger-consumer']`（一个都没有）；
+ * `self` ⇒ `['self-daemon', 'in-process-watcher']`（互斥的两条，掉线时交接）。
+ */
+export function plannedWakeSources(plan: IngestPlan): WakeSource[] {
+  const out = new Set<WakeSource>()
+  for (const daemonConnected of [true, false]) {
+    for (const source of resolveWakeSources(plan, daemonConnected)) out.add(source)
+  }
+  return [...out]
+}
+
+/**
+ * T-67：把「只有一个唤醒来源」从**接线计划**收紧到**运行时实际触发过**的来源。
+ *
+ * 为什么需要（这是 T-67 的现场教训）：`assertSingleWakeSource` 只校验
+ * `resolveWakeSources(plan, …)` —— 也就是"我们**打算**让谁响" ✓。它从来没校验过
+ * "**实际上**是谁响的" ✗：`deliverBatch` 被几条路径共用，任何一条被多接一次、
+ * 或在计划之外被调用一次，计划那边**一个字都不会变**，守卫照样通过。
+ *
+ * 两条判据，都是"绝不该发生"：
+ *   ① 响过的来源**超出了这份计划允许的集合** —— 例如 `ingest=ledger` 下账本消费者
+ *      之外还有谁醒了（卡面要的那条："账本消费者活着时不得再走补齐唤醒"）；
+ *   ② 响过的来源**不止一个** —— 同一个进程里两条唤醒路径同时在响。
+ *
+ * ⚠️ 本函数**只做判断**（抛错）。在后台循环里抛错会变成 unhandledRejection 并可能
+ * 带走宿主进程，所以生产接线把它的判据包在 try 里**响亮地记日志**
+ * （见 `watch.ts` 的 `noteWakeSource`），测试里则直接断言它抛。
+ */
+export function assertObservedWakeSources(observed: Iterable<WakeSource>, allowed: readonly WakeSource[]): void {
+  const fired = [...new Set(observed)]
+  if (fired.length === 0) return
+  const outside = fired.filter((source) => !allowed.includes(source))
+  if (outside.length > 0) {
+    throw new Error(
+      `msg9 ingest: wake source ${outside.join(', ')} actually FIRED but the plan allows only ` +
+        `${allowed.join(', ') || 'none'} — a wake path is firing that the wiring did not plan for`,
+    )
+  }
+  if (fired.length > 1) {
+    throw new Error(
+      `msg9 ingest: ${fired.length} wake sources actually FIRED (${fired.join(', ')}) — ` +
+        'exactly ONE may ever fire in a process',
+    )
+  }
+}
+
+/**
  * 「唤醒来源恰好一个」这个不变量的**守卫**（可判据，不只是注释）。
  *
  * 唯一的例外是 watcher 被整体关掉（`MSG9_WATCH=0`）：那时候零个来源是刻意的。
+ *
+ * T-67 起额外接受 `observed`：把**运行时实际触发过**的来源一起校验，
+ * 于是"计划对、实际错"这种形态再也躲不过这道门。
  */
-export function assertSingleWakeSource(plan: IngestPlan, daemonConnected: boolean, options: { watchDisabled?: boolean } = {}): WakeSource {
+export function assertSingleWakeSource(
+  plan: IngestPlan,
+  daemonConnected: boolean,
+  options: { watchDisabled?: boolean; observed?: Iterable<WakeSource> } = {},
+): WakeSource {
   const sources = resolveWakeSources(plan, daemonConnected)
   if (options.watchDisabled && sources.length === 0) return 'ledger-consumer'
   if (sources.length !== 1) {
@@ -158,6 +217,7 @@ export function assertSingleWakeSource(plan: IngestPlan, daemonConnected: boolea
       `msg9 ingest: expected exactly ONE wake source, got ${sources.length} (${sources.join(', ') || 'none'}) — mode=${plan.mode}`,
     )
   }
+  if (options.observed) assertObservedWakeSources(options.observed, plannedWakeSources(plan))
   return sources[0]!
 }
 

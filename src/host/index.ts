@@ -31,8 +31,10 @@ import { loadState, setWatchState, getNotifyPaused, type LiveInbox } from './sto
 import {
   INGEST_ENV,
   assertSingleWakeSource,
+  assertObservedWakeSources,
   assessDaemonCoverage,
   planIngest,
+  plannedWakeSources,
   platformDaemonHealth,
   readDaemonLocks,
   readDaemonPidState,
@@ -98,8 +100,8 @@ export {
 } from './credentials.ts'
 export { harnessAgentName, HARNESS_AGENT_NAMES, listWorkspaces, matchWorkspaceByPath, resolveWorkspace, setWorkspaceRegistry } from './workspace.ts'
 export { loadState, stateFilePath, upsertWorkspaceInbox, withStateLock } from './store.ts'
-export { WakeBudget, createLedgerIngest, createNonReentrant, createWatchRuntime, deliverBatch, deliverDaemonBatch, flushBatch, pluginNotice, pollOnce, renderMailNotice, startLedgerIngestLoop, streamInboxLoop, unseenMessages, StreamUnsupportedError } from './watch.ts'
-export type { LedgerIngest, LedgerIngestLoop, LedgerIngestOptions } from './watch.ts'
+export { ANNOUNCED_RING_CAP, WakeBudget, createLedgerIngest, createNonReentrant, createWatchRuntime, deliverBatch, deliverDaemonBatch, flushBatch, pluginNotice, pollOnce, renderMailNotice, startLedgerIngestLoop, streamInboxLoop, unseenMessages, wakeLine, StreamUnsupportedError } from './watch.ts'
+export type { LedgerIngest, LedgerIngestLoop, LedgerIngestOptions, WakeDeliveryOptions } from './watch.ts'
 // T-13 阶段三：共存交接的判据层（默认 self 的 ingest 开关、--scope 的**选择器**
 // 语义、死 pid 自愈、daemon 覆盖判定、账本分支的投递计划）。
 export {
@@ -109,6 +111,7 @@ export {
   SCOPE_CONTRACT,
   addressTenant,
   assertSingleWakeSource,
+  assertObservedWakeSources,
   assessDaemonCoverage,
   daemonHealthFromStatus,
   daemonScopeCovers,
@@ -117,6 +120,7 @@ export {
   parseScopeFlag,
   planIngest,
   planLedgerBatch,
+  plannedWakeSources,
   platformDaemonHealth,
   readDaemonLocks,
   readDaemonPidState,
@@ -502,7 +506,9 @@ function startWatcher(
   daemonUnread: { read?: () => Promise<Record<string, { unread?: number; total?: number; at?: number }>> },
   plan: IngestPlan,
 ): void {
-  const rt = createWatchRuntime()
+  // T-67：运行时也盯"实际是谁响的"。计划允许的来源从这里进 runtime，每一次真正
+  // 触发唤醒都要过 `assertObservedWakeSources` 的判据（不合法只响亮记日志，不杀循环）。
+  const rt = createWatchRuntime({ allowedWakeSources: plannedWakeSources(plan) })
 
   const deps: WatchDeps = {
     // state.json 只存热状态：watcher 的 loadState 经 resolveCredentials 回填
@@ -577,7 +583,7 @@ function startWatcher(
       setWatchState,
       uuid: () => randomUUID(),
       log,
-    }, key, inbox, body)
+    }, key, inbox, body, rt)
     if (!delivered) {
       throw new BridgeError(409, 'no-live-session', `no live session for ${body.project_key}; the daemon will retry`)
     }

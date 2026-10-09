@@ -11,8 +11,13 @@ import assert from 'node:assert/strict'
 import {
   StreamUnsupportedError,
   WakeBudget,
+  assertObservedWakeSources,
+  assertSingleWakeSource,
   createWatchRuntime,
+  deliverBatch,
   flushBatch,
+  planIngest,
+  plannedWakeSources,
   pluginNotice,
   pollOnce,
   renderMailNotice,
@@ -493,6 +498,176 @@ await check('renderMailNotice and helpers', () => {
   assert.equal(budget.decide(100), 'wake')
   assert.equal(budget.decide(200), 'inject')
   assert.equal(budget.decide(1101), 'wake', 'oldest wake slides out of the window')
+})
+
+// ---------------------------------------------------------------------- T-67
+// 同一条信被唤醒两次（重复门铃）。
+//
+// 现场归因（2026-10-10，真实数据）：
+//   · 账本 679 条事件 / 679 个不同 message_id，跨账本重复 0 ⇒ 平台没重投 ✓
+//   · 卡面假设的「账本消费者 + 独立兜底路径各响一次」**在代码里不存在**：
+//     unread 补齐就发生在同一轮 `pollOnce` 里，`planLedgerBatch` 按 message_id
+//     合并去重（见 tests/ledger.test.mjs），所以它是**同一个** `deliverBatch` 调用；
+//   · 真正响两次的是**两个 host 进程**（桌面宿主 + `dsh web`）：同一个
+//     `state.json`、同一个 `spool/<address>.dsh-msg9-kit.cursor`，各自一轮消费，
+//     各自唤醒**自己进程里的活会话**（lsof 实证：两个进程各持一个本 workspace 的
+//     session.lock）。这条 2:1 的比值在 `ingest=ledger` 之前（self 模式）就已存在。
+//
+// 所以这一组断言分两层：
+//   A. **本进程内**「同一 message_id 只准醒一次」——本次实现落的闸门；
+//   B. 跨进程那一层**不是**这个去重环能覆盖的，用一条显式的"已知边界"断言记下来，
+//      免得有人以为 A 已经把现场那条 2:1 修掉了。
+
+await check('T-67 观测：唤醒出口一行一封，字段足够只靠日志回答"是谁响的"', async () => {
+  const state = { workspaces: { 'ws-a': { ...INBOX, watch_cursor: 'W1' } } }
+  const logs = []
+  const { deps } = makeDeps({ state, pages: [] })
+  deps.log = (message) => logs.push(message)
+  const message = mail('m-obs')
+  deps.listInbox = async (_url, _key, query = {}) => (query.folder === 'unprocessed' ? { messages: [message] } : { messages: [] })
+
+  await deliverBatch(deps, createWatchRuntime(), 'ws-a', state.workspaces['ws-a'], [message], {
+    source: 'ledger-consumer',
+    originOf: () => 'ledger',
+  })
+
+  const line = logs.find((entry) => entry.startsWith('msg9 wake:'))
+  assert.ok(line, `唤醒出口必须打观测行；实际日志：${JSON.stringify(logs)}`)
+  for (const field of [
+    'source=ledger-consumer',
+    'origin=ledger',
+    'message_id=m-obs',
+    `address=${INBOX.address}`,
+    'announced=no',
+    `pid=${process.pid}`,
+    'session=sess-1',
+    'decision=wake',
+  ]) {
+    assert.ok(line.includes(field), `观测行缺少 ${field}：${line}`)
+  }
+  assert.match(line, /at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/, '时间戳必须是 ISO8601')
+})
+
+await check('T-67 去重：同一 message_id 经两条唤醒路径 ⇒ 只唤醒一次（跨路径共享同一个环）', async () => {
+  const state = { workspaces: { 'ws-a': { ...INBOX, watch_cursor: 'W1' } } }
+  const logs = []
+  const { deps, delivered } = makeDeps({ state, pages: [] })
+  deps.log = (message) => logs.push(message)
+  const message = mail('m-dup')
+  deps.listInbox = async (_url, _key, query = {}) => (query.folder === 'unprocessed' ? { messages: [message] } : { messages: [] })
+
+  const rt = createWatchRuntime()
+  const inbox = state.workspaces['ws-a']
+  // 路径①：账本消费者（ledger 分支的出口）
+  const first = await deliverBatch(deps, rt, 'ws-a', inbox, [message], {
+    source: 'ledger-consumer',
+    originOf: () => 'ledger',
+  })
+  // 路径②：进程内 watcher（self 分支 / 兜底那一类）——**同一封信**
+  const second = await deliverBatch(deps, rt, 'ws-a', inbox, [message], {
+    source: 'in-process-watcher',
+    originOf: () => 'inbox-page',
+  })
+
+  assert.equal(first, true, '第一次有活会话收下')
+  assert.equal(delivered.followup.length + delivered.inject.length, 1, '同一 message_id 只准唤醒一次')
+  assert.equal(delivered.followup.length, 1)
+  // 第二次必须是「被拦下」，而且要留痕 —— 不许静默
+  assert.equal(second, true, '第二次也要返回 true：有活会话收下了，账本游标必须能前进（false 会永远重投同一批）')
+  const skipped = logs.filter((entry) => entry.startsWith('msg9 wake:') && entry.includes('announced=yes'))
+  assert.equal(skipped.length, 1, `第二次要被观测到；实际：${JSON.stringify(logs.filter((l) => l.startsWith('msg9 wake:')))}`)
+  assert.match(skipped[0], /decision=skip/)
+  assert.match(skipped[0], /source=in-process-watcher/)
+  assert.match(skipped[0], /message_id=m-dup/)
+})
+
+await check('T-67 去重不吞信：没有活会话（返回 false）的一轮绝不进环', async () => {
+  const state = { workspaces: { 'ws-a': { ...INBOX, watch_cursor: 'W1' } } }
+  const message = mail('m-nowake')
+  const { deps, delivered } = makeDeps({ state, pages: [], agent: null })
+  deps.listInbox = async (_url, _key, query = {}) => (query.folder === 'unprocessed' ? { messages: [message] } : { messages: [] })
+  const rt = createWatchRuntime()
+
+  const missed = await deliverBatch(deps, rt, 'ws-a', state.workspaces['ws-a'], [message], { source: 'ledger-consumer' })
+  assert.equal(missed, false, '没有活会话 ⇒ 不投递')
+  assert.equal(rt.announced.has('m-nowake'), false, '没投出去的信绝不能进去重环（否则会被永久静默吞掉）')
+
+  // 会话来了：同一封信必须仍然叫得醒（这就是"没有活会话 ⇒ 不 commit ⇒ 下轮重投"）
+  deps.resolveAgent = () => ({ id: 'sess-late', followup: (m) => delivered.followup.push(m), inject: (m) => delivered.inject.push(m) })
+  const later = await deliverBatch(deps, rt, 'ws-a', state.workspaces['ws-a'], [message], { source: 'ledger-consumer' })
+  assert.equal(later, true)
+  assert.equal(delivered.followup.length, 1, '重投的那一封必须真的醒一次')
+})
+
+await check('T-67 判据：assertObservedWakeSources / assertSingleWakeSource 现在也校验运行时来源', () => {
+  const ledger = planIngest('ledger')
+  assert.deepEqual(plannedWakeSources(ledger), ['ledger-consumer'], 'ledger 计划只允许账本消费者')
+  assert.doesNotThrow(() => assertObservedWakeSources(['ledger-consumer'], plannedWakeSources(ledger)))
+  assert.throws(
+    () => assertObservedWakeSources(['ledger-consumer', 'in-process-watcher'], plannedWakeSources(ledger)),
+    /actually FIRED/,
+    '账本模式下别的来源也响了 ⇒ 必须抓出来',
+  )
+  assert.throws(
+    () => assertObservedWakeSources(['in-process-watcher'], plannedWakeSources(ledger)),
+    /actually FIRED/,
+  )
+  // 计划守卫吃进运行时观测：计划对、实际错 ⇒ 也要抛
+  assert.equal(assertSingleWakeSource(ledger, false, { observed: ['ledger-consumer'] }), 'ledger-consumer')
+  assert.throws(
+    () => assertSingleWakeSource(ledger, false, { observed: ['ledger-consumer', 'self-daemon'] }),
+    /actually FIRED/,
+  )
+
+  const self = planIngest('self')
+  assert.deepEqual(plannedWakeSources(self).sort(), ['in-process-watcher', 'self-daemon'], 'self 计划允许的是一对互斥来源')
+  assert.doesNotThrow(() => assertObservedWakeSources(['in-process-watcher'], plannedWakeSources(self)))
+})
+
+await check('T-67 判据接线：运行时真的响了两条来源 ⇒ 响亮记违反，但不杀循环', async () => {
+  const state = { workspaces: { 'ws-a': { ...INBOX, watch_cursor: 'W1' } } }
+  const logs = []
+  const { deps, delivered } = makeDeps({ state, pages: [] })
+  deps.log = (message) => logs.push(message)
+  const first = mail('m-v1')
+  const second = mail('m-v2')
+  deps.listInbox = async (_url, _key, query = {}) => (
+    query.folder === 'unprocessed' ? { messages: [first, second] } : { messages: [] }
+  )
+  // 计划说只允许账本消费者（ledger 模式）
+  const rt = createWatchRuntime({ allowedWakeSources: plannedWakeSources(planIngest('ledger')) })
+
+  await deliverBatch(deps, rt, 'ws-a', state.workspaces['ws-a'], [first], { source: 'ledger-consumer' })
+  assert.equal(rt.wakeViolation, undefined, '第一条合法来源不该触发违反')
+  // 另一条来源也响了 —— 这正是 T-67 要抓的形态
+  await deliverBatch(deps, rt, 'ws-a', state.workspaces['ws-a'], [second], { source: 'in-process-watcher' })
+
+  assert.ok(rt.wakeViolation, '运行时违反必须被记录')
+  assert.match(rt.wakeViolation, /actually FIRED/)
+  assert.ok(logs.some((entry) => entry.startsWith('msg9 wake: VIOLATION')), '违反必须响亮地进日志')
+  assert.equal(delivered.followup.length, 2, '记违反不等于把信扔掉 —— 投递照旧')
+})
+
+await check('T-67 已知边界：两个 runtime（＝两个 host 进程）各自去重 ⇒ 同一封信仍各响一次', async () => {
+  // 现场那条 2:1 的机制：桌面宿主与 `dsh web` 是两个进程、同一个 state.json、
+  // 同一个 `spool/<address>.dsh-msg9-kit.cursor`，各跑一轮消费、各唤醒自己进程里
+  // 的活会话。进程内去重环不跨进程 ⇒ 这一条**预期仍然重复**。
+  //
+  // ⚠️ 这张断言是**已知边界**的记录，不是"正确行为"：它红了，说明有人把跨进程
+  // 互斥补上了（那是好事）—— 请同时更新 T-67 的卡与这条断言，别直接删掉了事。
+  const sharedState = { workspaces: { 'ws-a': { ...INBOX, watch_cursor: 'W1' } } }
+  const message = mail('m-cross')
+  const runtimes = [createWatchRuntime(), createWatchRuntime()]
+  const delivered = []
+
+  for (const rt of runtimes) {
+    const { deps, delivered: sink } = makeDeps({ state: sharedState, pages: [] })
+    deps.listInbox = async (_url, _key, query = {}) => (query.folder === 'unprocessed' ? { messages: [message] } : { messages: [] })
+    await deliverBatch(deps, rt, 'ws-a', sharedState.workspaces['ws-a'], [message], { source: 'ledger-consumer' })
+    delivered.push(sink.followup.length + sink.inject.length)
+  }
+
+  assert.deepEqual(delivered, [1, 1], '两个进程各响一次 —— 这就是现场看到的重复门铃')
 })
 
 console.log(failed > 0 ? `\n${failed} check(s) failed` : '\nall checks passed')
