@@ -16,7 +16,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { appendFile, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -66,6 +66,14 @@ const {
   ledgerPath,
   readConsumerCursor,
   writeConsumerCursor,
+  // T-73 的开关与跨进程互斥
+  CONSUMER_LOCK_STALE_MS,
+  SINGLE_HOST_CONSUMER_ENV,
+  acquireConsumerLease,
+  isStaleConsumerLock,
+  readConsumerShape,
+  resetConsumerPresenceThrottle,
+  resolveSingleHostConsumer,
   // 自研 daemon 的持久化（造死 pid 夹具用）
   createDaemonClient,
   daemonHome,
@@ -787,6 +795,195 @@ await check('⑦b T-46②：assessDaemonCoverage 把"连接轴 + 凭据轴"接�
   assert.deepEqual(legacy.warnings, [])
   assert.equal(legacy.verdicts[0].wake_source, 'ledger')
   assert.equal(legacy.verdicts[0].credential, 'unknown')
+})
+
+// ============================================ ⑧ T-73：多宿主消费同一信箱（开关）
+
+await check('⑧ T-73 开关解析：默认关（重复但不漏）、配置 > 环境、写错回落关', async () => {
+  assert.equal(SINGLE_HOST_CONSUMER_ENV, 'MSG9_SINGLE_HOST_CONSUMER')
+  const off = resolveSingleHostConsumer()
+  assert.equal(off.enabled, false, '默认必须是关 —— 互斥会把可见的重复换成不可见的漏叫')
+  assert.equal(off.source, 'default')
+  assert.equal(resolveSingleHostConsumer({ env: '1' }).enabled, true)
+  assert.equal(resolveSingleHostConsumer({ env: 'true' }).enabled, true)
+  assert.equal(resolveSingleHostConsumer({ env: '0' }).enabled, false)
+  assert.equal(resolveSingleHostConsumer({ config: true, env: '0' }).enabled, true, '配置优先于环境变量')
+  assert.equal(resolveSingleHostConsumer({ config: false, env: '1' }).enabled, false, '配置里的 false 也要生效（不是"没给值"）')
+  const bad = resolveSingleHostConsumer({ env: 'yes-please' })
+  assert.equal(bad.enabled, false, '值不认识 ⇒ 回落默认（关）')
+  assert.ok(bad.warning?.includes('unrecognised'), '值写错必须大声记一笔')
+  assert.equal(bad.invalid, 'yes-please', '原样留证')
+})
+
+await check('⑧ T-73 默认（开关关）：两个宿主各拿租约、各投递 —— 与改前逐字一致', async () => {
+  const dir = await tempSpool()
+  const registry = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-t73-reg-'))
+  resetConsumerPresenceThrottle()
+  const leaseA = await acquireConsumerLease({
+    address: ADDRESS, consumer: CONSUMER, cursor: join(dir, 'c.cursor'), instance: 'host-a',
+    singleHostConsumer: false, dir: registry,
+  })
+  const leaseB = await acquireConsumerLease({
+    address: ADDRESS, consumer: CONSUMER, cursor: join(dir, 'c.cursor'), instance: 'host-b',
+    singleHostConsumer: false, dir: registry,
+  })
+  assert.equal(leaseA.granted, true, '默认：每个宿主都消费自己那一份')
+  assert.equal(leaseB.granted, true)
+  assert.equal(leaseA.route, 'open')
+  assert.equal(leaseB.route, 'open')
+  assert.equal(existsSync(join(registry, `${ADDRESS}.${CONSUMER}.lock`)), false, '默认**不建锁文件**（零副作用）')
+
+  // 但"有几个宿主在消费"必须看得见 —— 这正是 msg9_status 的输入。
+  const shape = await readConsumerShape(join(dir, 'c.cursor'), { dir: registry })
+  assert.deepEqual(shape.holders.map((row) => row.instance).sort(), ['host-a', 'host-b'])
+  assert.equal(shape.waiters.length, 0)
+  assert.ok(shape.holders.every((row) => row.pid === process.pid), '登记里如实记下 pid')
+})
+
+await check('⑧ T-73 开关开：两个宿主只有持锁者消费，另一个拿 skipped-lock-holder 留痕', async () => {
+  const dir = await tempSpool()
+  const registry = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-t73-reg-'))
+  resetConsumerPresenceThrottle()
+  // 账本里先有两行；游标停在 m1 ⇒ 这一轮的新事件就是 m2（不是基线轮）。
+  const file = ledgerPath(ADDRESS, dir)
+  await writeFile(file, `${ledgerLine('m1', '2026-10-07T01:00:00Z')}\n${ledgerLine('m2', '2026-10-07T01:10:00Z')}\n`, 'utf8')
+  await writeConsumerCursor(consumerCursorPath(ADDRESS, CONSUMER, dir), 'm1')
+  const now = Date.parse('2026-10-07T02:00:00Z')
+
+  // 造两个"宿主"（一个账本消费循环 = 生产里的一个宿主）。
+  //
+  // 时序**刻意做成确定的**（不靠 sleep 压噪声）：让 A 先拿到锁并卡在它那一轮 REST 上
+  // （现场那两个进程正是卡在这段窗口里），此时 B 来抢 ⇒ 必然撞上 EEXIST 而成为 waiter。
+  let enterRound
+  const inRound = new Promise((resolve) => { enterRound = resolve })
+  let openGate
+  const gate = new Promise((resolve) => { openGate = resolve })
+  function makeHost(instance, { hold = false } = {}) {
+    const followups = []
+    const logs = []
+    const agent = { id: `sess-${instance}`, followup: (m) => followups.push(m), inject: () => {} }
+    const deps = {
+      loadState: async () => ({ workspaces: {} }),
+      setWatchState: async () => {},
+      listInbox: async () => {
+        if (hold) {
+          enterRound()
+          await gate
+        }
+        return { messages: [mail('m1'), mail('m2', { created_at: '2026-10-07T01:10:00Z' })], unread_count: 1 }
+      },
+      resolveAgent: () => agent,
+      uuid: () => `u-${instance}-${followups.length + 1}`,
+      now: () => now,
+      log: (message) => logs.push(message),
+    }
+    const ingest = createLedgerIngest(deps, createWatchRuntime(), `ws-${instance}`, {
+      address: ADDRESS, api_key: 'k', api_url: 'http://fake', title: 't', path: '/w',
+    }, {
+      consumer: CONSUMER, spoolDir: dir, lagThresholdMs: 0, daemonHealth: async () => 'up',
+      singleHostConsumer: true, consumerDir: registry,
+    })
+    return { ingest, followups, logs, instance }
+  }
+  const hostA = makeHost('host-a', { hold: true })
+  const hostB = makeHost('host-b')
+
+  const aTick = hostA.ingest.tick()
+  await inRound // A 已经**持有锁**并进入它那一轮的 REST 窗口
+  await hostB.ingest.tick() // B 此刻来抢 —— 现场那两个进程的形状
+  openGate()
+  await aTick
+
+  const woke = hostA.followups.length + hostB.followups.length
+  assert.equal(woke, 1, `开了互斥就只能有一个宿主投递（实际 ${woke}：A=${hostA.followups.length} B=${hostB.followups.length}）`)
+  assert.equal(hostA.followups.length, 1, '持锁者照常投递（开了互斥不等于不投递）')
+  assert.equal(hostB.followups.length, 0, '没拿到锁的宿主一封都不投')
+  const skipped = hostB.logs.find((line) => line.includes('skipped-lock-holder='))
+  assert.ok(skipped, `没拿到锁的宿主必须留痕：${JSON.stringify(hostB.logs)}`)
+  assert.match(skipped, /^msg9 wake: /, '留痕走的是唤醒观测行')
+  assert.match(skipped, /decision=skipped-lock-holder=\d+/, '要指认持锁者（"为什么这次没叫我"的答案）')
+  assert.match(skipped, /origin=lock-skip/)
+  assert.ok(
+    hostB.logs.some((line) => line.includes('does NOT consume this round')),
+    '还要有一句人话说明本轮不消费',
+  )
+  // 拿不到锁的宿主**不许**推游标：信留给持锁者（这里 A 已经把它推到了 m2）。
+  assert.equal(
+    (await readFile(consumerCursorPath(ADDRESS, CONSUMER, dir), 'utf8')).trim(), 'm2',
+    '只有真正投递的那一轮才配推游标',
+  )
+
+  // 形态：恰好一个 holder、一个 waiter —— msg9_status 要说的就是这一句。
+  const shape = await readConsumerShape(consumerCursorPath(ADDRESS, CONSUMER, dir), { dir: registry })
+  assert.equal(shape.holders.length, 1, `只该有一个 holder：${JSON.stringify(shape.holders)}`)
+  assert.equal(shape.waiters.length, 1, `另一个必须在场并且被记成 waiter：${JSON.stringify(shape.waiters)}`)
+  assert.equal(shape.stale.length, 0)
+  assert.ok(shape.waiters[0].holderPid !== undefined, 'waiter 登记要带持锁者 pid')
+
+  await hostA.ingest.dispose()
+  await hostB.ingest.dispose()
+})
+
+await check('⑧ T-73 死 pid 自愈：持锁者死了 ⇒ 另一个宿主下一轮就能接手', async () => {
+  const dir = await tempSpool()
+  const registry = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-t73-reg-'))
+  const cursor = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  const lockFile = join(registry, `${ADDRESS}.${CONSUMER}.lock`)
+  resetConsumerPresenceThrottle()
+  await mkdir(registry, { recursive: true })
+  // 冒充一个已经死掉的宿主把锁留下（mtime 是**刚刚**，所以只有"死 pid"这条判据能救）。
+  await writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, at: new Date().toISOString() }), 'utf8')
+  assert.equal(isPidAlive(DEAD_PID), false, '夹具前提：这个 pid 确实不在')
+
+  const lease = await acquireConsumerLease({
+    address: ADDRESS, consumer: CONSUMER, cursor, instance: 'host-survivor',
+    singleHostConsumer: true, dir: registry,
+  })
+  assert.equal(lease.granted, true, '持锁者死了 ⇒ 必须能接手（否则信箱永久没人消费）')
+  assert.equal(lease.route, 'locked')
+
+  // 规则二：持锁者活着但心跳过期（卡住）⇒ 也允许拆锁。
+  await lease.release()
+  await writeFile(lockFile, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8')
+  const staleNow = () => Date.now() + CONSUMER_LOCK_STALE_MS + 1_000
+  assert.equal(await isStaleConsumerLock(lockFile, staleNow), true, '心跳超时 ⇒ 陈旧')
+  assert.equal(await isStaleConsumerLock(lockFile, () => Date.now()), false, '心跳新鲜 + 进程还活着 ⇒ 不算陈旧（不许抢）')
+})
+
+await check('⑧ T-73 默认路径不锁：持锁者活着时另一个宿主仍然拿到租约（重复但不漏）', async () => {
+  const dir = await tempSpool()
+  const registry = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-t73-reg-'))
+  const lockFile = join(registry, `${ADDRESS}.${CONSUMER}.lock`)
+  await mkdir(registry, { recursive: true })
+  await writeFile(lockFile, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8')
+  resetConsumerPresenceThrottle()
+  // 锁文件就算**已经在**（比如上一次开关打开时留下的），开关关着也不读它 —— 默认零副作用。
+  const lease = await acquireConsumerLease({
+    address: ADDRESS, consumer: CONSUMER, cursor: consumerCursorPath(ADDRESS, CONSUMER, dir),
+    instance: 'host-default', singleHostConsumer: false, dir: registry,
+  })
+  assert.equal(lease.granted, true, '默认（关）：绝不因为"别人持锁"而不消费')
+  assert.equal(lease.route, 'open')
+})
+
+await check('⑧ T-73 消费形态：同一游标才计入（不同地址/不同 consumer 互不干扰）', async () => {
+  const dir = await tempSpool()
+  const registry = await mkdtemp(join(tmpdir(), 'dsh-msg9-kit-t73-reg-'))
+  resetConsumerPresenceThrottle()
+  const cursorA = consumerCursorPath(ADDRESS, CONSUMER, dir)
+  const cursorB = consumerCursorPath('other@test.msg9.io', CONSUMER, dir)
+  await acquireConsumerLease({ address: ADDRESS, consumer: CONSUMER, cursor: cursorA, instance: 'h1', singleHostConsumer: false, dir: registry })
+  await acquireConsumerLease({ address: 'other@test.msg9.io', consumer: CONSUMER, cursor: cursorB, instance: 'h2', singleHostConsumer: false, dir: registry })
+  await acquireConsumerLease({ address: ADDRESS, consumer: 'another-consumer', cursor: join(dir, 'x.cursor'), instance: 'h3', singleHostConsumer: false, dir: registry })
+
+  const shape = await readConsumerShape(cursorA, { dir: registry })
+  assert.deepEqual(shape.holders.map((row) => row.instance), ['h1'], '只有同一个游标的宿主算"在消费同一个信箱"')
+  // 坏登记不该让观测面崩。
+  await writeFile(join(registry, 'broken.json'), '{not json', 'utf8')
+  assert.deepEqual((await readConsumerShape(cursorA, { dir: registry })).holders.map((row) => row.instance), ['h1'])
+  // 目录不存在 = 没有登记（不是错误）。
+  const empty = await readConsumerShape(cursorA, { dir: join(dir, 'nope') })
+  assert.deepEqual(empty, { cursor: cursorA, holders: [], waiters: [], stale: [] })
 })
 
 console.log(failed > 0 ? `\n${failed} check(s) failed` : '\nall checks passed')

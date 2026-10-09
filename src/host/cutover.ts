@@ -221,6 +221,72 @@ export function assertSingleWakeSource(
   return sources[0]!
 }
 
+// ------------------------------------------------- 多宿主消费（T-73 的显式开关）
+
+/** 开关的环境变量名（配置缺省时的第二来源；运维临时切换/测试用）。 */
+export const SINGLE_HOST_CONSUMER_ENV = 'MSG9_SINGLE_HOST_CONSUMER'
+
+/**
+ * 「同一信箱只由一个宿主消费」的开关（**默认关**）。
+ *
+ * ⚠️ **默认必须是关**，这是 PO 2026-10-09 的产品裁决，不是偷懒：
+ * 多个宿主各消费一份 ⇒ 通知**重复但不漏**（人在哪个宿主上都叫得到）；
+ * 加上互斥 ⇒ **不重复但可能漏**（信只叫醒持锁宿主的会话，另一个宿主上的人不会被叫）。
+ * **可见的重复**比**不可见的漏叫**好排查，所以默认保留前者。
+ * 需要去重的人显式打开（代价见上），并且开关打开时每一条被跳过的唤醒都会进观测行
+ * （`decision=skipped-lock-holder=<pid>`）—— 那是这个开关唯一的安全网。
+ */
+export interface SingleHostConsumerResolution {
+  enabled: boolean
+  /** 这个值是从哪儿来的（配置 / 环境变量 / 默认值）。 */
+  source: 'config' | 'env' | 'default'
+  /** 值无法识别时原样留证（**回落到关**）。 */
+  invalid?: string
+  /** 给 `log` 用的一句话（值写错时非空）。 */
+  warning?: string
+}
+
+/** 认 `true/1/yes/on` 与 `false/0/no/off`；别的（含空串）当"没给值"。 */
+function normalizeBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(trimmed)) return true
+  if (['0', 'false', 'no', 'off'].includes(trimmed)) return false
+  return undefined
+}
+
+/**
+ * 解析 `singleHostConsumer`：**配置 > 环境变量 > 默认（关）**。
+ *
+ * 与 `resolveIngestMode` 同一条纪律：值不认识就**回落默认（关）**并给 warning ——
+ * 写错一个字母就静默打开跨进程互斥（进而可能漏叫）是最坏的结果。永不抛错。
+ */
+export function resolveSingleHostConsumer(input: { config?: unknown; env?: unknown } = {}): SingleHostConsumerResolution {
+  const fromConfig = normalizeBoolean(input.config)
+  if (fromConfig !== undefined) return { enabled: fromConfig, source: 'config' }
+  if (input.config !== undefined && input.config !== null && input.config !== '') {
+    return {
+      enabled: false,
+      source: 'config',
+      invalid: String(input.config),
+      warning: `msg9 single-host consumer: unrecognised config singleHostConsumer=${JSON.stringify(input.config)}; keeping the default (off — duplicates but nothing is missed). Expected true/false.`,
+    }
+  }
+  const fromEnv = normalizeBoolean(input.env)
+  if (fromEnv !== undefined) return { enabled: fromEnv, source: 'env' }
+  if (typeof input.env === 'string' && input.env.trim() !== '') {
+    return {
+      enabled: false,
+      source: 'env',
+      invalid: input.env,
+      warning: `msg9 single-host consumer: unrecognised ${SINGLE_HOST_CONSUMER_ENV}=${JSON.stringify(input.env)}; keeping the default (off — duplicates but nothing is missed). Expected true/false.`,
+    }
+  }
+  return { enabled: false, source: 'default' }
+}
+
 // ------------------------------------------------------- --scope 是选择器
 
 /**

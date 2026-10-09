@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -197,7 +197,7 @@ const workspaces = [
 ]
 const sessionCwd = { 'sess-a': '/work/a', 'sess-b': '/work/b', 'sess-c': '/work/c' }
 
-const { apply, inject, name: pluginName, readProjectCredentials, resolveCredentials } = await import('../lib/index.js')
+const { apply, inject, name: pluginName, readProjectCredentials, resolveCredentials, consumerCursorPath, consumerRegistryDir, DEFAULT_CONSUMER } = await import('../lib/index.js')
 
 const tools = []
 const commands = []
@@ -367,6 +367,41 @@ await check('workspace B inbox is a separate address (sibling under the same own
 await check('second inbox pull reuses the stored inbox (no re-provision)', async () => {
   await tool('msg9_inbox').execute({}, exec('sess-a'))
   assert.equal(seen.ownerCreate.length, 2)
+})
+
+await check('T-73: msg9_status 说清"几个宿主在消费同一信箱" + 开关 + 一句可执行的结论', async () => {
+  const inbox = await resolveCredentials('ws-a')
+  assert.ok(inbox?.address, '夹具前提：ws-a 已经有信箱')
+  // 造两个"宿主"的在场登记（同一个游标）—— 生产里就是桌面宿主 + dsh web。
+  const cursor = consumerCursorPath(inbox.address)
+  const dir = consumerRegistryDir()
+  await mkdir(dir, { recursive: true })
+  const presence = (instance, role) => JSON.stringify({
+    instance, pid: process.pid, address: inbox.address, consumer: DEFAULT_CONSUMER,
+    cursor, role, at: new Date().toISOString(),
+  })
+  const files = [
+    join(dir, `${inbox.address}.${DEFAULT_CONSUMER}.host-1.json`),
+    join(dir, `${inbox.address}.${DEFAULT_CONSUMER}.host-2.json`),
+  ]
+  await writeFile(files[0], presence('host-1', 'holder'))
+  await writeFile(files[1], presence('host-2', 'holder'))
+
+  const text = await tool('msg9_status').execute({}, exec('sess-a'))
+  assert.match(text, /single-host consumer: off \(default: duplicates, but nothing is missed\) \(from: default\)/, text)
+  assert.match(text, /hosts consuming this inbox: 2 \(\d+/, text)
+  assert.match(text, /same cursor/, '要说清判据是"同一个游标"')
+  assert.match(text, /DUPLICATE but nothing is missed/, '要给一句结论，而不是只报数字')
+  assert.match(text, /MSG9_SINGLE_HOST_CONSUMER=1/, '要给出可执行的下一步')
+  assert.match(text, /only the lock holder's session is woken/, '同时写清去重的代价（否则等于劝人踩坑）')
+
+  // 开关打开时，同一份登记要读成"锁生效"（只报一个 holder 的情形）。
+  await rm(files[1], { force: true })
+  const single = await tool('msg9_status').execute({}, exec('sess-a'))
+  assert.match(single, /hosts consuming this inbox: 1 \(\d+/, single)
+
+  // 清场：别让这两条假登记影响后面的用例。
+  for (const file of files) await rm(file, { force: true })
 })
 
 await check('msg9_peers lists both sibling workspaces', async () => {

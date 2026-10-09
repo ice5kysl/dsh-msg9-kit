@@ -63,6 +63,15 @@ import {
 } from './store.ts'
 import { resolveWorkspace } from './workspace.ts'
 import { L } from './locale.ts'
+import { consumerRegistryDir, readConsumerShape } from './consumers.ts'
+import { consumerCursorPath } from './ledger.ts'
+import type { SingleHostConsumerResolution } from './cutover.ts'
+
+/** T-73：`apply` 把解析好的开关交给工具层，`msg9_status` 用它说清当前形态。 */
+export interface RegisterMsg9ToolsOptions {
+  singleHostConsumer?: boolean
+  singleHostConsumerSource?: SingleHostConsumerResolution['source']
+}
 
 const TEXT_OUTPUT = {
   schema: { type: 'string' as const },
@@ -141,7 +150,7 @@ function formatMessages(
 }
 
 /** Register all msg9 tools on `ctx.tools`. */
-export function registerMsg9Tools(ctx: Context): void {
+export function registerMsg9Tools(ctx: Context, options: RegisterMsg9ToolsOptions = {}): void {
   ctx.tools.register(defineTool({
     name: 'msg9_setup',
     description:
@@ -603,6 +612,78 @@ export function registerMsg9Tools(ctx: Context): void {
         L('已登记 workspace：{v}', 'registered workspaces: {v}', { v: inboxCount }),
         L('状态文件：{v}', 'state file: {v}', { v: stateFilePath() }),
       ]
+
+      // T-73：**当前有几个宿主在消费这个信箱** —— 这是 T-67 查明的那条重复门铃的
+      // 直接判据（不是"有几个 dsh 在跑"，而是"有几个 pid 在用同一个游标"）。
+      // 只读：不写任何登记、不改任何状态。
+      const singleHostOn = options.singleHostConsumer === true
+      lines.push(L(
+        '单宿主消费：{v}（来源：{src}）',
+        'single-host consumer: {v} (from: {src})',
+        {
+          src: options.singleHostConsumerSource ?? 'default',
+          v: singleHostOn
+            ? L('开（跨进程互斥：拿不到锁的宿主不消费）', 'on (cross-process mutex: the losing host does not consume)')
+            : L('关（默认：重复但不漏）', 'off (default: duplicates, but nothing is missed)'),
+        },
+      ))
+      if (inbox?.address) {
+        const cursorPath = consumerCursorPath(inbox.address)
+        const shape = await readConsumerShape(cursorPath).catch(() => undefined)
+        if (!shape || (shape.holders.length === 0 && shape.waiters.length === 0 && shape.stale.length === 0)) {
+          // 没有登记 ≠ 一定只有一个宿主：账本消费者还没跑过第一轮（或本实例是 self 模式，
+          // 根本不跑账本消费者）。**如实说"没有登记"**，不猜。
+          lines.push(L(
+            '消费同一信箱的宿主：没有账本消费者的在场登记（本实例可能还没跑第一轮，或走的是 self 路径）',
+            'hosts consuming this inbox: no ledger-consumer presence recorded (this instance may not have run a round yet, or it uses the self path)',
+          ))
+        } else {
+          const pids = [...new Set(shape.holders.map((row) => row.pid))]
+          lines.push(L(
+            '消费同一信箱的宿主：{n} 个（pid {pids}）· 游标 {cursor}',
+            'hosts consuming this inbox: {n} ({pids}) · cursor {cursor}',
+            { n: shape.holders.length, pids: pids.join(', ') || '-', cursor: cursorPath },
+          ))
+          if (shape.waiters.length > 0) {
+            lines.push(L(
+              '其中 {n} 个宿主在场但没拿到锁（等锁中，本轮不消费）：pid {pids}',
+              '{n} host(s) are present but hold no lock (waiting; not consuming this round): pid {pids}',
+              { n: shape.waiters.length, pids: [...new Set(shape.waiters.map((row) => row.pid))].join(', ') },
+            ))
+          }
+          if (shape.stale.length > 0) {
+            lines.push(L(
+              '陈旧登记（进程已不在，只作观测）：pid {pids}',
+              'stale presence (process gone; observation only): pid {pids}',
+              { pids: [...new Set(shape.stale.map((row) => row.pid))].join(', ') },
+            ))
+          }
+          if (shape.holders.length > 1 && !singleHostOn) {
+            lines.push(L(
+              '提醒：{n} 个宿主正在消费同一信箱（同一个游标 {cursor}）⇒ 通知会**重复但不会漏**；' +
+                '若要去重请开 MSG9_SINGLE_HOST_CONSUMER=1（代价：只叫醒持锁宿主的会话，另一个宿主上的人不会被叫）',
+              'Note: {n} hosts are consuming this inbox (same cursor {cursor}) ⇒ notifications will DUPLICATE but nothing is missed; ' +
+                'set MSG9_SINGLE_HOST_CONSUMER=1 to de-duplicate (cost: only the lock holder\'s session is woken — a session on the other host will not be)',
+              { n: shape.holders.length, cursor: cursorPath },
+            ))
+          }
+          if (shape.holders.length > 1 && singleHostOn) {
+            lines.push(L(
+              '⚠️ 开关已开，但仍有 {n} 个宿主在消费同一信箱 ⇒ 锁没生效，请查 {dir}（同一游标出现多个 holder 就是 T-67 那条重复门铃）',
+              '⚠️ the switch is ON yet {n} hosts still consume this inbox ⇒ the lock is not working; inspect {dir} ' +
+                '(several holders on one cursor IS the T-67 duplicate doorbell)',
+              { n: shape.holders.length, dir: consumerRegistryDir() },
+            ))
+          }
+          if (shape.holders.length === 1 && singleHostOn) {
+            lines.push(L(
+              '锁生效：只有 pid {pid} 在消费（另一个宿主在场但不投递）',
+              'lock effective: only pid {pid} consumes (other hosts are present but do not deliver)',
+              { pid: shape.holders[0]!.pid },
+            ))
+          }
+        }
+      }
 
       if (args.verify && inbox?.api_key) {
         try {

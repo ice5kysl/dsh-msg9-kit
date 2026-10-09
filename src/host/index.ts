@@ -30,6 +30,7 @@ import { loadState, setWatchState, getNotifyPaused, type LiveInbox } from './sto
 // 判据全是纯函数；接线只**读**它们，不因此改变 self 模式的任何行为。
 import {
   INGEST_ENV,
+  SINGLE_HOST_CONSUMER_ENV,
   assertSingleWakeSource,
   assertObservedWakeSources,
   assessDaemonCoverage,
@@ -40,6 +41,7 @@ import {
   readDaemonPidState,
   readDaemonStatuses,
   resolveIngestMode,
+  resolveSingleHostConsumer,
   type IngestPlan,
 } from './cutover.ts'
 import { consumerCursorPath, ledgerPath, spoolDir } from './ledger.ts'
@@ -109,6 +111,7 @@ export {
   DEFAULT_INGEST,
   INGEST_ENV,
   SCOPE_CONTRACT,
+  SINGLE_HOST_CONSUMER_ENV,
   addressTenant,
   assertSingleWakeSource,
   assertObservedWakeSources,
@@ -127,12 +130,24 @@ export {
   readDaemonStatuses,
   relevantStatusTenants,
   resolveIngestMode,
+  resolveSingleHostConsumer,
   resolveWakeSources,
   scopeFlagForAddress,
   scopeFromStatusFile,
   scopeNeededFor,
   tryParseScopeFlag,
 } from './cutover.ts'
+// T-73：多宿主消费同一信箱 —— 在场登记（永远开）+ 跨进程互斥（显式开关，默认关）。
+export {
+  CONSUMER_LOCK_STALE_MS,
+  acquireConsumerLease,
+  clearConsumerPresence,
+  consumerRegistryDir,
+  isStaleConsumerLock,
+  readConsumerShape,
+  resetConsumerPresenceThrottle,
+} from './consumers.ts'
+export type { ConsumerLease, ConsumerLeaseOptions, ConsumerPresence, ConsumerShape } from './consumers.ts'
 export type {
   AddressTenant,
   CoverageVerdict,
@@ -146,6 +161,7 @@ export type {
   IngestResolution,
   LedgerBatchPlan,
   PlatformDaemonStatus,
+  SingleHostConsumerResolution,
   WakeSource,
 } from './cutover.ts'
 // The watcher daemon's public surface (bin entry + integration tests).
@@ -256,7 +272,20 @@ export function apply(ctx: Context, config?: unknown): void {
   log.info(`msg9 ingest: ${plan.mode} (from ${ingest.source}) — ledger loop=${plan.ledgerLoop}, self daemon=${plan.selfDaemon}, in-process watcher=${plan.inProcessWatcher}`)
   if (ingest.warning) log.warn(ingest.warning)
 
-  registerMsg9Tools(ctx)
+  // T-73：多宿主消费同一信箱的**显式选择**（**默认关** —— 默认"重复但不漏"）。
+  // 与 ingest 同一条纪律：值写错 ⇒ 回落默认（关）并大声记一笔（静默打开跨进程互斥
+  // ⇒ 可能漏叫，那是比重复更坏的失效）。
+  const singleHost = resolveSingleHostConsumer({
+    config: ingestOptions.singleHostConsumer,
+    env: process.env[SINGLE_HOST_CONSUMER_ENV],
+  })
+  log.info(
+    `msg9 single-host consumer: ${singleHost.enabled ? 'ON (cross-process mutex per inbox; the losing host does not consume)' : 'off (default: several hosts consume the same inbox — notifications duplicate but nothing is missed)'}` +
+      ` (from ${singleHost.source})`,
+  )
+  if (singleHost.warning) log.warn(singleHost.warning)
+
+  registerMsg9Tools(ctx, { singleHostConsumer: singleHost.enabled, singleHostConsumerSource: singleHost.source })
   log.info('msg9 tools registered (setup, inbox, outbox, send, read, done, message, notify, resolve, contacts, peers, rotate, status)')
 
   registerMsg9Commands(ctx.commands)
@@ -402,6 +431,7 @@ export function apply(ctx: Context, config?: unknown): void {
       daemonDelivery,
       daemonUnread,
       plan,
+      singleHost.enabled,
     )
     log.info(plan.ledgerLoop
       ? `msg9 new-mail watcher started (ingest=ledger: platform ledger every ${WATCH_POLL_MS / 1000}s)`
@@ -427,6 +457,8 @@ function startLedgerIngest(
   rt: WatchRuntime,
   plan: IngestPlan,
   log: (message: string) => void,
+  /** T-73：跨进程互斥开关（默认关 ⇒ 只登记在场，行为与改前逐字一致）。 */
+  singleHostConsumer = false,
 ): void {
   const loops = new Map<string, { address: string; loop: LedgerIngestLoop }>()
   ctx.effect(() => {
@@ -454,6 +486,9 @@ function startLedgerIngest(
         }
         const loop = startLedgerIngestLoop(deps, rt, key, inbox, {
           intervalMs: WATCH_POLL_MS,
+          // T-73：默认关 ⇒ 只是登记在场（`msg9_status` 看得见几个宿主在消费）；
+          // 开了才按地址抢跨进程锁，拿不到的宿主本轮不消费并记进观测行。
+          singleHostConsumer,
           // 平台 daemon 健康（只读）：.daemon-status*.json + 活锁。没有活 daemon
           // ⇒ 'dead' ⇒ decideTopUp 走 inbox unread 补齐 —— 这就是「停 daemon →
           // 发信 → 重启必须补上」赖以成立的那条判据（账本零滞后时它是唯一一条）。
@@ -505,6 +540,8 @@ function startWatcher(
   daemonDelivery: { token?: string; handle?: (body: DaemonDelivery) => Promise<unknown> },
   daemonUnread: { read?: () => Promise<Record<string, { unread?: number; total?: number; at?: number }>> },
   plan: IngestPlan,
+  /** T-73：跨进程互斥开关（默认关 ⇒ 只登记在场，行为与改前逐字一致）。 */
+  singleHostConsumer = false,
 ): void {
   // T-67：运行时也盯"实际是谁响的"。计划允许的来源从这里进 runtime，每一次真正
   // 触发唤醒都要过 `assertObservedWakeSources` 的判据（不合法只响亮记日志，不杀循环）。
@@ -595,7 +632,7 @@ function startWatcher(
   // 与进程内 watcher 都**不**启动；self 模式与改前逐项一致（daemon-first，连不上
   // 才退回进程内 watcher）。两条路径不会同时喂唤醒。
   if (plan.ledgerLoop && process.env.MSG9_WATCH !== '0') {
-    startLedgerIngest(ctx, deps, rt, plan, log)
+    startLedgerIngest(ctx, deps, rt, plan, log, singleHostConsumer)
   } else if (process.env.MSG9_WATCH !== '0') {
     // NOTE: do NOT probe ctx.interval here — in cordis, reading a service the
     // plugin never injected throws ("cannot get property without inject"),

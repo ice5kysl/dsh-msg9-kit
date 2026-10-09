@@ -247,6 +247,59 @@ dsh 是回合制的 Agent 循环，所以插件用三条路把邮件推给它：
 | `MSG9_WATCH_STREAM` | 设为 `0` 强制用间隔轮询（不走 `/inbox/stream` 长轮询） |
 | `MSG9_WATCH_MS` | 兜底轮询间隔，服务端无 stream 端点时也用它（默认 30000，最小 5000） |
 | `MSG9_WATCH_BATCH_MS` | 聚合窗时长（默认 12000；设 0 则每批立即投递） |
+| `MSG9_SINGLE_HOST_CONSUMER` | `1`/`true` 打开「一个信箱只由一个宿主消费」的跨进程互斥。**默认关**，见下一节 |
+
+## 多个宿主同时消费一个信箱：默认「重复但不漏」
+
+一台机器上可以同时跑多个 dsh 宿主（比如桌面宿主 + `dsh web`），它们**共享**同一个
+`~/.dsh` 状态与**同一个**平台 spool。于是 `ingest: ledger`（或 self 模式下的进程内 watcher）
+会有**多个宿主各自消费同一个信箱**，读**同一个**游标文件
+`~/.msg9/spool/<address>.<consumer>.cursor`，而"读游标 → 投递 → 写游标"之间**没有跨进程互斥**
+—— 两边都可能把同一条新事件当作"新鲜"，各自唤醒**自己进程里的会话**。
+
+**结果：同一条信会被唤醒两次**（多花一轮 token，也让人以为"这封信我明明处理过了"），
+而**不会漏**：人在哪个宿主上，那个宿主的会话就会被叫到。
+
+### 两个选项，各自的代价（默认是第一个）
+
+| | 默认（`MSG9_SINGLE_HOST_CONSUMER` 不设 / `0`） | 打开（`=1`） |
+|---|---|---|
+| 行为 | **每个宿主各消费一份、各唤醒自己的会话** | 按地址抢 `O_EXCL` 锁；**只有持锁宿主消费**，其余宿主该轮不消费 |
+| 通知 | **会重复**（同一封信在两个宿主各响一次） | **不重复** |
+| 漏叫 | **不会漏**（哪个宿主上有人，就叫得到） | **可能漏**：信只叫醒持锁宿主的会话，另一个宿主上的会话**不会被叫** |
+| 可查性 | 观测行 `pid` 不同，一眼看得出是两个宿主 | 被跳过的每一轮都记 `decision=skipped-lock-holder=<pid>` |
+
+**默认选"重复但不漏"**，理由是：**可见的重复**（同一条信响两次，日志里两个 `pid`）比
+**不可见的漏叫**（人在 A 宿主的会话里等着，信只叫了 B 宿主，于是谁都不知道）好排查得多。
+需要去重的场景再显式打开，并接受"另一个宿主的会话不会被叫"这个代价。
+
+### 怎么查当前是什么形态
+
+`msg9_status` 会直接告诉你（判据是**有几个宿主用同一个游标**，不是"有几个 dsh 在跑"）：
+
+```
+single-host consumer: off (default: duplicates, but nothing is missed) (from: default)
+hosts consuming this inbox: 2 (54271, 74139) · cursor ~/.msg9/spool/dsh@dsh.ice.msg9.io.dsh-msg9-kit.cursor
+Note: 2 hosts are consuming this inbox (same cursor …) ⇒ notifications will DUPLICATE but
+nothing is missed; set MSG9_SINGLE_HOST_CONSUMER=1 to de-duplicate
+(cost: only the lock holder's session is woken — a session on the other host will not be)
+```
+
+在场登记与锁都落在**我们自己的状态目录**（`state.json` 同级的 `consumers/`），
+**绝不写 `~/.msg9/**`**；判活看 pid，陈旧登记（进程已不在）只作观测。
+锁是**按轮持有**的（"读游标 → 投递 → 写游标"这一小段时间，不是常驻），
+所以拿不到锁的宿主**下一轮基本都能拿到**（两个宿主 30s 一轮、锁只持有一小会儿，
+只有在两轮真正重叠时才争）—— 打开开关**不会**让某个宿主永久霸占信箱。
+持锁进程死掉时锁会被**死 pid 自愈**拆掉（与 `state.json` 的跨进程锁同款判据），
+所以也不会把信箱锁死。开关的解析与 `ingest` 同一条纪律：**值不认识 ⇒ 回落默认（关）**
+并大声记一笔。
+
+任一条改动都在 host 面 ⇒ **需要重启 dsh web 生效**。
+
+> ⚠️ 与上一节「一个 `DSH_HOME` 只支持**一个** dsh 实例」的关系：那条说的是**同时写
+> `state.json`** 会被文件锁挡住（锁只在写入期间持有）—— 它**并不阻止**两个宿主同时活着、
+> 各自消费一份信箱。后者正是 `msg9_status` 现在会报出来的形态，也是这张卡要解决的对象。
+
 
 界面上的未读徽标是事件驱动的：桥接提供 SSE 通道（`GET /dsh-msg9/events`），host 在 watcher 发现新邮件、标记已读/已处理、以及 120 秒快照对账发现漂移时推送失效通知，面板只在此时才拉 `/unread`。20 秒定时器仅作为没有 EventSource 时的回退。
 

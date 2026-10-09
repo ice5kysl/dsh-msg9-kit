@@ -20,10 +20,12 @@
  * @module dsh-msg9-kit/watch
  */
 
+import { randomUUID } from 'node:crypto'
 import type { InboxMessage, InboxPage } from './api.ts'
 import { bodyText, truncate } from '../shared/message.ts'
 import type { LiveInbox, State } from './store.ts'
-import { DEFAULT_LAG_TOPUP_MS, createLedgerConsumer, type DaemonHealth } from './ledger.ts'
+import { DEFAULT_CONSUMER, DEFAULT_LAG_TOPUP_MS, consumerCursorPath, createLedgerConsumer, readConsumerLag, spoolDir, type DaemonHealth } from './ledger.ts'
+import { acquireConsumerLease, clearConsumerPresence } from './consumers.ts'
 import { assertObservedWakeSources, planLedgerBatch, type WakeSource } from './cutover.ts'
 
 /** The live-agent face the watcher delivers to (subset of dsh's agent). */
@@ -213,7 +215,12 @@ export function wakeLine(entry: {
   /** 本进程的去重环里有没有它（卡面的「已通知过=是/否」）。 */
   announced: boolean
   agent: string
-  decision: 'wake' | 'inject' | 'skip'
+  /**
+   * 这一封的结局：`wake`（真唤醒）· `inject`（预算用尽，只注入上下文）·
+   * `skip`（本会话已经叫过）· `skipped-lock-holder=<pid>`（T-73：另一个宿主
+   * 拿着单宿主消费锁，本宿主本轮不消费）。
+   */
+  decision: string
   at: number
 }): string {
   return 'msg9 wake:'
@@ -695,6 +702,17 @@ export interface LedgerIngestOptions {
   daemonHealth?(): Promise<DaemonHealth>
   /** 每轮 unprocessed 页的条数上限（默认 100）。 */
   unprocessedLimit?: number
+  /**
+   * T-73：同一信箱**跨进程只由一个宿主消费**（**默认关**）。
+   *
+   * 关（默认）= 与改前逐字一致：每个宿主都消费、都唤醒自己进程里的会话
+   * ⇒ 通知**重复但不漏**。开 = 按地址抢 `O_EXCL` 锁，拿不到的宿主本轮不消费，
+   * 并把这件事记进观测行（`decision=skipped-lock-holder=<pid>`）。
+   * 裁决依据与代价见 `cutover.ts` 的 `SingleHostConsumerResolution`。
+   */
+  singleHostConsumer?: boolean
+  /** T-73：在场登记/锁目录覆盖（测试传临时目录；生产用 `state.json` 同级）。 */
+  consumerDir?: string
 }
 
 export interface LedgerIngest {
@@ -709,6 +727,8 @@ export interface LedgerIngest {
     /** 上一轮因为单轮唤醒上限被推到下一轮的事件数（T-46 ③）。 */
     deferred: number
   }
+  /** T-73：循环停掉时清掉自己的在场登记（只影响观测面，不影响消费）。 */
+  dispose(): Promise<void>
 }
 
 export function createLedgerIngest(
@@ -742,6 +762,15 @@ export function createLedgerIngest(
     return pagePromise
   }
 
+  const consumerName = options.consumer ?? DEFAULT_CONSUMER
+  const spool = options.spoolDir ?? spoolDir()
+  // T-73：互斥的**粒度是游标**（消费位），不是地址 —— 用同一个游标就是消费同一份位。
+  const cursorFile = consumerCursorPath(inbox.address, consumerName, spool)
+  const consumerDir = options.consumerDir
+  // 这个消费循环的稳定标识（同一循环每轮都传同一个值；生产里与 pid 一一对应，
+  // 但测试要在同一个进程里造两个宿主，所以不能只用 pid 当键）。
+  const instance = `${process.pid}-${randomUUID().slice(0, 8)}`
+
   const consumer = createLedgerConsumer({
     address: inbox.address,
     ...(options.consumer === undefined ? {} : { consumer: options.consumer }),
@@ -760,79 +789,132 @@ export function createLedgerIngest(
     log,
   })
 
+  /**
+   * 一轮**真正的**消费：读账本 + 游标 → 取正文对账 → 投递 → 确认后才 commit。
+   *
+   * T-73：拿不到跨进程租约时**绝不**调用它（`tick()` 负责那道门）。
+   */
+  const runRound = async (): Promise<void> => {
+    const poll = await consumer.pollOnce()
+    if (poll.baseline) {
+      // 与 self 路径同一条规矩：第一次观测只立基线，绝不把历史邮件倒进会话。
+      await poll.commit()
+      if (poll.ledger_events === 0) {
+        // T-46 ①：**空账本/无账本**的基线轮额外对账一次 —— 只为把"不再静默"
+        // 落到实处：这一轮到底有多少封服务器上未处理的信被跳过。
+        // ⚠️ 只观测，不投递（bootstrap 不变量）。`unprocessedOnce` 会缓存这一页，
+        // 所以即便后面还有别的分支用到它，也仍然只有一次 REST。
+        const page = await unprocessedOnce()
+        const pending = page === undefined ? undefined : page.length
+        log(
+          `msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path} ` +
+            `(ledger ${poll.ledger_exists ? 'file is empty' : 'file does not exist yet'}; sentinel cursor written —— ` +
+            `${pending === undefined ? 'server unprocessed count unavailable' : `${pending} unprocessed mail(s) on the server`} ` +
+            `are NOT announced this round; the next arrival will wake. ` +
+            `账本为空/无账本 ⇒ 已立哨兵基线，本轮${pending === undefined ? '（未处理数取不到）' : ` ${pending} 封`}不唤醒。)`,
+        )
+        return
+      }
+      log(`msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path} (ledger already has ${poll.ledger_events} event(s); none of them is announced)`)
+      return
+    }
+    last.lagSeconds = poll.lag?.lag_seconds
+    last.deferred = poll.deferred
+    const needed = poll.fresh.length > 0 || poll.top_up.topUp
+    const page = needed ? await unprocessedOnce() : []
+    const plan = planLedgerBatch(poll, page)
+    last.freshEvents = plan.fresh_events
+    last.toppedUp = plan.topped_up.length
+    last.reconciledAway = plan.reconciled_away.length
+
+    if (plan.retry) {
+      // 取不到 unprocessed 页：游标不动，下一轮重投（信在服务器，不丢）。
+      log(`msg9 ledger: ${plan.fresh_events} ledger event(s) for ${inbox.address} stay unconfirmed (retry next tick)`)
+      return
+    }
+    if (plan.deliver.length === 0) {
+      if (plan.fresh_events > 0 || poll.top_up.topUp) {
+        // 账本说有，但服务器说"已经没有未处理的了" ⇒ 已在别处闭环：跨过去，不唤醒。
+        if (plan.reconciled_away.length > 0) {
+          log(`msg9 ledger: skipped ${plan.reconciled_away.length} mail(s) already closed server-side for ${inbox.address}`)
+        }
+        await poll.commit()
+      }
+      return
+    }
+    if (await deps.isPaused?.()) {
+      // 与 self 路径同义：暂停期间照样跟踪（推进游标），但绝不投递、也不回放。
+      log(`msg9 ledger: notify paused — ${plan.deliver.length} mail(s) for ${inbox.address} tracked silently`)
+      await poll.commit()
+      return
+    }
+    // reconcile:false —— 这一批就来自 folder=unprocessed 那一页（权威对账已完成）。
+    // T-67：出处逐封标清 —— `ledger`（账本里有这一行）还是 `unread-top-up`
+    // （账本没跟上、由 unread 补齐捞回来的）。两者**同属** `ledger-consumer`
+    // 这一次消费轮，不是两条唤醒路径（`planLedgerBatch` 已按 message_id 合并去重）。
+    const toppedUp = new Set(plan.topped_up)
+    const delivered = await deliverBatch(deps, rt, key, inbox, plan.deliver, {
+      reconcile: false,
+      source: 'ledger-consumer',
+      originOf: (message) => (toppedUp.has(message.message_id) ? 'unread-top-up' : 'ledger'),
+    })
+    if (!delivered) {
+      // 没有活会话：**不 commit** ⇒ 下一轮重投（与自研 daemon 的 409 ⇒ pending 同义）。
+      log(`msg9 ledger: no live session for ${inbox.address}; ${plan.deliver.length} mail(s) wait for the next tick`)
+      return
+    }
+    await poll.commit()
+  }
+
   return {
     last,
+    async dispose() {
+      await clearConsumerPresence({
+        address: inbox.address,
+        consumer: consumerName,
+        instance,
+        ...(consumerDir === undefined ? {} : { dir: consumerDir }),
+      })
+    },
     async tick() {
       pagePromise = undefined
-      const poll = await consumer.pollOnce()
-      if (poll.baseline) {
-        // 与 self 路径同一条规矩：第一次观测只立基线，绝不把历史邮件倒进会话。
-        await poll.commit()
-        if (poll.ledger_events === 0) {
-          // T-46 ①：**空账本/无账本**的基线轮额外对账一次 —— 只为把"不再静默"
-          // 落到实处：这一轮到底有多少封服务器上未处理的信被跳过。
-          // ⚠️ 只观测，不投递（bootstrap 不变量）。`unprocessedOnce` 会缓存这一页，
-          // 所以即便后面还有别的分支用到它，也仍然只有一次 REST。
-          const page = await unprocessedOnce()
-          const pending = page === undefined ? undefined : page.length
+      // T-73：每一轮都要拿租约。默认（开关关）只是登记在场、永远 granted；
+      // 开了开关才真正互斥 —— 临界区恰好是"读游标 → 投递 → 写游标"，
+      // 也就是 T-67 查明的那条 2:1 窗口。
+      const lease = await acquireConsumerLease({
+        address: inbox.address,
+        consumer: consumerName,
+        cursor: cursorFile,
+        instance,
+        singleHostConsumer: options.singleHostConsumer === true,
+        ...(consumerDir === undefined ? {} : { dir: consumerDir }),
+        now: () => deps.now(),
+      })
+      try {
+        if (!lease.granted) {
+          // 没拿到锁 ⇒ **本轮一封都不投递**。但绝不能静默：这是这个开关唯一的安全网，
+          // 必须让"为什么这次没叫我"可查（谁拿着锁、积压了多少）。
+          const lag = await readConsumerLag(inbox.address, consumerName, { spoolDir: spool }).catch(() => undefined)
+          const holder = lease.holderPid === undefined ? 'unknown' : String(lease.holderPid)
           log(
-            `msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path} ` +
-              `(ledger ${poll.ledger_exists ? 'file is empty' : 'file does not exist yet'}; sentinel cursor written —— ` +
-              `${pending === undefined ? 'server unprocessed count unavailable' : `${pending} unprocessed mail(s) on the server`} ` +
-              `are NOT announced this round; the next arrival will wake. ` +
-              `账本为空/无账本 ⇒ 已立哨兵基线，本轮${pending === undefined ? '（未处理数取不到）' : ` ${pending} 封`}不唤醒。)`,
+            `msg9 ledger: ${inbox.address}: another host (pid ${holder}) holds the single-host consumer lock; ` +
+              `this host does NOT consume this round (singleHostConsumer=on)` +
+              (lag === undefined
+                ? ''
+                : ` — ${lag.unconsumed} event(s) waiting, cursor lag ${lag.lag_seconds}s; ` +
+                  `they will NOT be announced by this host while the lock is held`),
           )
+          log(wakeLine({
+            source: 'ledger-consumer', origin: 'lock-skip', address: inbox.address,
+            messageId: '-', announced: false, agent: '-',
+            decision: `skipped-lock-holder=${holder}`, at: deps.now(),
+          }))
           return
         }
-        log(`msg9 ledger: baseline established for ${inbox.address} → ${poll.ledger_path} (ledger already has ${poll.ledger_events} event(s); none of them is announced)`)
-        return
+        await runRound()
+      } finally {
+        await lease.release()
       }
-      last.lagSeconds = poll.lag?.lag_seconds
-      last.deferred = poll.deferred
-      const needed = poll.fresh.length > 0 || poll.top_up.topUp
-      const page = needed ? await unprocessedOnce() : []
-      const plan = planLedgerBatch(poll, page)
-      last.freshEvents = plan.fresh_events
-      last.toppedUp = plan.topped_up.length
-      last.reconciledAway = plan.reconciled_away.length
-
-      if (plan.retry) {
-        // 取不到 unprocessed 页：游标不动，下一轮重投（信在服务器，不丢）。
-        log(`msg9 ledger: ${plan.fresh_events} ledger event(s) for ${inbox.address} stay unconfirmed (retry next tick)`)
-        return
-      }
-      if (plan.deliver.length === 0) {
-        if (plan.fresh_events > 0 || poll.top_up.topUp) {
-          // 账本说有，但服务器说"已经没有未处理的了" ⇒ 已在别处闭环：跨过去，不唤醒。
-          if (plan.reconciled_away.length > 0) {
-            log(`msg9 ledger: skipped ${plan.reconciled_away.length} mail(s) already closed server-side for ${inbox.address}`)
-          }
-          await poll.commit()
-        }
-        return
-      }
-      if (await deps.isPaused?.()) {
-        // 与 self 路径同义：暂停期间照样跟踪（推进游标），但绝不投递、也不回放。
-        log(`msg9 ledger: notify paused — ${plan.deliver.length} mail(s) for ${inbox.address} tracked silently`)
-        await poll.commit()
-        return
-      }
-      // reconcile:false —— 这一批就来自 folder=unprocessed 那一页（权威对账已完成）。
-      // T-67：出处逐封标清 —— `ledger`（账本里有这一行）还是 `unread-top-up`
-      // （账本没跟上、由 unread 补齐捞回来的）。两者**同属** `ledger-consumer`
-      // 这一次消费轮，不是两条唤醒路径（`planLedgerBatch` 已按 message_id 合并去重）。
-      const toppedUp = new Set(plan.topped_up)
-      const delivered = await deliverBatch(deps, rt, key, inbox, plan.deliver, {
-        reconcile: false,
-        source: 'ledger-consumer',
-        originOf: (message) => (toppedUp.has(message.message_id) ? 'unread-top-up' : 'ledger'),
-      })
-      if (!delivered) {
-        // 没有活会话：**不 commit** ⇒ 下一轮重投（与自研 daemon 的 409 ⇒ pending 同义）。
-        log(`msg9 ledger: no live session for ${inbox.address}; ${plan.deliver.length} mail(s) wait for the next tick`)
-        return
-      }
-      await poll.commit()
     },
   }
 }
@@ -861,6 +943,9 @@ export function startLedgerIngestLoop(
     ingest,
     stop() {
       clearInterval(timer)
+      // T-73：循环走了，它的在场登记也要走 —— 否则 `msg9_status` 会把一个已经
+      // 停掉的宿主算成"还在消费"（陈旧登记只影响观测，但观测正是这张卡的价值）。
+      void ingest.dispose()
     },
   }
 }

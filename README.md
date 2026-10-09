@@ -331,6 +331,65 @@ The agent loop is turn-based, so the plugin pushes arrivals three ways:
 | `MSG9_WATCH_STREAM` | `0` forces interval polling instead of `/inbox/stream` long-poll |
 | `MSG9_WATCH_MS` | fallback poll interval, also used when the server has no stream endpoint (default 30000, min 5000) |
 | `MSG9_WATCH_BATCH_MS` | coalescing window for related mails (default 12000; 0 delivers each batch immediately) |
+| `MSG9_SINGLE_HOST_CONSUMER` | `1`/`true` turns on the cross-process mutex ("one host consumes an inbox"). **Default off** — see below |
+
+## Several hosts consuming one inbox: "duplicate, but never missed" (the default)
+
+One machine can run several dsh hosts at once (e.g. the desktop host plus `dsh web`), and they
+**share** the same `~/.dsh` state and the same platform spool. So under `ingest: ledger` (or the
+in-process watcher under `self`) **more than one host consumes the same inbox**, reading the
+**same** cursor file `~/.msg9/spool/<address>.<consumer>.cursor` — and "read cursor → deliver →
+write cursor" has **no cross-process exclusion**. Both can treat the same new event as "fresh"
+and each wakes **the session inside its own process**.
+
+**Net effect: one mail wakes twice** (an extra turn of tokens, plus the "I already handled this"
+confusion) — and **nothing is missed**: whichever host you are looking at, that host's session is
+woken.
+
+### Two options and their costs (the default is the first)
+
+| | default (`MSG9_SINGLE_HOST_CONSUMER` unset / `0`) | on (`=1`) |
+|---|---|---|
+| behaviour | **every host consumes its own copy and wakes its own session** | an `O_EXCL` lock per address; **only the lock holder consumes**, the rest skip the round |
+| notifications | **duplicate** (one mail rings once per host) | **no duplicates** |
+| missed wakes | **none** (wherever a human is, they get woken) | **possible**: the mail only wakes the lock holder's session; a session on the other host is **not** woken |
+| observability | the two `pid`s differ in the wake log lines | every skipped round logs `decision=skipped-lock-holder=<pid>` |
+
+**The default is "duplicate but never missed"** because a **visible duplicate** (one mail ringing
+twice, two different `pid`s in the log) is far easier to diagnose than an **invisible missed wake**
+(a human waiting in host A's session while the mail only rang host B — and nobody ever finds out).
+Turn it on explicitly when you want de-duplication, and accept the cost.
+
+### Check which shape you are in
+
+`msg9_status` tells you directly (the judgement is **how many hosts use the same cursor**, not
+"how many dsh processes are running"):
+
+```
+single-host consumer: off (default: duplicates, but nothing is missed) (from: default)
+hosts consuming this inbox: 2 (54271, 74139) · cursor ~/.msg9/spool/dsh@dsh.ice.msg9.io.dsh-msg9-kit.cursor
+Note: 2 hosts are consuming this inbox (same cursor …) ⇒ notifications will DUPLICATE but
+nothing is missed; set MSG9_SINGLE_HOST_CONSUMER=1 to de-duplicate
+(cost: only the lock holder's session is woken — a session on the other host will not be)
+```
+
+Presence records and locks live in **our own state directory** (`consumers/`, next to
+`state.json`) — this **never writes `~/.msg9/**`**. Liveness is judged by pid; stale records
+(process gone) are observation-only. The lock is **held per round** (only for "read cursor →
+deliver → write cursor", not permanently), so a host that loses one round will almost always win
+the next one (both hosts poll every 30s and the lock is held for a fraction of that — they only
+contend when two rounds actually overlap): turning the switch on does **not** let one host
+monopolise an inbox. If the lock holder dies the lock is dropped by **dead-pid self-healing**
+(the same judgement as the `state.json` cross-process lock). The switch follows the same
+discipline as `ingest`: **an unrecognised value falls back to the default (off)** and logs loudly.
+
+Any of these changes is host-side ⇒ **restart `dsh web` for it to take effect**.
+
+> ⚠️ Relation to the earlier note that "one `DSH_HOME` supports **one** dsh instance": that one is
+> about **simultaneous writes to `state.json`** being blocked by a file lock (held only during a
+> write) — it does **not** stop two hosts from being alive at once and each consuming its own copy
+> of an inbox. The latter is exactly what `msg9_status` now reports.
+
 
 The human-facing badge is event-driven: the bridge exposes an SSE channel
 (`GET /dsh-msg9/events`) and the host emits invalidations when the watcher
