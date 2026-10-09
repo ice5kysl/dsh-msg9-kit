@@ -382,3 +382,26 @@ headless host with no `webServer`).
 ## License
 
 MIT
+
+## v0.6.1 — quota round two: frequency down, semantics untouched
+
+1. **How often the `onlyUnprocessed` reconciliation runs** (the leftover evaluation from T-23): the **semantics stay** — it is the only
+   judgment for "a message already closed elsewhere must not wake anyone" — with two frequency reductions that do not relax it:
+   ① an **early stop on the daemon side** (this batch's ids are on page one ⇒ stop paging) and ② the **watcher looks for a live session before
+   reconciling** (no live session ⇒ no query). **Before/after** (`scripts/quota-probe.mjs`, a counting fake server on the real code paths):
+   S4 **3 → 1**, S5 **20 → 0**, S6 20 → 20 (control, semantics unchanged), S7 840 → 840 (what the platform-side WS unread-count request is for).
+   **Mutation**: turning either reconciliation off makes the ghost-wake regression test genuinely red.
+2. **The `ingest` switch and the coexistence handover checklist**: `self` (default; the old behaviour is untouched) and `ledger` (consume the
+   platform ledger); machine-checkable preconditions (platform daemon alive / ledger fresh / health file present) plus **precondition 0: who is
+   authorised** — because "it runs" is not "you should switch": switching while the platform daemon is not writing would swap one live wake source
+   for a dead ledger.
+3. **Three must-fixes before switching + the `staleMs` tuning**: an empty-ledger **sentinel cursor** (previously an address with no ledger file
+   never got a baseline and could never top up, and its first message was swallowed) · `connected:false` merged per address on **two axes** ·
+   backfill blocks **throttled in file order** (avoiding a 127-message wake storm).
+4. **A live-fire rehearsal script**: `scripts/ledger-rehearsal.mjs` consumes the real spool **read-only** (cursors in a temp dir, the ledger
+   byte-identical) — it is what uncovered the three must-fixes above.
+5. **A missing `return` in the reconciliation branch + `daemon.log` rotation**.
+6. **Docs**: `docs/COEXISTENCE-HANDOVER.md` · `docs/QUOTA-BUDGET.md`.
+
+**Verified**: `npm test` **275 checks / 15 suites green** + clean typecheck; both reductions carry mutation evidence.
+
