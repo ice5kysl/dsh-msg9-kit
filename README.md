@@ -464,3 +464,20 @@ MIT
 
 **Verified**: `npm test` **275 checks / 15 suites green** + clean typecheck; both reductions carry mutation evidence.
 
+## v0.7.0 — observability, de-duplication and the multi-host trade-off on the wake path (labelled by kind)
+
+- **Fix · trust gate scheme check**: an `https` origin can no longer drive a plain-http bridge.
+- **Capability · wake-exit observability + per-session dedupe + observed-source assertion**: every wake path funnels through one
+  exit that logs `source/origin/message_id/address/announced/pid/session/decision` — **`pid` and `session` matter**: two processes
+  report the *same* source and the *same* message id. Per-session dedupe by `message_id` has two deliberate semantics: a hit still
+  returns true (so the cursor advances) and a batch that was never delivered never enters the ring (so nothing is swallowed).
+  `assertSingleWakeSource` now also checks **observed** sources, not just the plan.
+  **Root cause (real data + elimination)**: duplicate doorbells come from **two host processes each running a ledger consumer**
+  over the same cursor file with no cross-process mutex — not from two wake paths, not from platform redelivery, and not introduced
+  by the switch to `ledger`.
+- **Capability · multi-host consumption: default "duplicates but no misses" + an explicit switch + honest `msg9_status`**:
+  `MSG9_SINGLE_HOST_CONSUMER=1` enables per-cursor cross-process exclusion (`O_EXCL` + dead-pid recovery + heartbeat timeout,
+  held per round). A host that cannot take the lock delivers nothing, does not advance the cursor, and leaves a
+  `decision=skipped-lock-holder=<pid>` trace. `msg9_status` answers "how many hosts consume this inbox" and states the cost.
+  **Why exclusion is off by default**: it trades a *visible duplicate* for an *invisible miss*.
+
