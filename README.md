@@ -481,3 +481,17 @@ MIT
   `decision=skipped-lock-holder=<pid>` trace. `msg9_status` answers "how many hosts consume this inbox" and states the cost.
   **Why exclusion is off by default**: it trades a *visible duplicate* for an *invisible miss*.
 
+## v0.7.1 — fix: the “rename slug” input now actually works, plus a silent host-side broken chain
+
+- **Fix** (T-81): the slug input was purely decorative — its value only ever landed in local state, while the action that ran,
+  `openPod(row.key)`, never received it, so **the typed slug never reached any request**. It is now sent as `pod_label` to
+  `/dsh-msg9/open-pod` and **read back and compared**: a mismatch between what you typed and the slug actually used produces a
+  **visible error** rather than being silently ignored. **Enter opens the pod** (same path as the button), **Esc cancels**, and
+  rows that are already `ready` still cannot be renamed.
+- **Fix · the host-side chain found only on a real machine**: the explicit slug was not passed down, so `ensureInbox → ownerForWorkspace`
+  re-derived the pod name — the slug renamed the pod while the **mailbox was silently opened into another pod** (or an error was raised).
+  The label now travels all the way to “create agent”, and the in-flight dedupe key includes it.
+
+**Verified**: 294 checks / 15 suites green; real-machine evidence with a **local fake ORG API** (zero real outbound writes);
+**negative controls genuinely red**; the loaded face proven by page-level sha256.
+
