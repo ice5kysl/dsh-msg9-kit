@@ -42,6 +42,8 @@ const {
 
 const calls = { pods: 0, create: 0, agents: 0, register: 0 }
 let podsInOrg = []
+/** 每次建 agent 用的 pod key（Bearer）—— 「信箱到底开在哪个 pod 里」的硬证据。 */
+let agentAuths = []
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
@@ -83,6 +85,7 @@ const server = createServer(async (req, res) => {
     if (!key.startsWith('msg9_tk_')) return send(403, { code: 40300, message: 'owner key required' })
     const body = JSON.parse(await readBody(req) || '{}')
     calls.agents += 1
+    agentAuths.push(key)
     const address = body.addresses?.[0]
     return send(200, {
       code: 0,
@@ -117,6 +120,7 @@ const check = (name, fn) => checks.push({ name, fn })
 const resetAll = async () => {
   calls.pods = 0; calls.create = 0; calls.agents = 0; calls.register = 0
   podsInOrg = []
+  agentAuths = []
   await rm(process.env.MSG9_HOME, { recursive: true, force: true })
   await rm(process.env.MSG9_STATE_FILE, { force: true })
   delete process.env.MSG9_ORG_KEY
@@ -191,6 +195,54 @@ check('P1-R3b：pod key 按规范落盘 tenants/<pod>-<org>.key（0600）', asyn
   assert.equal(key, 'msg9_tk_pod_test-project', 'pod key 应当按 <pod>-<org>.key 命名并落盘')
   const mode = (await stat(path)).mode & 0o777
   assert.equal(mode, 0o600, `凭据必须 0600，实际 ${mode.toString(8)}`)
+})
+
+check('P1-R3c ★：显式指定的 pod slug 就是实际建出来的那个（T-81「改 slug」的落点）', async () => {
+  await resetAll()
+  await writeOrgKey('ice', 'msg9_ok_test_key')
+  await writeState({ org: { label: 'ice', api_url: apiUrl }, workspaces: {} })
+
+  // 不指定 ⇒ 走推导（这个 workspace 推导出来是 test-project）
+  const derived = await openPod(ws)
+  assert.equal(derived.podLabel, 'test-project', '不给就用推导出来的名字')
+
+  // 显式指定 ⇒ 必须【就是这个名字】。判据打在**送给 ORG 的请求体**上，
+  // 而不是"返回值看起来对"：夹具记录的 `body.label` 才是真的建了什么。
+  const explicit = await openPod(ws, { podLabel: 'renamed-slug' })
+  assert.equal(explicit.podLabel, 'renamed-slug', '★ 返回的 label 必须等于显式指定的那个')
+  assert.equal(explicit.podCreated, true, '这是一个新 pod，不是复用')
+  assert.equal(explicit.addressDomain, 'renamed-slug.ice.msg9.io', '地址域由显式 slug 决定')
+  assert.deepEqual(
+    podsInOrg.map((pod) => pod.pod_label),
+    ['test-project', 'renamed-slug'],
+    '★ ORG 里真的建出了「renamed-slug」这个 pod',
+  )
+  assert.equal(
+    (await readFile(join(process.env.MSG9_HOME, 'tenants', 'renamed-slug-ice.key'), 'utf8')).trim(),
+    'msg9_tk_pod_renamed-slug',
+    'pod key 也按显式 slug 落盘（不会写回推导名那份）',
+  )
+})
+
+check('P1-R3d ★：显式 slug 必须一路传到「建 agent」（T-81 真机抓到的断链）', async () => {
+  await resetAll()
+  await writeOrgKey('ice', 'msg9_ok_test_key')
+  await writeState({ org: { label: 'ice', api_url: apiUrl }, workspaces: {} })
+  // ★ 先布下陷阱：**推导名自己有本地 key**。真机上就是这个形态 ——
+  //   `openPod` 用显式 slug 建了 pod，可随后"给这个 workspace 开信箱"又自己推导
+  //   了一遍 pod 名，于是拿推导名那把 key 去建 agent ⇒ 信箱**静默开进另一个 pod**。
+  await mkdir(join(process.env.MSG9_HOME, 'tenants'), { recursive: true })
+  await writeFile(join(process.env.MSG9_HOME, 'tenants', 'test-project-ice.key'), 'msg9_tk_pod_test-project\n', { mode: 0o600 })
+
+  const fresh = { key: 'ws-fresh', title: 'Test Project', path: '/work/test-project' }
+  const result = await openPod(fresh, { podLabel: 'renamed-slug' })
+  assert.equal(result.podLabel, 'renamed-slug')
+  assert.equal(calls.agents, 1, '信箱确实开了（不是"报错说没有 key"）')
+  assert.deepEqual(
+    agentAuths,
+    ['msg9_tk_pod_renamed-slug'],
+    '★ 建 agent 用的必须是「renamed-slug」那把 pod key —— 不是推导出来的 test-project',
+  )
 })
 
 check('P1-R4 ★：pod 已存在但本地无 key ⇒ 明确报错，【不重建】（40900 决议表）', async () => {

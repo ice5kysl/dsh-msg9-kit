@@ -195,8 +195,15 @@ export interface Msg9Store {
   bindOrg(orgKey: string, apiUrl?: string): Promise<void>
   /** 读当前 workspace 的开通状态（unconfigured / pod_closed / ready）。 */
   loadPodState(key?: string): Promise<void>
-  /** 开启当前 workspace 的 Pod（ORG → Pod → Agent）。**唯一写路径。** */
-  openPod(key?: string): Promise<void>
+  /**
+   * 开启当前 workspace 的 Pod（ORG → Pod → Agent）。**唯一写路径。**
+   *
+   * `podLabel` = 本次开通要用的 pod slug（面板「改 slug」输入框里填的那个）。
+   * 不给就交给宿主按「人工覆盖 → ORG 默认 → 从标题推导」挑一个。
+   * ⚠️ 必须**真的**送到请求里：这个参数只有一条去路（`bridge.openPod`），
+   * 少了它就是 2026-10-10 那个"输入框是装饰性的" bug。
+   */
+  openPod(key?: string, podLabel?: string): Promise<void>
   /**
    * 移除一条**本地** workspace 记录（僵尸 / 重复条目）。
    * 服务端会再判一次"是否为该地址的唯一持有者"，不安全就拒绝。
@@ -1062,12 +1069,36 @@ export function createMsg9Store(options: StoreOptions = {}): Msg9Store {
      * 不做乐观更新：等服务端返回再 refresh（与 store 其余写操作一致）。
      * 这一步真的会在远端建资源，"看起来成功了"是不能接受的假象。
      */
-    async openPod(key) {
+    async openPod(key, podLabel) {
       const target = key ?? state.currentKey ?? undefined
       const id = target ?? '__current__'
+      // 空串 / 纯空白 = "没有人工覆盖"，**不**把一个空 label 送上去：
+      // 宿主对 `pod_label` 做 `str()`（trim 后为空就当没给），送空串只会制造
+      // "我明明请求了却走了默认"的假象。
+      const wanted = typeof podLabel === 'string' ? podLabel.trim() : ''
       set({ opening: { ...state.opening, [id]: { busy: true, error: null } } })
       try {
-        const result = await bridge.openPod({ key: target, cwd: state.cwd ?? undefined })
+        const result = await bridge.openPod({
+          key: target,
+          cwd: state.cwd ?? undefined,
+          ...(wanted ? { pod_label: wanted } : {}),
+        })
+        // 不许静默忽略：人工指定的 slug 必须**就是**实际开通用的那个。
+        // 没有这一条，输入框会第二次退化成"装饰性"的 —— 值送出去了，
+        // 但结果没人核对，"按新的开"依然是空话。
+        // 真实不一致只可能来自宿主/上游改写（本仓库的 `podLabelFor` 原样透传），
+        // 所以这里宁可报出来，也不假装成功。
+        if (wanted && result.podLabel !== wanted) {
+          const message = L(
+            '开通使用的 slug 与你输入的不一致：要求「{wanted}」，实际用了「{got}」。请核对后重试。',
+            'The pod used a different slug than you typed: asked for "{wanted}", got "{got}".',
+            { wanted, got: result.podLabel ?? '?' },
+          )
+          set({ opening: { ...state.opening, [id]: { busy: false, error: message } } })
+          notice('error', message)
+          await refreshAll()
+          return
+        }
         set({ opening: { ...state.opening, [id]: { busy: false, error: null } } })
         notice('ok', result.podCreated
           ? L('已开通 Pod「{pod}」（{domain}）', 'Pod "{pod}" opened ({domain})', {

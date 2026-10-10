@@ -266,6 +266,19 @@ export function agentPartCompliant(address: string | null, expectedAgent: string
   return local === expectedAgent || local.startsWith(`${expectedAgent}-`)
 }
 
+/**
+ * 「改 slug」输入框里按下某个键，该做什么。
+ *
+ * 抽成纯函数是为了让**回车 = 开通**这件事能被单元测试钉住：主线证据是真机点出来
+ * 的（见卡上验收），但只有真机的话，谁把 `onKeyDown` 删了只有主人的手能发现。
+ * 返回 `null` = 不拦，交给输入框自己处理（普通打字）。
+ */
+export function slugFieldAction(key: string): 'open' | 'cancel' | null {
+  if (key === 'Enter') return 'open'
+  if (key === 'Escape') return 'cancel'
+  return null
+}
+
 export type GroupId = 'missing' | 'problem' | 'noncompliant' | 'unopened' | 'ok'
 
 export function groupOf(row: Msg9State['workspaces'][number]): GroupId {
@@ -408,6 +421,27 @@ function WorkspaceRow({
     : pod.state === 'pod_closed'
       ? L('Pod 未开通', 'Pod closed')
       : L('已开通', 'Ready')
+
+  /**
+   * 「开通」= 本行**唯一**的确认动作。
+   *
+   * 输入框只是把 slug 喂给它；**回车与点击走的是同一个 `submitOpen`**
+   * （2026-10-10 主人的实测报告就是「输入后没有确认键，回车也不好用」——
+   * 两个入口各写一遍，迟早又会分叉成"只有一个好用"）。
+   *
+   * 传值口径：空/纯空白 = 没有人工覆盖 ⇒ 传 `undefined`，让宿主按
+   * 「人工覆盖 → ORG 默认 → 推导」自己挑；**不送空串**（宿主会把空串
+   * trim 掉当没给，送了只会制造"我请求了却走了默认"的假象）。
+   */
+  const submitOpen = () => {
+    if (opening.busy) return
+    const wanted = editLabel?.trim()
+    void store.openPod(row.key, wanted || undefined).then(() => {
+      // 只有**成功**才收起输入框：失败（含"slug 与结果不一致"）时留着，
+      // 用户填的东西不该被一次报错清空。
+      if (!store.getState().opening[row.key]?.error) setEditLabel(null)
+    })
+  }
 
   return (
     <li style={styles.row}>
@@ -674,12 +708,29 @@ function WorkspaceRow({
               spellCheck={false}
               placeholder={pod?.pod_label ?? ''}
               onChange={(event) => setEditLabel(event.target.value.toLowerCase())}
+              onKeyDown={(event) => {
+                // 回车 = 开通（与点「开通」按钮同一条路径，不是"再实现一遍"）；
+                // Esc = 取消（关掉输入框、恢复默认）。规则见 `slugFieldAction`。
+                const action = slugFieldAction(event.key)
+                if (!action) return
+                event.preventDefault()
+                if (action === 'open') submitOpen()
+                else setEditLabel(null)
+              }}
             />
             <span style={styles.dim}>
-              {L('开通前可改；对已开通的 Pod 无效。', 'Changeable before opening; no effect once open.')}
+              {L(
+                '开通前可改：回车，或点右边的「开通」，都按这里的名字开；Esc 取消。对已开通的 Pod 无效。',
+                'Changeable before opening — press Enter or click “Open pod”; Esc cancels. No effect once open.',
+              )}
             </span>
           </div>
         )}
+        {/* 报错要看得见**原因**：「开通失败」四个字指不出该改什么。
+            这条线同时服务于"输入框是装饰性的"那个坑 —— 输入的名字与最终
+            开通用的 name 不一致时，用户必须能当场读到"要求 X、实际 Y"。
+            （rowStats 里那个「开通失败」短徽标保留，两处一个报"有错"、一个报"错在哪"。） */}
+        {opening.error && <div style={styles.errorText}>{opening.error}</div>}
       </div>
       <div style={styles.rowStats}>
         {opening.error && <span style={styles.warn}>{L('开通失败', 'Failed')}</span>}
@@ -692,7 +743,7 @@ function WorkspaceRow({
               className="m9-btn"
               style={styles.smallBtn}
               onClick={() => setEditLabel(editLabel === null ? (pod?.pod_label ?? '') : null)}
-              title={L('改 pod slug', 'Edit pod slug')}
+              title={L('改 pod slug（开通前可改）', 'Edit pod slug (before opening)')}
             >
               {L('改 slug', 'Rename')}
             </button>
@@ -702,7 +753,7 @@ function WorkspaceRow({
               style={styles.smallBtn}
               disabled={!orgBound || opening.busy}
               title={orgBound ? undefined : L('先绑定 ORG key', 'Bind an ORG key first')}
-              onClick={() => void store.openPod(row.key)}
+              onClick={submitOpen}
             >
               {opening.busy ? L('开通中…', 'Opening…') : L('开通', 'Open pod')}
             </button>

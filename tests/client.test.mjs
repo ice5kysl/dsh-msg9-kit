@@ -676,6 +676,86 @@ await check('bridge: provision opens the inbox of a workspace that has none', as
   assert.equal(overview.payload.data.current.provisioned, true)
 })
 
+/**
+ * 记录型 bridge 的底座：够 `openPod` 自己跑完一轮 refresh。
+ * T-81 的两条断言只关心**送出去的 body**，所以其余端点给最简的合法响应。
+ */
+function openPodFake(openPodImpl, calls) {
+  return {
+    overview: async () => ({
+      owner: null, api_url: 'http://fake', state_file: '', current: null,
+      workspaces: [{ key: 'ws-a', title: 'alpha', path: W.a, address: null, provisioned: false, cursor: null, current: true }],
+    }),
+    messages: async () => ({ messages: [], total: 0, unread_count: 0 }),
+    outbox: async () => ({ messages: [], total: 0 }),
+    contacts: async () => ({ contacts: [], total: 0 }),
+    unread: async () => ({ total: 0, byKey: {} }),
+    peers: async () => ({ peers: [] }),
+    groups: async () => ({ groups: [], total: 0 }),
+    openPod: async (input) => { calls.push(input); return openPodImpl(input) },
+  }
+}
+
+// 🔴 T-81 回归（2026-10-10 主人实测：「改 slug 这个好像不能用呀，输入后没有确认键，
+//    回车也不好用」）。真正的缺陷比"少个确认键"更重：**输入的值从未进入任何请求**，
+//    那个输入框是【装饰性】的。所以判据不是"输入框看得见"，而是
+//    **送出去的 body 里有没有那个名字** —— 把 store 里传值那一句删掉，这条必须红。
+await check('store: ★「改 slug」输入的值必须真的进入开通请求（T-81）', async () => {
+  const calls = []
+  const store = client.createMsg9Store({
+    bridge: openPodFake(() => ({ key: 'ws-a', state: 'ready', podCreated: true, podLabel: 'my-own-name', addressDomain: 'my-own-name.ice.msg9.io' }), calls),
+    pollMs: 10 ** 9,
+  })
+  store.setCwd(W.a)
+  await store.openPod('ws-a', 'my-own-name')
+  assert.equal(calls.length, 1, '开通只发一次请求')
+  assert.equal(calls[0].key, 'ws-a', '还是这一行')
+  assert.equal(calls[0].pod_label, 'my-own-name', '★ 输入框里的名字必须出现在开通请求里')
+  assert.equal(store.getState().opening['ws-a'].error, null, '名字与结果一致 ⇒ 不报错')
+
+  // 空 / 纯空白 = "没有人工覆盖"：**不送空串**。宿主对 `pod_label` 做 trim，
+  // 送空串只会制造"我请求了却走了默认"的假象。
+  calls.length = 0
+  await store.openPod('ws-a', '   ')
+  assert.equal('pod_label' in calls[0], false, '空输入不得伪造一个 pod_label 字段')
+})
+
+await check('store: ★ 开通用的 slug 与输入不一致 ⇒ 可见报错，不静默忽略（T-81）', async () => {
+  const calls = []
+  const store = client.createMsg9Store({
+    // 模拟"上游把名字改了"（真实来源只可能是宿主/上游改写）：结果必须被核对出来。
+    bridge: openPodFake(() => ({ key: 'ws-a', state: 'ready', podCreated: true, podLabel: 'something-else', addressDomain: 'something-else.ice.msg9.io' }), calls),
+    pollMs: 10 ** 9,
+  })
+  store.setCwd(W.a)
+  await store.openPod('ws-a', 'what-i-typed')
+  const error = store.getState().opening['ws-a'].error
+  assert.ok(error, '★ 不一致必须报错，而不是假装成功')
+  assert.match(error, /what-i-typed/, '报错要说清"要求的是什么"')
+  assert.match(error, /something-else/, '报错要说清"实际用了什么"')
+  assert.equal(store.getState().notice.kind, 'error', '同一条错误也要走面板既有的提示通道')
+})
+
+await check('bridge: ★ pod_label 真的落进 /open-pod 的 HTTP body（T-81 的最后一跳）', async () => {
+  // 上面那条盯到 store 为止。这一条再往下走一层：真 bridge 把 body 序列化后
+  // POST 给宿主。两段都绿，才说明"输入的名字"确实上了线。
+  const posts = []
+  const wire = client.createBridge({
+    fetch: async (url, init = {}) => {
+      posts.push({ url: String(url), body: init.body ? JSON.parse(init.body) : undefined })
+      return {
+        ok: true,
+        status: 200,
+        statusText: '',
+        text: async () => JSON.stringify({ ok: true, data: { key: 'ws-a', state: 'ready', podCreated: true, podLabel: 'my-own-name' } }),
+      }
+    },
+  })
+  await wire.openPod({ key: 'ws-a', pod_label: 'my-own-name' })
+  assert.ok(posts[0].url.includes('/open-pod'), `走的是开通路由，实际 ${posts[0].url}`)
+  assert.equal(posts[0].body.pod_label, 'my-own-name', '★ 名字真的落进了 HTTP body')
+})
+
 await check('bridge: rejects untrusted hosts, unknown routes and missing params', async () => {
   assert.equal(isTrustedRequest(fakeReq({ headers: { host: 'evil.example:80' } })), false)
   assert.equal(isTrustedRequest(fakeReq({ headers: { host: '127.0.0.1:3080' } })), true)
@@ -1870,6 +1950,13 @@ await check('按钮规则：目录不存在的行不给「开通」；无记录�
   assert.equal(canRemoveRecord({ ...base, stored: true, address: 'a@x', health: { pathMissing: false, duplicateOf: 'a@x', removable: true } }), true)
   // ⑧ 真记录 + 正常（无问题）⇒ 不给
   assert.equal(canRemoveRecord({ ...base, stored: true, health: { pathMissing: false, removable: false } }), false)
+
+  // ⑨ T-81：「改 slug」输入框里按键的规则。判据是**回车走的是开通那条路**，
+  //    而不是"输入框存在" —— 它一直存在，只是从前是装饰性的。
+  const { slugFieldAction } = client
+  assert.equal(slugFieldAction('Enter'), 'open', '★ 回车 = 开通（与点「开通」同一条路径）')
+  assert.equal(slugFieldAction('Escape'), 'cancel', 'Esc = 取消')
+  assert.equal(slugFieldAction('a'), null, '普通打字不拦，交给输入框')
 })
 
 await check('settings grouping: 4 objective buckets, and "another pod" is NOT non-compliant', async () => {

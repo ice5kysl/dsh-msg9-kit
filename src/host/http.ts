@@ -117,7 +117,12 @@ export interface BridgeDeps {
   loadState(): Promise<State>
   stateFilePath(): string
   defaultApiUrl(): string
-  ensureInbox(workspace: CurrentWorkspace, signal?: AbortSignal, preferred?: string): Promise<InboxContext>
+  ensureInbox(
+    workspace: CurrentWorkspace,
+    signal?: AbortSignal,
+    preferred?: string,
+    options?: { allowSelfRegister?: boolean; podLabel?: string },
+  ): Promise<InboxContext>
   /** 开启 Pod（ORG → Pod → Agent）。由 service.openPod 实现。 */
   openPod(workspace: CurrentWorkspace, options?: { podLabel?: string }): Promise<OpenPodResultLike>
   /** 开通状态（只读）：unconfigured / pod_closed / ready。 */

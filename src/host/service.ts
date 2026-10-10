@@ -111,21 +111,31 @@ const provisioning = new Map<string, Promise<InboxContext>>()
  * silent fallback scattered 9 identities into an unrelated domain on this
  * machine. `options.allowSelfRegister` restores the old path for callers that
  * genuinely mean it.
+ *
+ * `options.podLabel` 必须由 `openPod()` **传下来**（2026-10-10, T-81）：
+ * `openPod` 用显式 slug 建的 pod，与"给这个 workspace 开信箱该用哪把 pod key"
+ * 是**同一个决定**。以前后者在 `ownerForWorkspace()` 里**重新推导**一遍，
+ * 于是显式 slug 只改了 pod 的名字、信箱却照旧去 `derivePodLabel` 的那个 pod 里开：
+ * 推导名恰好有本地 key 时**静默开进另一个 pod**，没有时则报
+ * 「本地没有 Pod「llmpool」的租户 key」—— 两者都是"改 slug 没生效"。
  */
 export function ensureInbox(
   workspace: CurrentWorkspace,
   signal?: AbortSignal,
   preferred?: string,
-  options?: { allowSelfRegister?: boolean },
+  options?: { allowSelfRegister?: boolean; podLabel?: string },
 ): Promise<InboxContext> {
-  const pending = provisioning.get(workspace.key)
+  // 去重键要带上 pod label：同一个 workspace 上"按默认名开"与"按人工名开"
+  // 是两件不同的事，共用一个在途任务会把后者的结果换成前者的。
+  const ticket = `${workspace.key}::${options?.podLabel ?? ''}`
+  const pending = provisioning.get(ticket)
   if (pending) return pending
   // The shared task must not carry any single caller's signal: the first
   // caller disconnecting would otherwise abort provisioning for every waiter.
   // Outbound calls inside rely on the API client's own timeout instead.
-  const task = provision(workspace, undefined, preferred, options?.allowSelfRegister ?? false)
-    .finally(() => provisioning.delete(workspace.key))
-  provisioning.set(workspace.key, task)
+  const task = provision(workspace, undefined, preferred, options?.allowSelfRegister ?? false, options?.podLabel)
+    .finally(() => provisioning.delete(ticket))
+  provisioning.set(ticket, task)
   if (!signal) return task
   if (signal.aborted) return Promise.reject(signal.reason)
   // A caller may stop waiting, but the shared task runs to completion.
@@ -166,9 +176,10 @@ async function ownerForWorkspace(
   owner: OwnerState | undefined,
   apiUrl: string,
   orgLabel: string | undefined,
+  podLabel?: string,
 ): Promise<OwnerState | undefined> {
   if (!orgLabel || !owner?.api_key) return owner
-  const targetPod = await podLabelFor(workspace)
+  const targetPod = await podLabelFor(workspace, podLabel)
   const podKey = await readTenantKeyForPod(targetPod, orgLabel, apiUrl)
   if (!podKey) {
     throw new Error(L(
@@ -193,6 +204,8 @@ async function provision(
   log?: (message: string) => void,
   preferred?: string | null,
   allowSelfRegister = false,
+  /** 本次开通**指定**的 pod slug（「改 slug」里填的名字）；不给就照旧推导。 */
+  podLabel?: string,
 ): Promise<InboxContext> {
   let existing = await resolveCredentials(workspace.key, { log })
   if (!existing) {
@@ -236,7 +249,7 @@ async function provision(
 
   // ★ 地址的 pod 必须与 key 的 pod 一致（2026-09-30 事故）。逻辑集中在
   //   `ownerForWorkspace()` —— `migrateInbox` 共用同一份，见那里的注释。
-  const ownerForKey = await ownerForWorkspace(workspace, owner, apiUrl, orgLabel)
+  const ownerForKey = await ownerForWorkspace(workspace, owner, apiUrl, orgLabel, podLabel)
 
   if (!ownerForKey?.api_key) {
     // 走到这里 = `allowSelfRegister` 被显式打开（生产路径不会；见上面的守卫）。
@@ -688,7 +701,13 @@ export async function openPod(
   await writeTenantKey(podKey, { podLabel: label, orgLabel })
 
   // ⑤ 用 pod key 开 agent（复用既有幂等逻辑）
-  await ensureInbox(workspace)
+  //
+  // ⚠️ 必须把**刚刚选定的 label** 一起交下去（T-81，2026-10-10 真机抓到）：
+  //    `ensureInbox` 里"给这个 workspace 开信箱该用哪把 pod key"若自己再推导一遍，
+  //    显式 slug 就只改了 pod 的名字 —— 信箱会开进另一个 pod，或直接报
+  //    「本地没有 Pod「llmpool」的租户 key」。pod 与地址的 pod **必须同一个**，
+  //    这与 2026-09-30 那次事故是同一条规矩。
+  await ensureInbox(workspace, undefined, undefined, { podLabel: label })
   return {
     state: 'ready',
     podCreated,
