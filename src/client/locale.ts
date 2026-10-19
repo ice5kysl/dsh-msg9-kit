@@ -1,8 +1,10 @@
 /**
  * Browser-side locale detection for dsh-msg9-kit.
  *
- * Resolution order: `navigator.language` (then `navigator.languages[0]`), with
- * the document language as a fallback; unknown tags resolve to English. Every
+ * Resolution order: the host's resolved language (`<html lang>`, which includes
+ * the settings preference and is therefore more authoritative than
+ * `navigator.language`), then `navigator.language` (then `navigator.languages[0]`),
+ * then the document language; unknown tags resolve to English. Every
  * user-facing string is written in both languages at the call site:
  *
  *   L('中文原文', 'English original', { n: 3 })
@@ -12,20 +14,32 @@
 
 import { localize, normalizeLocale, type Locale, type Vars } from '../shared/i18n.ts'
 
-let cached: Locale | undefined
+let cachedTag: string | undefined
+let cachedLocale: Locale | undefined
 
-/** The effective browser locale (cached for the life of the page). */
+/**
+ * 生效语言。**宿主优先**：dsh 会把设置里的 preference 解析成 `active` 并同步到
+ * `<html lang>`（中文写成 `zh-CN`），而 `navigator.language` 只是浏览器/Electron
+ * 的原始值 —— 两者可以不一致（本机实测 navigator 报 `en-US`，界面却是中文），
+ * 只嗅 navigator 就会出现「核心界面中文、插件英文」的半截本地化。
+ *
+ * 宿主那个入口是 `immediately` 加载的，在我们的插件挂载前就已写好；切换语言时
+ * 它也会实时更新，所以这里按**当前值**判、不再缓存一次就定终身。
+ */
 export function browserLocale(): Locale {
-  if (cached) return cached
   let raw = ''
   try {
-    raw = (typeof navigator !== 'undefined' && (navigator.language || navigator.languages?.[0])) || ''
-    if (!raw && typeof document !== 'undefined') raw = document.documentElement?.lang ?? ''
+    raw = (typeof document !== 'undefined' && document.documentElement?.lang) || ''
+    if (!raw && typeof navigator !== 'undefined') {
+      raw = navigator.language || navigator.languages?.[0] || ''
+    }
   } catch {
     raw = ''
   }
-  cached = normalizeLocale(raw)
-  return cached
+  if (raw === cachedTag && cachedLocale) return cachedLocale
+  cachedTag = raw
+  cachedLocale = normalizeLocale(raw)
+  return cachedLocale
 }
 
 /** Localized string helper for browser copy. */
