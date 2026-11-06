@@ -17,7 +17,6 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
   Msg9ApiError,
   addContact,
@@ -66,6 +65,34 @@ import { L } from './locale.ts'
 import { consumerRegistryDir, readConsumerShape } from './consumers.ts'
 import { consumerCursorPath } from './ledger.ts'
 import type { SingleHostConsumerResolution } from './cutover.ts'
+
+// ---- host-injected tool helper: resolved lazily, optional on purpose ------
+//
+// `defineTool` lives in `@deepseek-ai/dsh-tools`, a **devDependency**: the host
+// injects that package into the plugin at run time, it is NOT installed next to
+// the plugin. A *static* import here used to break the watcher daemon, because
+// `bin/msg9-watcher-daemon.mjs` loads this very bundle in a **bare `node` child
+// process** that has no host module loader:
+//
+//     Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/dsh-tools'
+//       imported from .../dsh-msg9-kit/lib/index.js
+//
+// → the daemon died before its first line of logic, `daemon.json` was never
+// written, and WebSocket wake-ups stayed silently dead while the tool surface
+// (host process, package injected) looked perfectly healthy. Field report
+// 2026-11-06 (dsh-2 @ dsh.ice pod).
+//
+// Tools are only ever registered inside the host, so: import lazily, and if the
+// package is absent (daemon child), fall back to an identity wrapper. The
+// daemon never registers tools, it only needs this module to *load*.
+type DefineTool = (typeof import('@deepseek-ai/dsh-tools'))['defineTool']
+
+let defineTool: DefineTool
+try {
+  defineTool = (await import('@deepseek-ai/dsh-tools')).defineTool
+} catch {
+  defineTool = ((definition: unknown) => definition) as unknown as DefineTool
+}
 
 /** T-73：`apply` 把解析好的开关交给工具层，`msg9_status` 用它说清当前形态。 */
 export interface RegisterMsg9ToolsOptions {
